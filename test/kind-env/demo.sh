@@ -492,9 +492,12 @@ else
   b_after_status=$(printf '%s' "$b_after" | cut -d'|' -f1); b_after_backend=$(printf '%s' "$b_after" | cut -d'|' -f2)
   echo "    Tenant B after A change  HTTP $b_after_status; backend ${b_after_backend:-unavailable}"
   [[ "$b_after_status" == 200 ]] || fail_stage "Tenant B survival"
-  sa_a=$(kctl auth can-i get secrets --as="system:serviceaccount:$TENANT:praxis" -n "$TENANT" 2>/dev/null || true)
-  sa_b=$(kctl auth can-i get secrets --as="system:serviceaccount:$BNS:praxis-tenant-b" -n "$BNS" 2>/dev/null || true)
-  echo "    Praxis Secret API A/B   $sa_a/$sa_b (expected no/no)"
+  sa_a_name=$(kctl -n "$TENANT" get deployment "$DATAPLANE_DEPLOYMENT" -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null || true)
+  sa_b_name=$(kctl -n "$BNS" get deployment payload-processing-external-model-tenant-b -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null || true)
+  [[ -n "$sa_a_name" && -n "$sa_b_name" ]] || fail_stage "ExtProc ServiceAccount discovery"
+  sa_a=$(kctl auth can-i get secrets --as="system:serviceaccount:$TENANT:$sa_a_name" -n "$TENANT" 2>/dev/null || true)
+  sa_b=$(kctl auth can-i get secrets --as="system:serviceaccount:$BNS:$sa_b_name" -n "$BNS" 2>/dev/null || true)
+  echo "    ExtProc Secret API A/B  $sa_a/$sa_b (expected no/no)"
   [[ "$sa_a" == no && "$sa_b" == no ]] || fail_stage "tenant Secret API isolation"
   record 7 tenant_isolation PASS "tenant_b_before=$b_before_status tenant_b_after=$b_after_status secret_api=denied"
   echo "RESULT"; echo "  Status                 PASS"; echo "  Tenant B survived real Tenant A traffic and mutation."; pause
