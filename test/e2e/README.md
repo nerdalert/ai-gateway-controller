@@ -15,6 +15,7 @@ AI_GATEWAY_CONTROLLER_IMAGE=quay.io/opendatahub/odh-ai-gateway-controller:odh-pr
 For a one-off run against a different MaaS source revision, set `MAAS_COMMIT` to its full Git SHA. This overrides the locked commit for that run only and does not update `test/maas-e2e.lock`:
 
 ```bash
+MAAS_UPDATE_LOCK=false \
 MAAS_COMMIT="<full-commit-sha>" \
 AI_GATEWAY_CONTROLLER_IMAGE=quay.io/opendatahub/odh-ai-gateway-controller:odh-pr \
   ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
