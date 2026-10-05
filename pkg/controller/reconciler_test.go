@@ -37,6 +37,11 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 		t.Fatal(err)
 	}
 	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilterList"}, &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(tenant.AITenantGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"), &unstructured.UnstructuredList{})
+	scheme.AddKnownTypeWithName(tenant.MaasTenantConfigGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(tenant.MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(objects...).Build()
@@ -144,13 +149,16 @@ func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testin
 		"metadata": map[string]any{
 			"name":      tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a"),
 			"namespace": "gateway-system",
-			"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
+			"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a"},
 		},
 	}}
 	foreign := owned.DeepCopy()
 	foreign.SetName("foreign-routes")
 	foreign.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "other-controller"})
-	r := controllerTestClient(t, owned, foreign)
+	neighbor := owned.DeepCopy()
+	neighbor.SetNamespace("other-gateway-system")
+	neighbor.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-b"})
+	r := controllerTestClient(t, owned, foreign, neighbor)
 
 	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil); err != nil {
 		t.Fatal(err)
@@ -162,6 +170,9 @@ func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testin
 	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "gateway-system", Name: foreign.GetName()}, &got); err != nil {
 		t.Fatalf("foreign route EnvoyFilter was removed: %v", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(neighbor), &got); err != nil {
+		t.Fatalf("neighbor route EnvoyFilter with the same name was removed: %v", err)
 	}
 }
 
@@ -510,21 +521,76 @@ func TestDependentEventsRespectExternalModelNamespaceScope(t *testing.T) {
 	}
 }
 
-func TestPraxisTenantUsesAnnotation(t *testing.T) {
-	ait := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
-		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
-		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Active"},
-	}}
-	ait.SetGroupVersionKind(tenant.AITenantGVK)
-	r := controllerTestClient(t)
-	if err := r.Create(context.Background(), ait); err != nil {
-		t.Fatal(err)
+func TestMaasTenantConfigEventsFanOutOnlyWithinConfigNamespace(t *testing.T) {
+	modelA := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "tenant-a"}}
+	modelB := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "tenant-b"}}
+	r := controllerTestClient(t, modelA, modelB)
+	if got := r.maasTenantConfigModels(context.Background(), controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")); len(got) != 1 || got[0].NamespacedName != client.ObjectKeyFromObject(modelA) {
+		t.Fatalf("MaaS TenantConfig event enqueued %#v, want only tenant-a model", got)
 	}
+	other := controllerMaasTenantConfig("tenant-b", "tenant-b", "models-as-a-service", "praxis")
+	if got := r.maasTenantConfigModels(context.Background(), other); len(got) != 1 || got[0].NamespacedName != client.ObjectKeyFromObject(modelB) {
+		t.Fatalf("second MaaS TenantConfig event enqueued %#v, want only tenant-b model", got)
+	}
+	r.Namespace = "tenant-a"
+	if got := r.maasTenantConfigModels(context.Background(), other); len(got) != 0 {
+		t.Fatalf("out-of-scope MaaS TenantConfig event enqueued %#v", got)
+	}
+}
+
+func TestPraxisTenantUsesMaasTenantConfigSelector(t *testing.T) {
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, ait, mtc)
 	got, found, err := r.praxisTenantForNamespace(context.Background(), "tenant-a")
 	if err != nil || !found || got.GetName() != "tenant" {
-		t.Fatalf("annotation tenant lookup = %v, %v, %v", got, found, err)
+		t.Fatalf("MaaS tenant config lookup = %v, %v, %v", got, found, err)
 	}
+	ait.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP})
+	if err := r.Update(context.Background(), ait); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err = r.praxisTenantForNamespace(context.Background(), "tenant-a")
+	if err != nil || !found || got.GetName() != "tenant" {
+		t.Fatalf("AITenant selector unexpectedly changed selection: %v, %v, %v", got, found, err)
+	}
+	mtc.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP, tenant.AnnotationAITenantName: "tenant", tenant.AnnotationAITenantNamespace: "models-as-a-service"})
+	if err := r.Update(context.Background(), mtc); err != nil {
+		t.Fatal(err)
+	}
+	if _, selected, err := r.praxisTenantForNamespace(context.Background(), "tenant-a"); err != nil || selected {
+		t.Fatalf("MaaS TenantConfig ipp selection = %v, want false", err)
+	}
+}
+
+func controllerAITenant(name, namespace, tenantNamespace, gatewayName, gatewayNamespace string) *unstructured.Unstructured {
+	u := tenant.NewAITenant()
+	u.SetName(name)
+	u.SetNamespace(namespace)
+	u.SetGeneration(1)
+	u.Object["status"] = map[string]any{
+		"tenantNamespace": tenantNamespace,
+		"phase":           tenant.AITenantPhaseActive,
+		"gatewayRef":      map[string]any{"name": gatewayName, "namespace": gatewayNamespace},
+		"conditions": []any{map[string]any{
+			"type":               tenant.AITenantConditionReady,
+			"status":             string(metav1.ConditionTrue),
+			"observedGeneration": int64(1),
+		}},
+	}
+	return u
+}
+
+func controllerMaasTenantConfig(namespace, aitenantName, aitenantNamespace, selector string) *unstructured.Unstructured {
+	u := tenant.NewMaasTenantConfig()
+	u.SetName(tenant.MaasTenantConfigInstanceName)
+	u.SetNamespace(namespace)
+	u.SetAnnotations(map[string]string{
+		tenant.AnnotationPayloadProcessingType: selector,
+		tenant.AnnotationAITenantName:          aitenantName,
+		tenant.AnnotationAITenantNamespace:     aitenantNamespace,
+	})
+	return u
 }
 
 func TestTenantModelsMapsStatusNamespace(t *testing.T) {
@@ -546,16 +612,14 @@ func TestReconcileInactivePraxisTenantDoesNotPublish(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
 		Spec:       v1alpha1.ExternalModelSpec{ModelName: "client-model"},
 	}
-	ait := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
-		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
-		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Pending"},
-	}}
-	ait.SetGroupVersionKind(tenant.AITenantGVK)
-	r := controllerTestClient(t, model)
-	if err := r.Create(context.Background(), ait); err != nil {
-		t.Fatal(err)
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	status, ok := ait.Object["status"].(map[string]any)
+	if !ok {
+		t.Fatal("AITenant fixture status is not an object")
 	}
+	status["phase"] = "Pending"
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, model, ait, mtc)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
 	}
@@ -592,6 +656,170 @@ func TestReconcileInactivePraxisTenantDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotPublishWithoutMaasTenantConfig(t *testing.T) {
+	for _, withAITenant := range []bool{true, false} {
+		t.Run(map[bool]string{true: "owner-present", false: "owner-absent"}[withAITenant], func(t *testing.T) {
+			model := &v1alpha1.ExternalModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
+			}
+			controllerutil.AddFinalizer(model, externalModelFinalizer)
+			overlay := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name:      "routing-overlay",
+				Namespace: "tenant-a",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
+			}}
+			filter := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "networking.istio.io/v1alpha3",
+				"kind":       "EnvoyFilter",
+				"metadata": map[string]any{
+					"name":      tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"),
+					"namespace": "gateway-system",
+					"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a"},
+				},
+			}}
+			objects := []client.Object{model, overlay, filter}
+			if withAITenant {
+				objects = append(objects, controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system"))
+			}
+			r := controllerTestClient(t, objects...)
+			r.Namespace, r.GatewayName, r.GatewayNamespace = "tenant-a", "gateway", "gateway-system"
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			var gotOverlay corev1.ConfigMap
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(overlay), &gotOverlay); err != nil {
+				t.Fatalf("missing MaasTenantConfig must retain serving overlay: %v", err)
+			}
+			var gotFilter unstructured.Unstructured
+			gotFilter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(filter), &gotFilter); err != nil {
+				t.Fatalf("missing MaasTenantConfig must retain route filter: %v", err)
+			}
+			var gotModel v1alpha1.ExternalModel
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil {
+				t.Fatal(err)
+			}
+			if !controllerutil.ContainsFinalizer(&gotModel, externalModelFinalizer) {
+				t.Fatal("missing MaasTenantConfig must retain the ExternalModel cleanup finalizer")
+			}
+		})
+	}
+}
+
+func TestExplicitIPPSwitchCleansOwnedResourcesWithoutGatewayStatus(t *testing.T) {
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"},
+	}
+	controllerutil.AddFinalizer(model, externalModelFinalizer)
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	status, ok := ait.Object["status"].(map[string]any)
+	if !ok {
+		t.Fatal("AITenant fixture status is not an object")
+	}
+	delete(status, "gatewayRef")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "ipp")
+	overlay := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "routing-overlay", Namespace: "tenant-a",
+		Labels: map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
+	}}
+	filter := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata": map[string]any{
+			"name":      tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"),
+			"namespace": "gateway-system",
+			"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a"},
+		},
+	}}
+	r := controllerTestClient(t, model, ait, mtc, overlay, filter)
+	r.Namespace, r.GatewayNamespace = "tenant-a", "gateway-system"
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	var gotFilter unstructured.Unstructured
+	gotFilter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(filter), &gotFilter); !apierrors.IsNotFound(err) {
+		t.Fatalf("route filter cleanup error = %v, want NotFound", err)
+	}
+	var gotOverlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(overlay), &gotOverlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("overlay cleanup error = %v, want NotFound", err)
+	}
+	var gotModel v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&gotModel, externalModelFinalizer) {
+		t.Fatal("explicit ipp cleanup retained the ExternalModel finalizer")
+	}
+}
+
+func TestExplicitIPPSwitchCleansOnlyTenantDestinationRulesAcrossGatewayMove(t *testing.T) {
+	model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a"}}
+	controllerutil.AddFinalizer(model, externalModelFinalizer)
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "new-gateway", "new-gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "ipp")
+	ownedOld := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "tenant-a", Endpoint: "old.example.com"}, "old-gateway-system", "tenant")
+	ownedCurrent := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-b", Namespace: "tenant-a", Endpoint: "current.example.com"}, "new-gateway-system", "tenant")
+	neighbor := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "tenant-b", Endpoint: "neighbor.example.com"}, "new-gateway-system", "tenant-b")
+	foreign := providerDestinationRule(resolver.Route{Provider: "provider-a", Endpoint: "foreign.example.com"}, "old-gateway-system")
+	r := controllerTestClient(t, model, ait, mtc, &ownedOld, &ownedCurrent, &neighbor, &foreign)
+	r.Namespace, r.GatewayNamespace = "tenant-a", "new-gateway-system"
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, owned := range []*unstructured.Unstructured{&ownedOld, &ownedCurrent} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(owned), got); !apierrors.IsNotFound(err) {
+			t.Fatalf("owned DestinationRule %s/%s cleanup error = %v, want NotFound", owned.GetNamespace(), owned.GetName(), err)
+		}
+	}
+	for _, preserved := range []*unstructured.Unstructured{&neighbor, &foreign} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(preserved), got); err != nil {
+			t.Fatalf("foreign DestinationRule %s/%s was removed: %v", preserved.GetNamespace(), preserved.GetName(), err)
+		}
+	}
+}
+
+func TestDefaultTenantCleanupPreservesNeighborDestinationRule(t *testing.T) {
+	defaultRule := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "models-as-a-service", Endpoint: "default.example.com"}, "gateway-system", "")
+	neighbor := providerDestinationRuleForTenant(resolver.Route{Provider: "provider-a", Namespace: "tenant-b", Endpoint: "neighbor.example.com"}, "gateway-system", "tenant-b")
+	if got := defaultRule.GetLabels()[externalTenantLabel]; got != "models-as-a-service" {
+		t.Fatalf("default DestinationRule tenant label = %q, want models-as-a-service", got)
+	}
+	r := controllerTestClient(t, &defaultRule, &neighbor)
+	if err := r.cleanupTransport(context.Background(), "models-as-a-service", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&defaultRule), got); !apierrors.IsNotFound(err) {
+		t.Fatalf("default DestinationRule cleanup error = %v, want NotFound", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&neighbor), got); err != nil {
+		t.Fatalf("neighbor DestinationRule was removed: %v", err)
+	}
+}
+
+func TestResolveTenantRejectsWrongOwnerAndStatusNamespace(t *testing.T) {
+	ait := controllerAITenant("tenant", "models-as-a-service", "other-tenant", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, ait, mtc)
+	if _, err := r.resolveTenantForNamespace(context.Background(), "tenant-a"); err == nil || !strings.Contains(err.Error(), "does not own") {
+		t.Fatalf("wrong status namespace resolution error = %v, want ownership error", err)
+	}
+	mtc.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: "praxis", tenant.AnnotationAITenantName: "other", tenant.AnnotationAITenantNamespace: "models-as-a-service"})
+	if err := r.Update(context.Background(), mtc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.resolveTenantForNamespace(context.Background(), "tenant-a"); err == nil || !strings.Contains(err.Error(), "get owning AITenant") {
+		t.Fatalf("wrong owner resolution error = %v, want missing owner error", err)
+	}
+}
+
 func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
@@ -607,16 +835,9 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("must-not-be-published")}}
-	ait := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
-		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
-		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Active"},
-	}}
-	ait.SetGroupVersionKind(tenant.AITenantGVK)
-	r := controllerTestClient(t, provider, model, secret)
-	if err := r.Create(context.Background(), ait); err != nil {
-		t.Fatal(err)
-	}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, model, secret, ait, mtc)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
@@ -651,6 +872,9 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 			}
 			if got.GetLabels()["inference.opendatahub.io/external-provider"] != "provider" {
 				t.Fatalf("DestinationRule provider label = %q", got.GetLabels()["inference.opendatahub.io/external-provider"])
+			}
+			if got.GetLabels()[externalTenantLabel] != "tenant-a" {
+				t.Fatalf("DestinationRule tenant label = %q, want tenant-a", got.GetLabels()[externalTenantLabel])
 			}
 			continue
 		}
@@ -695,8 +919,11 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	if len(gotModel.Status.Conditions) < 2 {
 		t.Fatalf("expected Ready and OverlayDistributed conditions: %#v", gotModel.Status.Conditions)
 	}
-	ait.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP})
-	if err := r.Update(context.Background(), ait); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(mtc), mtc); err != nil {
+		t.Fatal(err)
+	}
+	mtc.SetAnnotations(map[string]string{tenant.AnnotationPayloadProcessingType: tenant.PayloadProcessingBackendIPP, tenant.AnnotationAITenantName: "tenant", tenant.AnnotationAITenantNamespace: "models-as-a-service"})
+	if err := r.Update(context.Background(), mtc); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -709,6 +936,11 @@ func TestReconcileCreatesTransportAndOverlayFromOneRouteSet(t *testing.T) {
 	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
 		t.Fatalf("switch-away overlay error = %v, want NotFound", err)
+	}
+	routeFilter := &unstructured.Unstructured{}
+	routeFilter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "gateway-system", Name: tenant.PayloadProcessingExternalModelEnvoyFilterName("")}, routeFilter); !apierrors.IsNotFound(err) {
+		t.Fatalf("switch-away route EnvoyFilter error = %v, want NotFound", err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil {
 		t.Fatal(err)
@@ -749,16 +981,9 @@ func TestReconcileRecoversProviderAfterSecretDeletionAndRestoration(t *testing.T
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
-	ait := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
-		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
-		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Active"},
-	}}
-	ait.SetGroupVersionKind(tenant.AITenantGVK)
-	r := controllerTestClient(t, provider, model, secret)
-	if err := r.Create(context.Background(), ait); err != nil {
-		t.Fatal(err)
-	}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "tenant-a")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, model, secret, ait, mtc)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
@@ -1140,16 +1365,9 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 		}}},
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}
-	ait := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "AITenant",
-		"metadata": map[string]any{"name": "tenant", "namespace": "models-as-a-service", "annotations": map[string]any{tenant.AnnotationPayloadProcessingType: "praxis"}},
-		"status":   map[string]any{"tenantNamespace": "tenant-a", "phase": "Active"},
-	}}
-	ait.SetGroupVersionKind(tenant.AITenantGVK)
-	r := controllerTestClient(t, provider, model, secret)
-	if err := r.Create(context.Background(), ait); err != nil {
-		t.Fatal(err)
-	}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "tenant-a")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, model, secret, ait, mtc)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	return r, model

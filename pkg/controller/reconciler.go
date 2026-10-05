@@ -46,6 +46,7 @@ const (
 	providerServicePrefix         = "provider-"
 	providerSelectionSinkPrefix   = "provider-selection-required-"
 	selectedProviderHeader        = "X-AI-Routing-Candidate"
+	externalTenantLabel           = "inference.opendatahub.io/external-tenant"
 	externalModelPreExtProcFilter = "envoy.filters.http.ext_proc.external-model-pre"
 	externalModelExtProcFilter    = "envoy.filters.http.ext_proc.external-model"
 	modelRoutePrefix              = "external-model-"
@@ -82,9 +83,11 @@ type Reconciler struct {
 	PublishOverlay func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error)
 }
 
-// SetupWithManager registers model, provider, Secret, and AITenant watches.
-// Provider and Secret changes fan out to every affected model in the same
-// namespace; AITenant changes fan out to models in the tenant namespace.
+// SetupWithManager registers model, provider, Secret, MaasTenantConfig, and
+// AITenant watches. Provider, Secret, and MaasTenantConfig changes fan out to
+// affected models in the same namespace; AITenant changes fan out to models
+// in its resolved tenant namespace because status and Gateway identity remain
+// owned by AITenant.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
 	return builder.ControllerManagedBy(mgr).
@@ -97,6 +100,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// again. Service events are namespace-scoped and therefore only fan out
 		// to models in the affected tenant.
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
+		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		Complete(r)
 }
@@ -142,6 +146,13 @@ func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstruc
 		return nil
 	}
 	return r.modelsInNamespace(ctx, ns)
+}
+
+func (r *Reconciler) maasTenantConfigModels(ctx context.Context, mtc *unstructured.Unstructured) []reconcile.Request {
+	if mtc.GetName() != tenant.MaasTenantConfigInstanceName || !r.namespaceAllowed(mtc.GetNamespace()) {
+		return nil
+	}
+	return r.modelsInNamespace(ctx, mtc.GetNamespace())
 }
 
 func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []reconcile.Request {
@@ -231,32 +242,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, err
 	}
-	ait, found, err := r.praxisTenantForNamespace(ctx, req.Namespace)
+	modelTenant, proceed, err := r.prepareModelTenant(ctx, &model, req.Namespace)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if !found {
-		if err := r.cleanupUnselectedModel(ctx, &model); err != nil {
-			return reconcile.Result{}, err
-		}
+	if !proceed {
 		return reconcile.Result{}, nil
 	}
-	if handled, err := r.handleModelLifecycle(ctx, &model, ait); handled {
-		return reconcile.Result{}, err
-	} else if err != nil {
-		return reconcile.Result{}, err
-	}
-	if !tenant.IsActive(ait) {
-		if err := r.updateModelStatus(ctx, &model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
-	}
-	gatewayName, gatewayNamespace := r.gatewayName(), r.gatewayNamespace()
-	if selectedGateway, selectedNamespace, ok := tenant.GatewayRef(ait); ok {
-		gatewayName, gatewayNamespace = selectedGateway, selectedNamespace
-	}
-
+	gatewayName, gatewayNamespace := modelTenant.gatewayName, modelTenant.gatewayNamespace
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(req.Namespace)); err != nil {
 		return reconcile.Result{}, err
@@ -298,10 +291,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 	if len(set.Routes()) == 0 {
-		if err := r.enableExternalModelRoutes(ctx, tenant.ID(ait.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return reconcile.Result{}, err
 		}
-		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, gatewayNamespace, nil); cleanupErr != nil {
+		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, nil); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
 		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
@@ -313,7 +306,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(ait.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		for _, p := range validProviders {
 			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
 				return reconcile.Result{}, statusErr
@@ -324,7 +317,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupTransport(ctx, req.Namespace, gatewayNamespace, set.Routes()); err != nil {
+	if err := r.cleanupTransport(ctx, req.Namespace, set.Routes()); err != nil {
 		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -363,10 +356,89 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	return reconcile.Result{}, nil
 }
 
+type modelTenantContext struct {
+	aitenant         *unstructured.Unstructured
+	gatewayName      string
+	gatewayNamespace string
+}
+
+// prepareModelTenant resolves the MaasTenantConfig selector and the owning
+// AITenant before any ExternalModel serving state is published. A false
+// proceed result means status/cleanup work was completed and the caller must
+// stop this reconcile.
+func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.ExternalModel, namespace string) (modelTenantContext, bool, error) {
+	resolution, err := r.resolveTenantForNamespace(ctx, namespace)
+	if err != nil {
+		return modelTenantContext{}, false, err
+	}
+	if resolution.aitenant == nil {
+		message := "owning AITenant is not yet resolvable for MaasTenantConfig"
+		if resolution.missingConfig {
+			message = "MaasTenantConfig/default-tenant is missing; retaining serving state and waiting for the owner to resolve"
+		}
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, message, nil); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
+	ait := resolution.aitenant
+	// Preserve the existing deletion protocol before readiness gates: a
+	// deleting model may be observed while AITenant status is already being
+	// withdrawn, but reconcileDeletedModel still has the established fallback
+	// Gateway identity and must be allowed to release the model finalizer.
+	if resolution.selected {
+		if handled, err := r.handleModelLifecycle(ctx, model, ait); handled {
+			return modelTenantContext{}, false, err
+		} else if err != nil {
+			return modelTenantContext{}, false, err
+		}
+	}
+	// An explicit switch away from Praxis is a cleanup request even while the
+	// AITenant status is being withdrawn. Use the controller's configured
+	// Gateway identity as a fallback; cleanup must not wait for a currently
+	// ready gatewayRef that the owner is in the process of removing.
+	if !resolution.selected {
+		gatewayName, gatewayNamespace, _ := tenant.GatewayRef(ait)
+		if gatewayName == "" {
+			gatewayName = r.gatewayName()
+		}
+		if gatewayNamespace == "" {
+			gatewayNamespace = r.gatewayNamespace()
+		}
+		if err := r.cleanupUnselectedModel(ctx, model, tenant.ID(ait.GetName()), gatewayName, gatewayNamespace); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
+	gatewayName, gatewayNamespace, gatewayReady := tenant.GatewayRef(ait)
+	if !gatewayReady {
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant Gateway reference is not ready", nil); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
+	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
+			return modelTenantContext{}, false, err
+		}
+		return modelTenantContext{}, false, nil
+	}
+	return modelTenantContext{aitenant: ait, gatewayName: gatewayName, gatewayNamespace: gatewayNamespace}, true, nil
+}
+
 // cleanupUnselectedModel releases only resources owned by this controller when
 // the tenant no longer selects Praxis. The default IPP path is not targeted.
-func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if err := r.cleanupTransport(ctx, model.Namespace, r.gatewayNamespace(), nil); err != nil {
+func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
+	if gatewayName == "" {
+		gatewayName = r.gatewayName()
+	}
+	if gatewayNamespace == "" {
+		gatewayNamespace = r.gatewayNamespace()
+	}
+	if err := r.enableExternalModelRoutes(ctx, tenantID, model.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		return err
+	}
+	if err := r.cleanupTransport(ctx, model.Namespace, nil); err != nil {
 		return err
 	}
 	if err := r.cleanupOverlay(ctx, model.Namespace); err != nil {
@@ -434,7 +506,7 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 		if len(modelPtrs) > 0 {
 			return err
 		}
-		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayNamespace, nil); err != nil {
+		if err := r.cleanupTransport(ctx, deleted.Namespace, nil); err != nil {
 			return err
 		}
 		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
@@ -454,7 +526,7 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenant.ID(ait.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
-	if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayNamespace, set.Routes()); err != nil {
+	if err := r.cleanupTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
 		return err
 	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
@@ -486,7 +558,7 @@ func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1
 	return nil
 }
 
-func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNamespace string, routes []resolver.Route) error {
+func (r *Reconciler) cleanupTransport(ctx context.Context, namespace string, routes []resolver.Route) error {
 	providers := map[string]bool{}
 	models := map[string]bool{}
 	for _, route := range routes {
@@ -505,24 +577,25 @@ func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNam
 	}
 	for _, resource := range resources {
 		namespaces := []string{namespace}
-		if resource.kind == "DestinationRule" && gatewayNamespace != namespace {
-			namespaces = append(namespaces, gatewayNamespace)
+		listOptions := []client.ListOption{client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}}
+		if resource.kind == "DestinationRule" {
+			// DestinationRules are Gateway-local and may survive in a
+			// previous Gateway namespace. The tenant ownership label is
+			// required before listing cluster-wide; provider name and
+			// managed-by alone are not a safe ownership key in a shared
+			// Gateway namespace.
+			namespaces = []string{""}
+			listOptions = append(listOptions, client.MatchingLabels{externalTenantLabel: namespace})
 		}
 		for _, resourceNamespace := range namespaces {
 			list := &unstructured.UnstructuredList{}
 			list.SetGroupVersionKind(schema.GroupVersionKind{Group: resource.group, Version: resource.version, Kind: resource.kind + "List"})
-			if err := r.List(ctx, list, client.InNamespace(resourceNamespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
+			if err := r.List(ctx, list, append([]client.ListOption{client.InNamespace(resourceNamespace)}, listOptions...)...); err != nil {
 				return fmt.Errorf("list stale %s resources: %w", resource.kind, err)
 			}
 			for i := range list.Items {
 				name := list.Items[i].GetLabels()[resource.label]
 				keep := resource.keep[name]
-				// DestinationRules are Gateway-local when the Gateway and
-				// tenant namespaces differ. Remove an older controller-owned
-				// copy left in the tenant namespace during that topology move.
-				if resource.kind == "DestinationRule" && resourceNamespace == namespace && gatewayNamespace != namespace {
-					keep = false
-				}
 				if name != "" && !keep {
 					if err := r.Delete(ctx, &list.Items[i]); client.IgnoreNotFound(err) != nil {
 						return fmt.Errorf("delete stale %s %s/%s: %w", resource.kind, resourceNamespace, list.Items[i].GetName(), err)
@@ -550,23 +623,56 @@ func (r *Reconciler) cleanupOverlay(ctx context.Context, namespace string) error
 	return client.IgnoreNotFound(r.Delete(ctx, &cm))
 }
 
+type tenantResolution struct {
+	aitenant      *unstructured.Unstructured
+	selected      bool
+	missingConfig bool
+}
+
+func (r *Reconciler) resolveTenantForNamespace(ctx context.Context, namespace string) (tenantResolution, error) {
+	mtc := tenant.NewMaasTenantConfig()
+	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc)
+	if apierrors.IsNotFound(err) {
+		// The MaasTenantConfig is the sole selector. If it disappears, do
+		// not infer ownership from an AITenant and do not delete serving
+		// state: the owner may be recreating or handing off the config.
+		return tenantResolution{missingConfig: true}, nil
+	}
+	if err != nil {
+		return tenantResolution{}, fmt.Errorf("get MaasTenantConfig %s/%s: %w", namespace, tenant.MaasTenantConfigInstanceName, err)
+	}
+	ait, err := r.resolveOwningAITenant(ctx, mtc)
+	if err != nil {
+		return tenantResolution{}, err
+	}
+	return tenantResolution{aitenant: ait, selected: tenant.UsesPraxis(mtc)}, nil
+}
+
+func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	name, namespace, ok := tenant.OwningAITenantRef(mtc)
+	if !ok {
+		return nil, fmt.Errorf("MaasTenantConfig %s/%s has no owning AITenant reference", mtc.GetNamespace(), mtc.GetName())
+	}
+	ait := tenant.NewAITenant()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, ait); err != nil {
+		return nil, fmt.Errorf("get owning AITenant %s/%s: %w", namespace, name, err)
+	}
+	resolvedNamespace, ok := tenant.ConfigNamespace(ait)
+	if !ok || resolvedNamespace != mtc.GetNamespace() {
+		return nil, fmt.Errorf("AITenant %s/%s does not own MaasTenantConfig %s/%s", namespace, name, mtc.GetNamespace(), mtc.GetName())
+	}
+	return ait, nil
+}
+
+// praxisTenantForNamespace is retained for callers/tests that need the
+// resolved owner. Selection itself is deliberately read only from the
+// tenant-local MaasTenantConfig.
 func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace string) (*unstructured.Unstructured, bool, error) {
-	var tenants unstructured.UnstructuredList
-	tenants.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
-	if err := r.List(ctx, &tenants); err != nil {
-		return nil, false, fmt.Errorf("list AITenants: %w", err)
+	resolution, err := r.resolveTenantForNamespace(ctx, namespace)
+	if err != nil {
+		return nil, false, err
 	}
-	for i := range tenants.Items {
-		ait := &tenants.Items[i]
-		tenantNamespace, _, _ := unstructured.NestedString(ait.Object, "status", "tenantNamespace")
-		if tenantNamespace == "" {
-			tenantNamespace = ait.GetNamespace()
-		}
-		if tenantNamespace == namespace && tenant.UsesPraxis(ait) {
-			return ait, true, nil
-		}
-	}
-	return nil, false, nil
+	return resolution.aitenant, resolution.selected, nil
 }
 
 func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalProvider) error {
@@ -703,17 +809,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
 	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
 	if len(routes) == 0 {
-		filter := &unstructured.Unstructured{}
-		filter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
-		filter.SetName(name)
-		filter.SetNamespace(gatewayNamespace)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(filter), filter); err != nil {
-			return client.IgnoreNotFound(err)
-		}
-		if filter.GetLabels()["app.kubernetes.io/managed-by"] != "ai-gateway-controller" {
-			return nil
-		}
-		return client.IgnoreNotFound(r.Delete(ctx, filter))
+		return r.deleteExternalModelRouteFilters(ctx, name, modelNamespace)
 	}
 	filter := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1alpha3",
@@ -723,6 +819,7 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 			"namespace": gatewayNamespace,
 			"labels": map[string]any{
 				"app.kubernetes.io/managed-by": "ai-gateway-controller",
+				externalTenantLabel:            modelNamespace,
 			},
 		},
 		"spec": map[string]any{
@@ -815,6 +912,30 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 		return r.ApplyResource(ctx, r.Client, *filter)
 	}
 	return render.Apply(ctx, r.Client, []unstructured.Unstructured{*filter})
+}
+
+// deleteExternalModelRouteFilters removes only the controller-owned route
+// filter with the deterministic tenant name. Listing cluster-wide is
+// intentional: during an AITenant handoff its status.gatewayRef may already
+// be empty or may point at a new Gateway while the old filter still exists.
+// The tenant namespace label, exact name, and managed-by label are the
+// ownership guard.
+func (r *Reconciler) deleteExternalModelRouteFilters(ctx context.Context, name, modelNamespace string) error {
+	filters := &unstructured.UnstructuredList{}
+	filters.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilterList"})
+	if err := r.List(ctx, filters, client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: modelNamespace}); err != nil {
+		return fmt.Errorf("list controller-owned ExternalModel route EnvoyFilters: %w", err)
+	}
+	for i := range filters.Items {
+		filter := &filters.Items[i]
+		if filter.GetName() != name || filter.GetLabels()["app.kubernetes.io/managed-by"] != "ai-gateway-controller" || filter.GetLabels()[externalTenantLabel] != modelNamespace {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, filter)); err != nil {
+			return fmt.Errorf("delete ExternalModel route EnvoyFilter %s/%s: %w", filter.GetNamespace(), filter.GetName(), err)
+		}
+	}
+	return nil
 }
 
 func setOwnerReference(obj *unstructured.Unstructured, owner client.Object) {
@@ -974,9 +1095,14 @@ func providerDestinationRuleForTenant(route resolver.Route, ns, tenantID string)
 	if tenantID != "" && tenantID != "models-as-a-service" {
 		name += "-" + tenantID
 	}
+	labels := map[string]any{
+		"app.kubernetes.io/managed-by":               "ai-gateway-controller",
+		"inference.opendatahub.io/external-provider": route.Provider,
+	}
+	labels[externalTenantLabel] = route.Namespace
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1", "kind": "DestinationRule",
-		"metadata": labelledMetadata(name, ns, "inference.opendatahub.io/external-provider", route.Provider),
+		"metadata": map[string]any{"name": name, "namespace": ns, "labels": labels},
 		"spec": map[string]any{
 			// The Gateway workload may be in a different namespace from the
 			// tenant-owned transport resources. Export the rule explicitly so
