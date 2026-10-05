@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -586,9 +587,10 @@ func controllerMaasTenantConfig(namespace, aitenantName, aitenantNamespace, sele
 	u.SetName(tenant.MaasTenantConfigInstanceName)
 	u.SetNamespace(namespace)
 	u.SetAnnotations(map[string]string{
-		tenant.AnnotationPayloadProcessingType: selector,
-		tenant.AnnotationAITenantName:          aitenantName,
-		tenant.AnnotationAITenantNamespace:     aitenantNamespace,
+		tenant.AnnotationPayloadProcessingType:   selector,
+		tenant.AnnotationAITenantName:            aitenantName,
+		tenant.AnnotationAITenantNamespace:       aitenantNamespace,
+		tenant.AnnotationPayloadProcessingStatus: tenant.PayloadProcessingStatusSteady,
 	})
 	return u
 }
@@ -791,7 +793,7 @@ func TestDefaultTenantCleanupPreservesNeighborDestinationRule(t *testing.T) {
 		t.Fatalf("default DestinationRule tenant label = %q, want models-as-a-service", got)
 	}
 	r := controllerTestClient(t, &defaultRule, &neighbor)
-	if err := r.cleanupTransport(context.Background(), "models-as-a-service", nil); err != nil {
+	if err := r.cleanupTransport(context.Background(), "models-as-a-service", "", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	got := &unstructured.Unstructured{}
@@ -815,8 +817,9 @@ func TestResolveTenantRejectsWrongOwnerAndStatusNamespace(t *testing.T) {
 	if err := r.Update(context.Background(), mtc); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.resolveTenantForNamespace(context.Background(), "tenant-a"); err == nil || !strings.Contains(err.Error(), "get owning AITenant") {
-		t.Fatalf("wrong owner resolution error = %v, want missing owner error", err)
+	resolution, err := r.resolveTenantForNamespace(context.Background(), "tenant-a")
+	if err != nil || resolution.aitenant != nil || !resolution.selected {
+		t.Fatalf("missing owner resolution = %#v, %v, want selected with no owner", resolution, err)
 	}
 }
 
@@ -1400,5 +1403,402 @@ func TestReconcileRevalidatesPendingProviderDuringIPPHandoff(t *testing.T) {
 	var overlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
 		t.Fatalf("routing overlay = %v", err)
+	}
+}
+
+func TestReconcileRequiresSteadyPayloadProcessingHandoff(t *testing.T) {
+	for _, status := range []string{"", tenant.PayloadProcessingStatusCleanupComplete, tenant.PayloadProcessingStatusSteady} {
+		t.Run(map[string]string{"": "absent", tenant.PayloadProcessingStatusCleanupComplete: "cleanup-complete", tenant.PayloadProcessingStatusSteady: "steady"}[status], func(t *testing.T) {
+			r, model := reconcilerFixture(t)
+			var mtc unstructured.Unstructured
+			mtc.SetGroupVersionKind(tenant.MaasTenantConfigGVK)
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: tenant.MaasTenantConfigInstanceName}, &mtc); err != nil {
+				t.Fatal(err)
+			}
+			annotations := mtc.GetAnnotations()
+			if status == "" {
+				delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+			} else {
+				annotations[tenant.AnnotationPayloadProcessingStatus] = status
+			}
+			mtc.SetAnnotations(annotations)
+			if err := r.Update(context.Background(), &mtc); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			var overlay corev1.ConfigMap
+			overlayErr := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay)
+			if status == tenant.PayloadProcessingStatusSteady {
+				if overlayErr != nil {
+					t.Fatalf("steady handoff did not publish serving state: %v", overlayErr)
+				}
+			} else if !apierrors.IsNotFound(overlayErr) {
+				t.Fatalf("status %q published serving state: %v", status, overlayErr)
+			}
+		})
+	}
+}
+
+func TestExplicitIPPSwitchCleansWithoutSteadyStatus(t *testing.T) {
+	for _, status := range []string{"", tenant.PayloadProcessingStatusCleanupComplete} {
+		t.Run(map[string]string{"": "absent", tenant.PayloadProcessingStatusCleanupComplete: "cleanup-complete"}[status], func(t *testing.T) {
+			r, model := reconcilerFixture(t)
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			var mtc unstructured.Unstructured
+			mtc.SetGroupVersionKind(tenant.MaasTenantConfigGVK)
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: tenant.MaasTenantConfigInstanceName}, &mtc); err != nil {
+				t.Fatal(err)
+			}
+			annotations := mtc.GetAnnotations()
+			annotations[tenant.AnnotationPayloadProcessingType] = tenant.PayloadProcessingBackendIPP
+			if status == "" {
+				delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+			} else {
+				annotations[tenant.AnnotationPayloadProcessingStatus] = status
+			}
+			mtc.SetAnnotations(annotations)
+			if err := r.Update(context.Background(), &mtc); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			var overlay corev1.ConfigMap
+			if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+				t.Fatalf("IPP switch with status %q left overlay: %v", status, err)
+			}
+		})
+	}
+}
+
+type overridingTenantConfigReader struct {
+	client.Reader
+	mtc *unstructured.Unstructured
+}
+
+func (r overridingTenantConfigReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == tenant.MaasTenantConfigGVK && key.Name == tenant.MaasTenantConfigInstanceName {
+		*u = *r.mtc.DeepCopy()
+		return nil
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestStalePraxisDecisionDoesNotPublishAfterLiveIPPSwitch(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ipp := controllerMaasTenantConfig(model.Namespace, "tenant", "models-as-a-service", tenant.PayloadProcessingBackendIPP)
+	r.APIReader = overridingTenantConfigReader{Reader: r.APIReader, mtc: ipp}
+	published := false
+	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+		published = true
+		return publisher.Result{}, nil
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	if published {
+		t.Fatal("stale Praxis decision published after live IPP switch")
+	}
+}
+
+func TestDeletingModelCleansOwnedResourcesWithoutMTCOrAITenant(t *testing.T) {
+	for _, withMTC := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing-mtc", true: "missing-aitenant"}[withMTC], func(t *testing.T) {
+			model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{
+				Name: "model", Namespace: "tenant-a", Finalizers: []string{externalModelFinalizer},
+				DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-time.Minute)},
+			}}
+			labels := map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a"}
+			filter := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "networking.istio.io/v1alpha3", "kind": "EnvoyFilter",
+				"metadata": map[string]any{"name": tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "namespace": "gateway-old", "labels": labels},
+			}}
+			route := resolver.Route{Model: "model", Provider: "provider", Namespace: "tenant-a", Endpoint: "provider.example.com"}
+			dr := providerDestinationRuleAtGateway(route, "gateway-old", "gateway-old", "tenant")
+			svc := providerService(route, "tenant-a")
+			entry := providerServiceEntry(route, "tenant-a")
+			httpRoute := modelHTTPRouteSet([]resolver.Route{route}, "tenant-a", "gateway", "gateway-old")
+			overlay := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "routing-overlay", Namespace: "tenant-a", Labels: map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller"}}}
+			objects := []client.Object{model, filter, &dr, &svc, &entry, &httpRoute, overlay}
+			if withMTC {
+				objects = append(objects, controllerMaasTenantConfig("tenant-a", "missing", "models-as-a-service", tenant.PayloadProcessingBackendPraxis))
+			}
+			r := controllerTestClient(t, objects...)
+			r.Namespace = "tenant-a"
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			var gotModel v1alpha1.ExternalModel
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gotModel); err != nil && !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&gotModel, externalModelFinalizer) {
+				t.Fatal("deleting model retained finalizer after ownerless cleanup")
+			}
+			for _, object := range []struct {
+				obj       client.Object
+				group     string
+				version   string
+				kind      string
+				namespace string
+			}{
+				{filter, "networking.istio.io", "v1alpha3", "EnvoyFilter", "gateway-old"},
+				{&dr, "networking.istio.io", "v1", "DestinationRule", "gateway-old"},
+				{&svc, "", "v1", "Service", "tenant-a"},
+				{&entry, "networking.istio.io", "v1", "ServiceEntry", "tenant-a"},
+				{&httpRoute, "gateway.networking.k8s.io", "v1", "HTTPRoute", "tenant-a"},
+				{overlay, "", "v1", "ConfigMap", "tenant-a"},
+			} {
+				got := &unstructured.Unstructured{}
+				got.SetGroupVersionKind(schema.GroupVersionKind{Group: object.group, Version: object.version, Kind: object.kind})
+				if err := r.Get(context.Background(), client.ObjectKey{Namespace: object.namespace, Name: object.obj.GetName()}, got); !apierrors.IsNotFound(err) {
+					t.Fatalf("owned %s/%s remained: %v", object.namespace, object.obj.GetName(), err)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileDeletingModelHonorsIPPSwitchWithSurvivingSibling(t *testing.T) {
+	deleted := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "deleted-model",
+			Namespace:         "tenant-a",
+			Finalizers:        []string{externalModelFinalizer},
+			DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-time.Minute)},
+		},
+	}
+	sibling := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "surviving-model", Namespace: "tenant-a", UID: "sibling-uid"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.NameReference{Name: "provider"}, TargetModel: "gpt",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("fixture")}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", tenant.PayloadProcessingBackendIPP)
+	overlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "routing-overlay", Namespace: "tenant-a", Labels: map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller"}},
+		Data:       map[string]string{"routing-overlay.json": `{"serving":"last-known-good"}`},
+	}
+	r := controllerTestClient(t, deleted, sibling, provider, secret, ait, mtc, overlay)
+	r.Namespace, r.GatewayName, r.GatewayNamespace = "tenant-a", "gateway", "gateway-system"
+	published := false
+	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+		published = true
+		return publisher.Result{}, nil
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(deleted)}); err != nil {
+		t.Fatal(err)
+	}
+	if published {
+		t.Fatal("deleting model on explicit IPP switch republished a Praxis overlay")
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(overlay), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("IPP cleanup left the routing overlay: %v", err)
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(deleted), &got); !apierrors.IsNotFound(err) {
+		t.Fatalf("IPP cleanup left deleting model present with its finalizer: %v", err)
+	}
+}
+
+func TestOwnerlessDeletingModelWithSiblingRetainsFinalizerWhenIdentityIsAmbiguous(t *testing.T) {
+	deleted := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "deleted-model",
+			Namespace:         "tenant-a",
+			Finalizers:        []string{externalModelFinalizer},
+			DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-time.Minute)},
+		},
+	}
+	sibling := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "surviving-model", Namespace: "tenant-a"}}
+	r := controllerTestClient(t, deleted, sibling)
+	r.Namespace = "tenant-a"
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(deleted)}); err == nil {
+		t.Fatal("ownerless deletion with an ambiguous sibling unexpectedly succeeded")
+	}
+	var got v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(deleted), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalModelFinalizer) {
+		t.Fatal("ambiguous ownerless deletion dropped the finalizer")
+	}
+}
+
+func TestDeletingModelDoesNotRebuildSiblingRoutesBeforeSteadyHandoff(t *testing.T) {
+	for _, status := range []string{"missing-mtc", "absent", tenant.PayloadProcessingStatusCleanupComplete} {
+		t.Run(status, func(t *testing.T) {
+			deleted := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{
+				Name: "deleted-model", Namespace: "tenant-a", Finalizers: []string{externalModelFinalizer},
+				DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-time.Minute)},
+			}}
+			sibling := &v1alpha1.ExternalModel{
+				ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: "tenant-a", UID: "sibling-uid"},
+				Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+					Ref: v1alpha1.NameReference{Name: "provider"}, TargetModel: "gpt",
+					APIFormat: "openai-chat", Path: "/v1/chat/completions",
+				}}},
+			}
+			provider := &v1alpha1.ExternalProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+				Spec: v1alpha1.ExternalProviderSpec{
+					Provider: "openai", Endpoint: "api.example.com",
+					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+				},
+			}
+			ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+			filter := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "networking.istio.io/v1alpha3", "kind": "EnvoyFilter",
+				"metadata": map[string]any{
+					"name": tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "namespace": "gateway-system",
+					"labels": map[string]any{
+						"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a",
+						externalTenantIDLabel: "tenant", externalGatewayNameLabel: "gateway",
+						externalGatewayNamespaceLabel: "gateway-system",
+					},
+				},
+			}}
+			objects := []client.Object{deleted, sibling, provider, ait, filter}
+			if status != "missing-mtc" {
+				mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", tenant.PayloadProcessingBackendPraxis)
+				annotations := mtc.GetAnnotations()
+				if status == "absent" {
+					delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+				} else {
+					annotations[tenant.AnnotationPayloadProcessingStatus] = status
+				}
+				mtc.SetAnnotations(annotations)
+				objects = append(objects, mtc)
+			}
+			r := controllerTestClient(t, objects...)
+			r.Namespace, r.GatewayName, r.GatewayNamespace = "tenant-a", "gateway", "gateway-system"
+			published := false
+			r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+				published = true
+				return publisher.Result{}, nil
+			}
+			if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(deleted)}); err == nil {
+				t.Fatal("deletion rebuilt sibling routes before the Praxis handoff became steady")
+			}
+			if published {
+				t.Fatal("deletion published sibling routes before the Praxis handoff became steady")
+			}
+			var got v1alpha1.ExternalModel
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(deleted), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !controllerutil.ContainsFinalizer(&got, externalModelFinalizer) {
+				t.Fatal("deletion released finalizer before sibling serving state could be reconciled")
+			}
+		})
+	}
+}
+
+func TestActiveProviderGatewayMoveRemovesOnlyPriorTenantCopies(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+		},
+	}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "tenant-a", UID: "model-uid"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.NameReference{Name: "provider"}, TargetModel: "gpt",
+			APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("fixture")}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "new-gateway", "new-gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", tenant.PayloadProcessingBackendPraxis)
+	route := resolver.Route{Model: "model", Provider: "provider", Namespace: "tenant-a", Endpoint: "api.example.com"}
+	oldRule := providerDestinationRuleAtGateway(route, "old-gateway", "old-gateway-system", "tenant")
+	neighborRule := providerDestinationRuleAtGateway(resolver.Route{Provider: "provider", Namespace: "tenant-b", Endpoint: "neighbor.example.com"}, "old-gateway", "old-gateway-system", "neighbor")
+	oldFilter := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3", "kind": "EnvoyFilter",
+		"metadata": map[string]any{
+			"name": tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "namespace": "old-gateway-system",
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a",
+				externalTenantIDLabel: "tenant", externalGatewayNameLabel: "old-gateway",
+				externalGatewayNamespaceLabel: "old-gateway-system",
+			},
+		},
+	}}
+	r := controllerTestClient(t, provider, model, secret, ait, mtc, &oldRule, &neighborRule, oldFilter)
+	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "new-gateway", "new-gateway-system", "external-model"
+	r.KnownClusters = []string{"provider-provider"}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range []client.Object{&oldRule, oldFilter} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(object), got); !apierrors.IsNotFound(err) {
+			t.Fatalf("prior Gateway resource %s/%s remained: %v", object.GetNamespace(), object.GetName(), err)
+		}
+	}
+	for _, object := range []client.Object{&neighborRule} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(object), got); err != nil {
+			t.Fatalf("neighbor resource %s/%s was removed: %v", object.GetNamespace(), object.GetName(), err)
+		}
+	}
+	currentRule := &unstructured.Unstructured{}
+	currentRule.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "new-gateway-system", Name: "provider-provider-tenant"}, currentRule); err != nil {
+		t.Fatalf("current Gateway DestinationRule missing: %v", err)
+	}
+	if currentRule.GetLabels()[externalGatewayNameLabel] != "new-gateway" {
+		t.Fatalf("current Gateway ownership labels = %#v", currentRule.GetLabels())
+	}
+}
+
+func TestAmbiguousPrePRDestinationRuleIsPreserved(t *testing.T) {
+	// origin/main rendered provider-<provider> in the Gateway namespace with
+	// only managed-by and external-provider labels. It has no tenant identity,
+	// owner reference, or Gateway label, so automatic deletion would risk a
+	// neighboring tenant. Leave it for the documented manual migration.
+	legacy := unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1", "kind": "DestinationRule",
+		"metadata": map[string]any{
+			"name": "provider-provider-a", "namespace": "gateway-system",
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by":               "ai-gateway-controller",
+				"inference.opendatahub.io/external-provider": "provider-a",
+			},
+		},
+		"spec": map[string]any{"host": "legacy.example.com"},
+	}}
+	owned := providerDestinationRuleAtGateway(resolver.Route{Provider: "provider-a", Namespace: "tenant-a", Endpoint: "current.example.com"}, "gateway", "gateway-system", "tenant")
+	r := controllerTestClient(t, &legacy, &owned)
+	if err := r.cleanupTransport(context.Background(), "tenant-a", "", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	gotLegacy := &unstructured.Unstructured{}
+	gotLegacy.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&legacy), gotLegacy); err != nil {
+		t.Fatalf("ambiguous pre-PR DestinationRule was removed: %v", err)
+	}
+	gotOwned := &unstructured.Unstructured{}
+	gotOwned.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(&owned), gotOwned); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned DestinationRule cleanup error = %v, want NotFound", err)
 	}
 }

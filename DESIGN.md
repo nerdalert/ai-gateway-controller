@@ -24,6 +24,41 @@ overlay, credential projections, and Envoy-owned provider transport.
 
 ## Purpose
 
+### ExternalModel handoff and transport cleanup ownership
+
+`ai-gateway-controller` reads `payload-processing-type` and
+`payload-processing-status` only from the tenant-local `MaasTenantConfig`.
+It publishes ExternalModel serving state only after the selector is Praxis and
+the handoff status is `steady`; the tenant reconciler owns the transition to
+`steady` and `cleanup-complete`. An explicit `ipp` selector is a cleanup
+request and does not wait for `steady`. A missing configuration is retained
+for non-deleting models, while deleting models use controller ownership labels
+and the model namespace to complete safe final-model cleanup.
+
+Gateway-local provider `DestinationRule` objects and the route `EnvoyFilter`
+carry the model namespace, tenant identifier, and current Gateway name and
+namespace. On a Gateway move, the controller applies the new copy first and
+removes only the old copy carrying the same tenant identity. Neighboring
+tenant and foreign-controller resources are not candidates for deletion.
+
+The pre-PR DestinationRule shape from `origin/main` was
+`provider-<provider>` in the Gateway namespace with only
+`app.kubernetes.io/managed-by=ai-gateway-controller` and
+`inference.opendatahub.io/external-provider=<provider>` labels. It has no
+tenant or Gateway identity and is therefore inherently ambiguous in a shared
+Gateway namespace. The controller intentionally leaves such an object alone;
+an operator must perform a targeted manual migration after identifying its
+owner. New controller-owned rules are unambiguous and are cleaned up by the
+normal handoff/finalizer path.
+
+If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
+there are sibling models, deletion is conservative: it will not rebuild shared
+Praxis serving state without a live, steady tenant handoff. The ExternalModel
+finalizer remains until the owning handoff objects are restored or the sibling
+models are removed. Final-model deletion can clean controller-owned state
+using its namespace and ownership labels. Ambiguous pre-PR resources are never
+removed by a label-only sweep.
+
 `ai-gateway-controller` is the AI Gateway control-plane controller. Target
 state (3.6): sibling of `maas-controller`, both deployed by
 `ai-gateway-operator`:
