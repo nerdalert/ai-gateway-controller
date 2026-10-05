@@ -242,9 +242,12 @@ resources. Do not first restore IPP from saved YAML, add
 ownership metadata by hand, or run two routing-state writers at once.
 
 The harness writes only `payload-processing-type=praxis`; it never fabricates
-the MaaS handoff status annotation. Provisioning waits for the
-MaaS/controller claim to reach `payload-processing-status=steady` and records
-that observation. If `MaasTenantConfig/default-tenant` is temporarily absent,
+the MaaS handoff status annotation. Provisioning has two bounded handoff
+gates: before applying the run-owned controller, the source-created config may
+be `cleanup-complete` or `steady`; after the controller and ExternalModel
+fixtures are applied, the config must reach `payload-processing-status=steady`
+before qualification continues. Both status snapshots and timeout diagnostics
+are retained in run evidence. If `MaasTenantConfig/default-tenant` is temporarily absent,
 the ExternalModel controller retains its existing serving state and waits for
 the owner to recreate the config; it does not infer selection from `AITenant`
 or delete resources. An explicit `ipp` selection is the cleanup signal.
@@ -701,6 +704,7 @@ make lint
 ./test/kind-env/test-provider-credentials.sh
 ./test/openshift-env/test-request-wrapper.sh
 ./test/openshift-env/test-render-manifests.sh
+./test/openshift-env/test-provision-handoff-order.sh
 
 for file in test/openshift-env/*.sh; do
   bash -n "$file"

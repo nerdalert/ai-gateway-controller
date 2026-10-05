@@ -49,6 +49,17 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
 }
 
+func legacyExternalModelRouteFilter(name, namespace, managedBy string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3",
+		"kind":       "EnvoyFilter",
+		"metadata": map[string]any{
+			"name": name, "namespace": namespace,
+			"labels": map[string]any{"app.kubernetes.io/managed-by": managedBy},
+		},
+	}}
+}
+
 func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *testing.T) {
 	filter := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1alpha3",
@@ -733,7 +744,10 @@ func TestExplicitIPPSwitchCleansOwnedResourcesWithoutGatewayStatus(t *testing.T)
 			"labels":    map[string]any{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-a"},
 		},
 	}}
-	r := controllerTestClient(t, model, ait, mtc, overlay, filter)
+	legacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "old-gateway-system", "ai-gateway-controller")
+	neighborLegacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("neighbor"), "old-gateway-system", "ai-gateway-controller")
+	foreignLegacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "foreign-gateway-system", "other-controller")
+	r := controllerTestClient(t, model, ait, mtc, overlay, filter, legacy, neighborLegacy, foreignLegacy)
 	r.Namespace, r.GatewayNamespace = "tenant-a", "gateway-system"
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
@@ -742,6 +756,18 @@ func TestExplicitIPPSwitchCleansOwnedResourcesWithoutGatewayStatus(t *testing.T)
 	gotFilter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(filter), &gotFilter); !apierrors.IsNotFound(err) {
 		t.Fatalf("route filter cleanup error = %v, want NotFound", err)
+	}
+	for _, preserved := range []*unstructured.Unstructured{neighborLegacy, foreignLegacy} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(preserved), got); err != nil {
+			t.Fatalf("legacy neighboring/foreign filter %s/%s was removed: %v", preserved.GetNamespace(), preserved.GetName(), err)
+		}
+	}
+	gotFilter = unstructured.Unstructured{}
+	gotFilter.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"})
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(legacy), &gotFilter); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy route filter cleanup error = %v, want NotFound", err)
 	}
 	var gotOverlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(overlay), &gotOverlay); !apierrors.IsNotFound(err) {
@@ -1740,13 +1766,16 @@ func TestActiveProviderGatewayMoveRemovesOnlyPriorTenantCopies(t *testing.T) {
 			},
 		},
 	}}
-	r := controllerTestClient(t, provider, model, secret, ait, mtc, &oldRule, &neighborRule, oldFilter)
+	legacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "legacy-gateway-system", "ai-gateway-controller")
+	neighborLegacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("neighbor"), "legacy-gateway-system", "ai-gateway-controller")
+	foreignLegacy := legacyExternalModelRouteFilter(tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"), "foreign-gateway-system", "other-controller")
+	r := controllerTestClient(t, provider, model, secret, ait, mtc, &oldRule, &neighborRule, oldFilter, legacy, neighborLegacy, foreignLegacy)
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "new-gateway", "new-gateway-system", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatal(err)
 	}
-	for _, object := range []client.Object{&oldRule, oldFilter} {
+	for _, object := range []client.Object{&oldRule, oldFilter, legacy} {
 		got := &unstructured.Unstructured{}
 		got.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
 		if err := r.Get(context.Background(), client.ObjectKeyFromObject(object), got); !apierrors.IsNotFound(err) {
@@ -1758,6 +1787,13 @@ func TestActiveProviderGatewayMoveRemovesOnlyPriorTenantCopies(t *testing.T) {
 		got.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
 		if err := r.Get(context.Background(), client.ObjectKeyFromObject(object), got); err != nil {
 			t.Fatalf("neighbor resource %s/%s was removed: %v", object.GetNamespace(), object.GetName(), err)
+		}
+	}
+	for _, object := range []client.Object{neighborLegacy, foreignLegacy} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(object), got); err != nil {
+			t.Fatalf("legacy neighboring/foreign filter %s/%s was removed: %v", object.GetNamespace(), object.GetName(), err)
 		}
 	}
 	currentRule := &unstructured.Unstructured{}

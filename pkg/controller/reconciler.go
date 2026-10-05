@@ -316,6 +316,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return reconcile.Result{}, err
 		}
+		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
+			return reconcile.Result{}, err
+		}
 		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, nil); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
@@ -464,6 +467,11 @@ func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1
 	if err := r.deleteExternalModelRouteFiltersForTenant(ctx, model.Namespace); err != nil {
 		return err
 	}
+	if live.aitenant != nil {
+		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(live.aitenant.GetName())); err != nil {
+			return err
+		}
+	}
 	if err := r.cleanupTransport(ctx, model.Namespace, "", "", nil); err != nil {
 		return err
 	}
@@ -603,6 +611,11 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
 			return err
 		}
+		if tenantID != "" {
+			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
+				return err
+			}
+		}
 		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return err
 		}
@@ -621,6 +634,9 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
+		return err
+	}
+	if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
 		return err
 	}
 	if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
@@ -1131,6 +1147,35 @@ func (r *Reconciler) deleteExternalModelRouteFiltersForTenant(ctx context.Contex
 	return nil
 }
 
+// deleteLegacyExternalModelRouteFilter removes the pre-#105 route filter only
+// when the tenant identity is known. Before the ownership labels were added,
+// the deterministic name and controller managed-by label are the remaining
+// ownership proof. The exact-name check is mandatory: never sweep filters by
+// managed-by alone, because a shared Gateway namespace may contain other
+// tenants or foreign resources.
+func (r *Reconciler) deleteLegacyExternalModelRouteFilter(ctx context.Context, tenantID string) error {
+	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
+	filters := &unstructured.UnstructuredList{}
+	filters.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilterList"})
+	if err := r.List(ctx, filters, client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
+		return fmt.Errorf("list legacy ExternalModel route EnvoyFilters: %w", err)
+	}
+	for i := range filters.Items {
+		filter := &filters.Items[i]
+		labels := filter.GetLabels()
+		if filter.GetName() != name || labels["app.kubernetes.io/managed-by"] != "ai-gateway-controller" {
+			continue
+		}
+		if _, labeledForTenant := labels[externalTenantLabel]; labeledForTenant {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, filter)); err != nil {
+			return fmt.Errorf("delete legacy ExternalModel route EnvoyFilter %s/%s: %w", filter.GetNamespace(), filter.GetName(), err)
+		}
+	}
+	return nil
+}
+
 // cleanupExternalModelRouteFilters removes stale Gateway-local copies after
 // the new copy has been applied. The deterministic name plus tenant label is
 // the ownership proof; Gateway labels decide which copy is current.
@@ -1154,7 +1199,7 @@ func (r *Reconciler) cleanupExternalModelRouteFilters(ctx context.Context, model
 			return fmt.Errorf("delete stale ExternalModel route EnvoyFilter %s/%s: %w", filter.GetNamespace(), filter.GetName(), err)
 		}
 	}
-	return nil
+	return r.deleteLegacyExternalModelRouteFilter(ctx, tenantID)
 }
 
 func setOwnerReference(obj *unstructured.Unstructured, owner client.Object) {

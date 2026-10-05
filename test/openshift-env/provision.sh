@@ -477,12 +477,12 @@ MTC_STATUS_DEADLINE=$((SECONDS + 300))
 MTC_STATUS=""
 while (( SECONDS < MTC_STATUS_DEADLINE )); do
   MTC_STATUS=$("${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)
-  [[ "$MTC_STATUS" == steady ]] && break
+  [[ "$MTC_STATUS" == cleanup-complete || "$MTC_STATUS" == steady ]] && break
   sleep 2
 done
-if [[ "$MTC_STATUS" != steady ]]; then
+if [[ "$MTC_STATUS" != cleanup-complete && "$MTC_STATUS" != steady ]]; then
   "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json >"$OUT/maastenantconfig-handoff-timeout.json" 2>&1 || true
-  echo "MaaS/Praxis handoff did not reach steady; diagnostics: $OUT/maastenantconfig-handoff-timeout.json" >&2
+  echo "MaaS/Praxis handoff did not reach cleanup-complete or steady before controller claim; diagnostics: $OUT/maastenantconfig-handoff-timeout.json" >&2
   exit 1
 fi
 "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json |
@@ -707,6 +707,26 @@ apply_rendered 40-model-fixtures.yaml
 export OPENSHIFT_E2E_USER
 "$ROOT/test/openshift-env/render-manifests.sh" "$RENDER_DIR" 50-maas-fixtures.yaml.tmpl >"$OUT/render-manifests-maas.log"
 apply_rendered 50-maas-fixtures.yaml
+
+# The run-owned controller claims the Praxis handoff only after it is applied
+# and the ExternalModel fixtures exist. A fresh tenant may correctly enter the
+# early gate in cleanup-complete; serving state is not publishable until the
+# controller has completed its real handoff and MaaS reports steady.
+MTC_STEADY_DEADLINE=$((SECONDS + 300))
+MTC_STATUS=""
+while (( SECONDS < MTC_STEADY_DEADLINE )); do
+  MTC_STATUS=$("${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/payload-processing-status}' 2>/dev/null || true)
+  [[ "$MTC_STATUS" == steady ]] && break
+  sleep 2
+done
+if [[ "$MTC_STATUS" != steady ]]; then
+  "${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json >"$OUT/maastenantconfig-steady-timeout.json" 2>&1 || true
+  echo "MaaS/Praxis handoff did not reach steady after controller and ExternalModel fixtures; diagnostics: $OUT/maastenantconfig-steady-timeout.json" >&2
+  exit 1
+fi
+"${OC[@]}" get maastenantconfig "$MTC_NAME" -n "$MTC_NAMESPACE" -o json |
+  jq '{name:.metadata.name,namespace:.metadata.namespace,uid:.metadata.uid,selector:(.metadata.annotations["maas.opendatahub.io/payload-processing-type"] // ""),status:(.metadata.annotations["maas.opendatahub.io/payload-processing-status"] // "")}' \
+  >"$OUT/maastenantconfig-after-controller-fixtures.json"
 
 # MaaS creates the gateway AuthPolicy from its fixture.  Do not finish
 # provisioning until Kuadrant has both accepted and enforced that generated
