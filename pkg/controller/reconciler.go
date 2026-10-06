@@ -321,7 +321,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
+	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		reason := reasonReconcileFailed
 		if errors.Is(err, errCredentialNotReady) {
 			reason = reasonProviderNotReady
@@ -670,8 +670,8 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
 	}
-	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
-		return fmt.Errorf("validate remaining ExternalModel credentials after deletion: %w", err)
+	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
+		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
 	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
@@ -954,6 +954,13 @@ func (r *Reconciler) validateResolvedCredentials(ctx context.Context, routes []r
 		}
 	}
 	return nil
+}
+
+func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet) error {
+	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
+		return err
+	}
+	return envelope.ValidateSelectionMetadata(set)
 }
 
 func (r *Reconciler) namespaceAllowed(namespace string) bool {
