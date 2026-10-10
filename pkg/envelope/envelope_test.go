@@ -542,8 +542,11 @@ func TestComputeDigest_KnownVectors(t *testing.T) {
 }
 
 func TestRender_SelectionPolicyOnWire(t *testing.T) {
-	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
-	env, err := Render(set, scope(), Revision{}, Options{SelectionPolicy: json.RawMessage(`{"mode":"random"}`)})
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{
+		route("m1", "p1", 1),
+		route("m1", "p2", 1),
+	}})
+	env, err := Render(set, scope(), Revision{}, Options{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -552,10 +555,19 @@ func TestRender_SelectionPolicyOnWire(t *testing.T) {
 		t.Fatalf("marshal overlay: %v", err)
 	}
 	if !strings.Contains(string(raw), `"selection_policy":{"mode":"random"}`) {
-		t.Errorf("selection_policy must serialize verbatim: %s", raw)
+		t.Errorf("equal-provider policy must serialize: %s", raw)
 	}
-	// absent by default
-	env2, _ := Render(set, scope(), Revision{}, Options{})
+	for i, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Errorf("candidate %d selection_group = %v, want numeric zero", i, candidate.SelectionGroup)
+		}
+	}
+	// A singleton derives no policy and remains deterministic.
+	singleton := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
+	env2, err := Render(singleton, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render singleton: %v", err)
+	}
 	raw2, err := json.Marshal(env2.Overlay)
 	if err != nil {
 		t.Fatalf("marshal overlay: %v", err)

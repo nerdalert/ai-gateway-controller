@@ -150,9 +150,6 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
-	// SelectionPolicy overrides the policy derived from equal-weight route
-	// groups. Nil derives the policy automatically; singleton routes omit it.
-	SelectionPolicy json.RawMessage
 }
 
 // Render validates the resolved route set and emits the envelope with its
@@ -233,10 +230,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 		Network:         scope.Network,
 		LocalSite:       scope.LocalSite,
 		Candidates:      candidates,
-		SelectionPolicy: opts.SelectionPolicy,
-	}
-	if len(overlay.SelectionPolicy) == 0 {
-		overlay.SelectionPolicy = selection.policy
+		SelectionPolicy: selection.policy,
 	}
 	digest, err := ComputeDigest(overlay)
 	if err != nil {
