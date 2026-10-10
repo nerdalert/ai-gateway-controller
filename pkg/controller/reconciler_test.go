@@ -1183,8 +1183,8 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	sibling := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid", Finalizers: []string{externalModelFinalizer}},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "shared-model", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
-			{Ref: v1alpha1.NameReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-			{Ref: v1alpha1.NameReference{Name: "provider-c"}, TargetModel: "gpt-c", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "provider-c"}, TargetModel: "gpt-c", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
 		}},
 	}
 	if err := r.Create(context.Background(), sibling); err != nil {
@@ -1293,7 +1293,7 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		t.Fatal(err)
 	}
 	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.NameReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	})
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
@@ -1407,7 +1407,7 @@ func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T
 	}
 	unequalWeight := 2
 	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.NameReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
+		Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat",
 		Path: "/v1/chat/completions", Weight: &unequalWeight,
 	})
 	if err := r.Update(context.Background(), model); err != nil {
