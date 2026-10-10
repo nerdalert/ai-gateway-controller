@@ -171,7 +171,7 @@ def capture_provider_ingress_events(label, request_ids):
             logs = kubectl("-n", API_NAMESPACE, "logs", f"pod/{name}", "-c", "recorder",
                            check=False).stdout
             for line in logs.splitlines():
-                fields = dict(re.findall(r"([a-z_]+)=([^ ]*)", line))
+                fields = dict(re.findall(r"([a-z0-9_]+)=([^ ]*)", line))
                 if fields.get("request_id") not in wanted:
                     continue
                 events.append({key: fields.get(key, "") for key in (
