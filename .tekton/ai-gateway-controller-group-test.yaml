@@ -26,11 +26,11 @@ spec:
     resolver: git
     params:
     - name: url
-      value: '{{source_url}}'
+      value: https://github.com/opendatahub-io/odh-konflux-central.git
     - name: revision
-      value: '{{revision}}'
+      value: main
     - name: pathInRepo
-      value: hack/tekton/pr-group-testing-pipeline.yaml
+      value: integration-tests/ai-gateway-controller/pr-group-testing-pipeline.yaml
   taskRunTemplate:
     podTemplate:
       nodeSelector:
