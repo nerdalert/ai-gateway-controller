@@ -8,9 +8,9 @@ spec:
     cluster and runs MaaS e2e tests (without external-model modules) using the PR-built
     odh-ai-gateway-controller-ci image.
 
-    Uses odh-praxis-extproc-ci from the group snapshot when present; otherwise
-    quay.io/opendatahub/odh-praxis-extproc:odh-stable (includes llmisvc_model_provider_resolver
-    since opendatahub-io/praxis-extproc#79 / commit 9872fc9).
+    Uses the explicit immutable praxis-extproc-image parameter when supplied;
+    otherwise uses odh-praxis-extproc-ci from the group snapshot when present,
+    then quay.io/opendatahub/odh-praxis-extproc:odh-stable.
   params:
     - description: List of components in the group
       name: group-components
@@ -21,6 +21,10 @@ spec:
     - name: artifact-browser-url
       default: 'https://app-artifact-browser.apps.rosa.konflux-qe.zmr9.p3.openshiftapps.com'
       description: Artifact browser base URL for PR comments.
+    - name: praxis-extproc-image
+      type: string
+      default: ''
+      description: Optional immutable ExtProc image reference for qualification.
   tasks:
     - name: generate-snapshot
       description: Composite snapshot for group components
@@ -181,7 +185,13 @@ spec:
       runAfter:
         - provision-cluster
         - audit-snapshot
+      params:
+        - name: praxis-extproc-image
+          value: $(params.praxis-extproc-image)
       taskSpec:
+        params:
+          - name: praxis-extproc-image
+            type: string
         # Mount artifacts into every step (including StepAction refs). Per-step
         # volumeMounts are illegal with ref: (admission webhook denies them).
         stepTemplate:
@@ -248,6 +258,8 @@ spec:
                     fieldPath: metadata.labels['pipelinesascode.tekton.dev/pull-request']
               - name: PR_NUMBER_RESULT
                 value: $(tasks.audit-snapshot.results.pull-request-number)
+              - name: PRAXIS_EXTPROC_IMAGE_OVERRIDE
+                value: $(params.praxis-extproc-image)
             workingDir: /workspace/source
             volumeMounts:
               - name: credentials
@@ -295,7 +307,14 @@ spec:
 
               PRAXIS_EXTPROC_STABLE_IMAGE="quay.io/opendatahub/odh-praxis-extproc:odh-stable"
               PRAXIS_FROM_SNAPSHOT=$(jq -r '."odh-praxis-extproc-ci".image // empty' <<< "${SNAPSHOT}")
-              if [ -n "${PRAXIS_FROM_SNAPSHOT}" ] && [ "${PRAXIS_FROM_SNAPSHOT}" != "null" ]; then
+              if [ -n "${PRAXIS_EXTPROC_IMAGE_OVERRIDE}" ]; then
+                if [[ ! "${PRAXIS_EXTPROC_IMAGE_OVERRIDE}" =~ ^quay\.io/opendatahub/odh-praxis-extproc@sha256:[0-9a-f]{64}$ ]]; then
+                  echo "ERROR: praxis-extproc-image must be an immutable odh-praxis-extproc digest reference" >&2
+                  exit 1
+                fi
+                export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE_OVERRIDE}"
+                echo "Using explicit PRAXIS_EXTPROC_IMAGE override=${PRAXIS_EXTPROC_IMAGE}"
+              elif [ -n "${PRAXIS_FROM_SNAPSHOT}" ] && [ "${PRAXIS_FROM_SNAPSHOT}" != "null" ]; then
                 export PRAXIS_EXTPROC_IMAGE="${PRAXIS_FROM_SNAPSHOT}"
               else
                 export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-${PRAXIS_EXTPROC_STABLE_IMAGE}}"
