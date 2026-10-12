@@ -458,4 +458,3 @@ def _aigc_capture_request_logs(context, request_ids):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
