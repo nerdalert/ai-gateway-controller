@@ -12,6 +12,10 @@ if [[ -z "${MAAS_E2E_DIR:-}" ]]; then
 fi
 TEST_DIR="${MAAS_E2E_DIR}"
 
+if [[ "${AIGC_MODELS_LISTING_DIAGNOSTICS:-false}" == "true" ]]; then
+    python3 "${SCRIPT_DIR}/instrument-maas-models-listing.py" "${TEST_DIR}"
+fi
+
 serial_only=false
 extra_pytest_args=()
 while [[ $# -gt 0 ]]; do

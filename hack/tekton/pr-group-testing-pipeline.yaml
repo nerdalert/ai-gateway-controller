@@ -25,6 +25,30 @@ spec:
       type: string
       default: ''
       description: Optional immutable ExtProc image reference for qualification.
+    - name: aigc-controller-image
+      type: string
+      default: ''
+      description: Optional immutable AIGC controller image for controlled comparisons.
+    - name: maas-api-image
+      type: string
+      default: ''
+      description: Optional immutable MaaS API image for controlled comparisons.
+    - name: maas-controller-image
+      type: string
+      default: ''
+      description: Optional immutable MaaS controller image for controlled comparisons.
+    - name: e2e-test-filter
+      type: string
+      default: ''
+      description: Optional pytest -k expression for focused diagnostics.
+    - name: e2e-parallel-workers
+      type: string
+      default: '7'
+      description: Number of pytest workers; set to 1 for isolated diagnostics.
+    - name: models-listing-diagnostics
+      type: string
+      default: 'false'
+      description: Capture request-correlated MaaS /v1/models cache and route evidence.
   tasks:
     - name: generate-snapshot
       description: Composite snapshot for group components
@@ -188,9 +212,33 @@ spec:
       params:
         - name: praxis-extproc-image
           value: $(params.praxis-extproc-image)
+        - name: aigc-controller-image
+          value: $(params.aigc-controller-image)
+        - name: maas-api-image
+          value: $(params.maas-api-image)
+        - name: maas-controller-image
+          value: $(params.maas-controller-image)
+        - name: e2e-test-filter
+          value: $(params.e2e-test-filter)
+        - name: e2e-parallel-workers
+          value: $(params.e2e-parallel-workers)
+        - name: models-listing-diagnostics
+          value: $(params.models-listing-diagnostics)
       taskSpec:
         params:
           - name: praxis-extproc-image
+            type: string
+          - name: aigc-controller-image
+            type: string
+          - name: maas-api-image
+            type: string
+          - name: maas-controller-image
+            type: string
+          - name: e2e-test-filter
+            type: string
+          - name: e2e-parallel-workers
+            type: string
+          - name: models-listing-diagnostics
             type: string
         # Mount artifacts into every step (including StepAction refs). Per-step
         # volumeMounts are illegal with ref: (admission webhook denies them).
@@ -260,6 +308,18 @@ spec:
                 value: $(tasks.audit-snapshot.results.pull-request-number)
               - name: PRAXIS_EXTPROC_IMAGE_OVERRIDE
                 value: $(params.praxis-extproc-image)
+              - name: AI_GATEWAY_CONTROLLER_IMAGE_OVERRIDE
+                value: $(params.aigc-controller-image)
+              - name: MAAS_API_IMAGE_OVERRIDE
+                value: $(params.maas-api-image)
+              - name: MAAS_CONTROLLER_IMAGE_OVERRIDE
+                value: $(params.maas-controller-image)
+              - name: E2E_TEST_FILTER
+                value: $(params.e2e-test-filter)
+              - name: E2E_PARALLEL_WORKERS
+                value: $(params.e2e-parallel-workers)
+              - name: AIGC_MODELS_LISTING_DIAGNOSTICS
+                value: $(params.models-listing-diagnostics)
             workingDir: /workspace/source
             volumeMounts:
               - name: credentials
@@ -301,6 +361,14 @@ spec:
                   ;;
               esac
 
+              if [ -n "${AI_GATEWAY_CONTROLLER_IMAGE_OVERRIDE}" ]; then
+                if [[ ! "${AI_GATEWAY_CONTROLLER_IMAGE_OVERRIDE}" =~ ^quay\.io/opendatahub/odh-ai-gateway-controller@sha256:[0-9a-f]{64}$ ]]; then
+                  echo "ERROR: aigc-controller-image must be an immutable AIGC controller digest reference" >&2
+                  exit 1
+                fi
+                export AI_GATEWAY_CONTROLLER_IMAGE="${AI_GATEWAY_CONTROLLER_IMAGE_OVERRIDE}"
+              fi
+
               echo "AI_GATEWAY_CONTROLLER_IMAGE=${AI_GATEWAY_CONTROLLER_IMAGE}"
               echo "AI_GATEWAY_CONTROLLER_IMAGE (snapshot digest, unused): ${AIGC_DIGEST_REF}"
               echo "AI_GATEWAY_CONTROLLER_IMAGE (snapshot tag): ${AIGC_REPO}:${AIGC_TAG}"
@@ -325,6 +393,24 @@ spec:
               # MaasTenantConfig (main mirror). Leave unset so prow's
               # maas-image-defaults.sh pins the test/maas-e2e.lock commit (keeps type annotation).
               unset MAAS_API_IMAGE MAAS_CONTROLLER_IMAGE 2>/dev/null || true
+              if [ -n "${MAAS_API_IMAGE_OVERRIDE}" ]; then
+                if [[ ! "${MAAS_API_IMAGE_OVERRIDE}" =~ ^quay\.io/opendatahub/maas-api@sha256:[0-9a-f]{64}$ ]]; then
+                  echo "ERROR: maas-api-image must be an immutable MaaS API digest reference" >&2
+                  exit 1
+                fi
+                export MAAS_API_IMAGE="${MAAS_API_IMAGE_OVERRIDE}"
+              fi
+              if [ -n "${MAAS_CONTROLLER_IMAGE_OVERRIDE}" ]; then
+                if [[ ! "${MAAS_CONTROLLER_IMAGE_OVERRIDE}" =~ ^quay\.io/opendatahub/maas-controller@sha256:[0-9a-f]{64}$ ]]; then
+                  echo "ERROR: maas-controller-image must be an immutable MaaS controller digest reference" >&2
+                  exit 1
+                fi
+                export MAAS_CONTROLLER_IMAGE="${MAAS_CONTROLLER_IMAGE_OVERRIDE}"
+              fi
+              if [ -n "${E2E_TEST_FILTER}" ]; then
+                echo "Focused pytest selection: -k ${E2E_TEST_FILTER}"
+              fi
+              echo "E2E_PARALLEL_WORKERS=${E2E_PARALLEL_WORKERS} AIGC_MODELS_LISTING_DIAGNOSTICS=${AIGC_MODELS_LISTING_DIAGNOSTICS}"
               echo "PRAXIS_EXTPROC_IMAGE=${PRAXIS_EXTPROC_IMAGE}"
 
               mkdir -p "${ARTIFACT_DIR}"
