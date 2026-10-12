@@ -22,15 +22,17 @@ spec:
   params:
   - name: group-components
     value: '{ "odh-ai-gateway-controller-ci": "opendatahub/odh-ai-gateway-controller" }'
+  - name: praxis-extproc-image
+    value: quay.io/opendatahub/odh-praxis-extproc@sha256:0acefdc2793849ca4728be3d56702150caa36d09773ebdf724190d2fd20a2002
   pipelineRef:
     resolver: git
     params:
     - name: url
-      value: https://github.com/opendatahub-io/odh-konflux-central.git
+      value: '{{source_url}}'
     - name: revision
-      value: main
+      value: '{{revision}}'
     - name: pathInRepo
-      value: integration-tests/ai-gateway-controller/pr-group-testing-pipeline.yaml
+      value: hack/tekton/pr-group-testing-pipeline.yaml
   taskRunTemplate:
     podTemplate:
       nodeSelector:
