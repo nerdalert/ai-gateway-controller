@@ -72,13 +72,14 @@ def _aigc_conditions(conditions):
     ]
 
 
-def _aigc_capture_state(stage, context, subscription_name, subscription_namespace, refs):
+def _aigc_capture_state(stage, context, subscription_name, auth_policy_name, subscription_namespace, refs):
     from datetime import datetime, timezone
     result = {
         "stage": stage,
         "capturedAtUtc": datetime.now(timezone.utc).isoformat(),
         "maasSource": os.environ.get("MAAS_COMMIT_RESOLVED", "unknown"),
         "subscription": {},
+        "authPolicy": {},
         "modelRefs": [],
         "api": {},
         "gateway": {},
@@ -105,6 +106,23 @@ def _aigc_capture_state(stage, context, subscription_name, subscription_namespac
                 for ref in status.get("modelRefStatuses", []) if isinstance(ref, dict)
             ],
             "tokenRateLimitStatusCount": len(status.get("tokenRateLimitStatuses", [])),
+        }
+
+    policy = _aigc_oc_json(["get", "maasauthpolicy", auth_policy_name, "-n", subscription_namespace])
+    if "error" in policy:
+        result["authPolicy"] = policy
+    else:
+        policy_spec, policy_status = policy.get("spec", {}), policy.get("status", {})
+        result["authPolicy"] = {
+            "name": policy.get("metadata", {}).get("name"),
+            "namespace": policy.get("metadata", {}).get("namespace"),
+            "generation": policy.get("metadata", {}).get("generation"),
+            "phase": policy_status.get("phase"),
+            "conditions": _aigc_conditions(policy_status.get("conditions")),
+            "modelRefs": [
+                {"name": ref.get("name"), "namespace": ref.get("namespace")}
+                for ref in policy_spec.get("modelRefs", []) if isinstance(ref, dict)
+            ],
         }
 
     for name, namespace in refs:
@@ -197,31 +215,32 @@ def _aigc_capture_state(stage, context, subscription_name, subscription_namespac
             ],
         })
 
-    all_pods = _aigc_oc_json(["get", "pods", "-A"])
     result["relevantImagePods"] = []
-    for pod in all_pods.get("items", []):
-        meta = pod.get("metadata", {})
-        name = meta.get("name", "")
-        labels = meta.get("labels", {})
-        if not (
-            name.startswith("payload-processing")
-            or name.startswith("payload-pre-processing")
-            or name.startswith("maas-api")
-            or name.startswith("maas-controller")
-            or name.startswith("ai-gateway-controller")
-        ):
-            continue
-        result["relevantImagePods"].append({
-            "name": name,
-            "namespace": meta.get("namespace"),
-            "labels": {key: labels[key] for key in ("app", "app.kubernetes.io/name") if key in labels},
-            "phase": pod.get("status", {}).get("phase"),
-            "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in pod.get("status", {}).get("conditions", [])),
-            "containers": [
-                {"name": c.get("name"), "image": c.get("image"), "imageID": c.get("imageID")}
-                for c in pod.get("status", {}).get("containerStatuses", [])
-            ],
-        })
+    for namespace in ("openshift-ingress", "opendatahub", "odh-ai-gateway-infra"):
+        namespace_pods = _aigc_oc_json(["get", "pods", "-n", namespace])
+        for pod in namespace_pods.get("items", []):
+            meta = pod.get("metadata", {})
+            name = meta.get("name", "")
+            labels = meta.get("labels", {})
+            if not (
+                name.startswith("payload-processing")
+                or name.startswith("payload-pre-processing")
+                or name.startswith("maas-api")
+                or name.startswith("maas-controller")
+                or name.startswith("ai-gateway-controller")
+            ):
+                continue
+            result["relevantImagePods"].append({
+                "name": name,
+                "namespace": meta.get("namespace"),
+                "labels": {key: labels[key] for key in ("app", "app.kubernetes.io/name") if key in labels},
+                "phase": pod.get("status", {}).get("phase"),
+                "ready": any(c.get("type") == "Ready" and c.get("status") == "True" for c in pod.get("status", {}).get("conditions", [])),
+                "containers": [
+                    {"name": c.get("name"), "image": c.get("image"), "imageID": c.get("imageID")}
+                    for c in pod.get("status", {}).get("containerStatuses", [])
+                ],
+            })
 
     output = _aigc_diag_dir() / f"{stage}.json"
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -404,7 +423,7 @@ def _aigc_capture_request_logs(context, request_ids):
                 request_ids.append(primary_id)
                 headers["X-Request-ID"] = primary_id
                 refs = ((DISTINCT_MODEL_REF, MODEL_NAMESPACE), (DISTINCT_MODEL_2_REF, MODEL_NAMESPACE))
-                _aigc_capture_state("before-query", context, subscription_name, maas_ns, refs)
+                _aigc_capture_state("before-query", context, subscription_name, auth_policy_name, maas_ns, refs)
                 _aigc_capture_gateway_xds(context)
             elif diagnostic:
                 raise RuntimeError("diagnostics enabled but the worker tenant context was not activated")
@@ -416,10 +435,10 @@ def _aigc_capture_request_logs(context, request_ids):
             if diagnostic and context:
                 _aigc_capture_response("primary", r, headers["X-Request-ID"])
                 refs = ((DISTINCT_MODEL_REF, MODEL_NAMESPACE), (DISTINCT_MODEL_2_REF, MODEL_NAMESPACE))
-                _aigc_capture_state("immediately-after-primary", context, subscription_name, maas_ns, refs)
+                _aigc_capture_state("immediately-after-primary", context, subscription_name, auth_policy_name, maas_ns, refs)
                 for delay_seconds in (2, 5):
                     time.sleep(delay_seconds)
-                    _aigc_capture_state(f"after-{delay_seconds}s", context, subscription_name, maas_ns, refs)
+                    _aigc_capture_state(f"after-{delay_seconds}s", context, subscription_name, auth_policy_name, maas_ns, refs)
                     repeat_id = f"aigc-pr123-{uuid.uuid4().hex[:12]}-repeat-{delay_seconds}s"
                     request_ids.append(repeat_id)
                     repeated = requests.get(
