@@ -23,19 +23,7 @@ spec:
   - name: group-components
     value: '{ "odh-ai-gateway-controller-ci": "opendatahub/odh-ai-gateway-controller" }'
   - name: praxis-extproc-image
-    value: quay.io/opendatahub/odh-praxis-extproc@sha256:1ad87bba6bf06738064552f45ff9f492952d30ba1be115461ae2af9f4c069658
-  - name: aigc-controller-image
-    value: quay.io/opendatahub/odh-ai-gateway-controller@sha256:1e649f4ac8c7083639b08cc5ba2c650f4a23cfcabc9a19fb7d955548e0a7df35
-  - name: maas-api-image
-    value: quay.io/opendatahub/maas-api@sha256:8f20438ed20c69579d86d52be92abe19c54c5a6629d947994d95eb79bafe87de
-  - name: maas-controller-image
-    value: quay.io/opendatahub/maas-controller@sha256:6538317db1b7324eb3daeb413c609c7fdc31f5d9896a29363c1d5a300c3441ff
-  - name: e2e-test-filter
-    value: test_multiple_distinct_models_in_subscription
-  - name: e2e-parallel-workers
-    value: '1'
-  - name: models-listing-diagnostics
-    value: 'true'
+    value: quay.io/opendatahub/odh-praxis-extproc@sha256:9acb0f8cdccf449f8c236692b15adb808eac1227a0503a7041e2e1280b6e0475
   pipelineRef:
     resolver: git
     params:

@@ -276,11 +276,7 @@ run_e2e_tests() {
     export ARTIFACTS_DIR
     export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-7}"
     export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
-    if [[ -n "${E2E_TEST_FILTER:-}" ]]; then
-        "${SCRIPT_DIR}/run_e2e_tests.sh" -- -k "${E2E_TEST_FILTER}"
-    else
-        "${SCRIPT_DIR}/run_e2e_tests.sh"
-    fi
+    "${SCRIPT_DIR}/run_e2e_tests.sh"
 }
 
 _run_exit_artifacts() {

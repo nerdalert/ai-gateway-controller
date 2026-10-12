@@ -30,8 +30,8 @@ if [[ "${MAAS_ALLOW_LATEST_IMAGES:-false}" != "true" ]]; then
   fi
 fi
 
-export MAAS_API_IMAGE="${MAAS_API_IMAGE_OVERRIDE:-${MAAS_API_IMAGE:-quay.io/opendatahub/maas-api:${MAAS_IMAGE_TAG}}}"
-export MAAS_CONTROLLER_IMAGE="${MAAS_CONTROLLER_IMAGE_OVERRIDE:-${MAAS_CONTROLLER_IMAGE:-quay.io/opendatahub/maas-controller:${MAAS_IMAGE_TAG}}}"
+export MAAS_API_IMAGE="${MAAS_API_IMAGE:-quay.io/opendatahub/maas-api:${MAAS_IMAGE_TAG}}"
+export MAAS_CONTROLLER_IMAGE="${MAAS_CONTROLLER_IMAGE:-quay.io/opendatahub/maas-controller:${MAAS_IMAGE_TAG}}"
 
 # ai-gateway-controller is always supplied by the caller (Konflux snapshot or local override).
 if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE:-}" ]]; then
