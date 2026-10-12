@@ -23,7 +23,7 @@ spec:
   - name: group-components
     value: '{ "odh-ai-gateway-controller-ci": "opendatahub/odh-ai-gateway-controller" }'
   - name: praxis-extproc-image
-    value: quay.io/opendatahub/odh-praxis-extproc@sha256:9acb0f8cdccf449f8c236692b15adb808eac1227a0503a7041e2e1280b6e0475
+    value: quay.io/opendatahub/odh-praxis-extproc@sha256:1ad87bba6bf06738064552f45ff9f492952d30ba1be115461ae2af9f4c069658
   - name: aigc-controller-image
     value: quay.io/opendatahub/odh-ai-gateway-controller@sha256:1e649f4ac8c7083639b08cc5ba2c650f4a23cfcabc9a19fb7d955548e0a7df35
   - name: maas-api-image
