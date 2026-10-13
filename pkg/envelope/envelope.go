@@ -132,6 +132,7 @@ type Overlay struct {
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
 	ErrWeightUnsupported     = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
+	ErrDuplicateProvider     = errors.New("envelope: a client model cannot bind the same provider more than once")
 	ErrUnknownCluster        = errors.New("envelope: candidate references cluster absent from load_balancer config")
 	ErrScopeMismatch         = errors.New("envelope: scope fields must be non-empty")
 	ErrGenerationRegression  = errors.New("envelope: source_generation must strictly increase on content change")
@@ -153,11 +154,12 @@ type Options struct {
 }
 
 // Render validates the resolved route set and emits the envelope with its
-// revision. Equal positive-weight providers sharing a client-visible model
-// name are assigned selection group zero and use Praxis' global random
-// policy. Singleton model capabilities remain ungrouped and deterministic.
-// Unequal weights are rejected because this controller does not implement
-// proportional routing.
+// revision. Distinct providers with equal positive weights sharing a
+// client-visible model name are assigned selection group zero and use
+// Praxis' global random policy. Singleton model capabilities remain ungrouped
+// and deterministic.
+// Unequal weights and repeated providers are rejected because this controller
+// does not implement proportional routing or deduplication of bindings.
 //
 // Revision rule: digest equal to prev → prev returned unchanged (no bump);
 // digest changed → Generation = prev.Generation + 1.
@@ -288,12 +290,18 @@ type selectionMetadata struct {
 // distinct client-visible names never share a group.
 func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetadata, error) {
 	capabilities := map[string]*selectionCapability{}
+	providerBindings := map[string]bool{}
 	for _, model := range routes.Models {
 		if err := checkUniformWeights(model); err != nil {
 			return selectionMetadata{}, err
 		}
 		for _, route := range model.Routes {
 			key := "inference_model\x00" + route.ClientName
+			binding := key + "\x00" + route.Provider
+			if providerBindings[binding] {
+				return selectionMetadata{}, fmt.Errorf("%w: client model %s provider %s", ErrDuplicateProvider, route.ClientName, route.Provider)
+			}
+			providerBindings[binding] = true
 			capability := capabilities[key]
 			if capability == nil {
 				capability = &selectionCapability{firstRoute: route}

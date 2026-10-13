@@ -344,6 +344,26 @@ func TestRender_RejectsUnequalWeightsAcrossSameClientModel(t *testing.T) {
 	}
 }
 
+func TestRender_RejectsRepeatedProviderAcrossSameClientModel(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("shared", "p1", 1), route("shared", "p2", 1)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("shared", "p1", 1)}},
+	)
+	if _, err := Render(set, scope(), Revision{}, Options{}); !errors.Is(err, ErrDuplicateProvider) {
+		t.Fatalf("Render error = %v, want ErrDuplicateProvider", err)
+	}
+}
+
+func TestRender_AllowsSharedProviderAcrossDifferentClientModels(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("a", "p1", 1)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("b", "p1", 1)}},
+	)
+	if _, err := Render(set, scope(), Revision{}, Options{}); err != nil {
+		t.Fatalf("different client models may share a provider: %v", err)
+	}
+}
+
 func TestRender_SelectionMetadataChangesDigestAndNoopKeepsGeneration(t *testing.T) {
 	single := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
 	first, err := Render(single, scope(), Revision{}, Options{})

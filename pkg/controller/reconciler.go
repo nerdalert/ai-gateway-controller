@@ -664,7 +664,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
 	}
-	set, rejected := excludeUnsupportedModelWeights(set)
+	set, rejected := excludeUnsupportedModelSelection(set)
 	if len(set.Routes()) == 0 && len(rejected) > 0 {
 		// No valid sibling can serve. Remove the deleted model's routes before
 		// releasing its finalizer; unsupported siblings remain unserved.
@@ -977,25 +977,52 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 	return envelope.ValidateSelectionMetadata(set)
 }
 
-// excludeUnsupportedModelWeights keeps one model's unsupported provider
-// weights from preventing valid siblings from sharing the serving overlay.
-// Render still validates the resulting set, including aliases across models.
-func excludeUnsupportedModelWeights(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
+// excludeUnsupportedModelSelection excludes every model contributing to a
+// conflicting client-visible capability. The overlay selects candidates by
+// client name, so unequal weights or repeated providers across model objects
+// must not affect unrelated models in the namespace.
+func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
 	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
 	rejected := make(map[string]error)
+	weights := make(map[string]int)
+	weightConflicts := make(map[string]bool)
+	bindings := make(map[string]bool)
+	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
-		if err := envelope.ValidateSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{model}}); err != nil {
-			rejected[model.ModelRef] = err
-			continue
+		for _, route := range model.Routes {
+			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
+				weightConflicts[route.ClientName] = true
+			} else {
+				weights[route.ClientName] = route.Weight
+			}
+			binding := route.ClientName + "\x00" + route.Provider
+			if bindings[binding] {
+				duplicateProviders[route.ClientName] = true
+			}
+			bindings[binding] = true
 		}
-		valid.Models = append(valid.Models, model)
+	}
+	for _, model := range set.Models {
+		for _, route := range model.Routes {
+			if weightConflicts[route.ClientName] {
+				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
+				break
+			}
+			if duplicateProviders[route.ClientName] {
+				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
+				break
+			}
+		}
+		if rejected[model.ModelRef] == nil {
+			valid.Models = append(valid.Models, model)
+		}
 	}
 	return valid, rejected
 }
 
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
 	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
-	valid, rejected := excludeUnsupportedModelWeights(set)
+	valid, rejected := excludeUnsupportedModelSelection(set)
 	for name, rejection := range rejected {
 		if owner := owners[name[strings.LastIndexByte(name, '/')+1:]]; owner != nil {
 			if owner.Namespace == current.Namespace && owner.Name == current.Name {
