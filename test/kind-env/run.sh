@@ -864,11 +864,48 @@ EOF
   for extproc_ref in maas-system/payload-pre-processing models-as-a-service/payload-processing-external-model; do
     extproc_namespace=${extproc_ref%/*}
     extproc_name=${extproc_ref#*/}
+    # The Kind identity patch above changes the pod template and can start a
+    # second rollout. Wait for that rollout before recording the image, then
+    # select only Ready pods owned by the Deployment's current ReplicaSet.
+    "${KCTL[@]}" -n "$extproc_namespace" rollout status "deployment/$extproc_name" --timeout=180s
     deployed_image=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o jsonpath='{.spec.template.spec.containers[0].image}')
     [[ "$deployed_image" == "$EXTPROC_IMAGE" ]] || { fail "ExtProc image mismatch for $extproc_ref: requested=$EXTPROC_IMAGE deployed=$deployed_image"; exit 2; }
-    pod_selector=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
-    [[ -n "$pod_selector" ]] || { fail "ExtProc Deployment $extproc_ref has no selector"; exit 2; }
-    "${KCTL[@]}" -n "$extproc_namespace" get pods -l "$pod_selector" -o json | jq --arg requested "$EXTPROC_IMAGE" --arg deployment "$extproc_name" '{requestedImage:$requested,deployment:$deployment,pods:[.items[]|{name:.metadata.name,uid:.metadata.uid,image:.spec.containers[0].image,imageID:.status.containerStatuses[0].imageID,ready:([.status.conditions[]?|select(.type=="Ready" and .status=="True")]|length==1)}]}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
+    deployment_json=$("${KCTL[@]}" -n "$extproc_namespace" get deployment "$extproc_name" -o json)
+    deployment_selector=$(jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' <<<"$deployment_json")
+    [[ -n "$deployment_selector" ]] || { fail "ExtProc Deployment $extproc_ref has no selector"; exit 2; }
+    deployment_uid=$(jq -r '.metadata.uid' <<<"$deployment_json")
+    extproc_container=$(jq -r '.spec.template.spec.containers[0].name' <<<"$deployment_json")
+    generation=$(jq -r '.metadata.generation' <<<"$deployment_json")
+    observed_generation=$(jq -r '.status.observedGeneration // 0' <<<"$deployment_json")
+    desired_replicas=$(jq -r '.spec.replicas // 1' <<<"$deployment_json")
+    updated_replicas=$(jq -r '.status.updatedReplicas // 0' <<<"$deployment_json")
+    available_replicas=$(jq -r '.status.availableReplicas // 0' <<<"$deployment_json")
+    revision=$(jq -r '.metadata.annotations["deployment.kubernetes.io/revision"] // empty' <<<"$deployment_json")
+    [[ "$observed_generation" -ge "$generation" && "$updated_replicas" -eq "$desired_replicas" && "$available_replicas" -ge "$desired_replicas" && -n "$revision" ]] || {
+      fail "ExtProc Deployment $extproc_ref has not observed and completed its current generation (generation=$generation observed=$observed_generation updated=$updated_replicas available=$available_replicas desired=$desired_replicas revision=${revision:-absent})"
+      exit 2
+    }
+    replica_sets=$("${KCTL[@]}" -n "$extproc_namespace" get replicasets -l "$deployment_selector" -o json)
+    current_replica_sets=$(jq -c --arg revision "$revision" --arg deploymentUID "$deployment_uid" '[.items[] | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision) | select(any(.metadata.ownerReferences[]?; .kind == "Deployment" and .uid == $deploymentUID)) | .metadata.name]' <<<"$replica_sets")
+    [[ "$(jq 'length' <<<"$current_replica_sets")" -gt 0 ]] || { fail "ExtProc Deployment $extproc_ref has no ReplicaSet for current revision $revision"; exit 2; }
+    pods=$("${KCTL[@]}" -n "$extproc_namespace" get pods -l "$deployment_selector" -o json)
+    ready_current_pods=$(jq -c \
+      --argjson replicaSets "$current_replica_sets" \
+      --arg requested "$EXTPROC_IMAGE" \
+      --arg container "$extproc_container" \
+      '[.items[]
+        | select(.metadata.deletionTimestamp == null)
+        | select(any(.metadata.ownerReferences[]?; .kind == "ReplicaSet" and (.name as $owner | ($replicaSets | index($owner)) != null)))
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+        | select(any(.spec.containers[]?; .name == $container and .image == $requested))
+        | select(any(.status.containerStatuses[]?; .name == $container and (.imageID // "") != ""))
+        | {name:.metadata.name,uid:.metadata.uid,ownerReplicaSet:([.metadata.ownerReferences[]? | select(.kind == "ReplicaSet") | .name] | first),image:([.spec.containers[]? | select(.name == $container) | .image] | first),imageID:([.status.containerStatuses[]? | select(.name == $container) | .imageID] | first),ready:true}]' <<<"$pods")
+    ready_current_count=$(jq 'length' <<<"$ready_current_pods")
+    [[ "$ready_current_count" -eq "$desired_replicas" ]] || {
+      fail "ExtProc Deployment $extproc_ref has $ready_current_count Ready pods with image IDs from current revision $revision; expected $desired_replicas"
+      exit 2
+    }
+    jq -n --arg requestedImage "$EXTPROC_IMAGE" --arg deployment "$extproc_name" --arg revision "$revision" --argjson generation "$generation" --argjson observedGeneration "$observed_generation" --argjson desiredReplicas "$desired_replicas" --argjson pods "$ready_current_pods" '{requestedImage:$requestedImage,deployment:$deployment,generation:$generation,observedGeneration:$observedGeneration,replicaSetRevision:$revision,desiredReplicas:$desiredReplicas,pods:$pods}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
   done
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a-tenant-b --timeout=180s
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-b-tenant-b --timeout=180s
