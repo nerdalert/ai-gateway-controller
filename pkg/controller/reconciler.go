@@ -321,14 +321,8 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
-		reason := reasonReconcileFailed
-		if errors.Is(err, errCredentialNotReady) {
-			reason = reasonProviderNotReady
-		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
-			return reconcile.Result{}, statusErr
-		}
+	set, err = r.validateModelRouteSet(ctx, set, modelOwners, &model, report)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
 	// The selector/status/owner may have changed while provider inputs and
@@ -670,6 +664,26 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
 	}
+	set, rejected := excludeUnsupportedModelWeights(set)
+	if len(set.Routes()) == 0 && len(rejected) > 0 {
+		// No valid sibling can serve. Remove the deleted model's routes before
+		// releasing its finalizer; unsupported siblings remain unserved.
+		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		if tenantID != "" {
+			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
+				return err
+			}
+		}
+		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+			return err
+		}
+		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
+			return err
+		}
+		return r.removeExternalModelFinalizer(ctx, deleted)
+	}
 	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
@@ -961,6 +975,54 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 		return err
 	}
 	return envelope.ValidateSelectionMetadata(set)
+}
+
+// excludeUnsupportedModelWeights keeps one model's unsupported provider
+// weights from preventing valid siblings from sharing the serving overlay.
+// Render still validates the resulting set, including aliases across models.
+func excludeUnsupportedModelWeights(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
+	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
+	rejected := make(map[string]error)
+	for _, model := range set.Models {
+		if err := envelope.ValidateSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{model}}); err != nil {
+			rejected[model.ModelRef] = err
+			continue
+		}
+		valid.Models = append(valid.Models, model)
+	}
+	return valid, rejected
+}
+
+func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
+	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
+	valid, rejected := excludeUnsupportedModelWeights(set)
+	for name, rejection := range rejected {
+		if owner := owners[name[strings.LastIndexByte(name, '/')+1:]]; owner != nil {
+			if owner.Namespace == current.Namespace && owner.Name == current.Name {
+				continue
+			}
+			if err := r.updateModelStatus(ctx, owner, false, reasonReconcileFailed, rejection.Error(), nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+			return nil, statusErr
+		}
+		return nil, err
+	}
+	if err := r.validateResolvedRouteSet(ctx, valid); err != nil {
+		reason := reasonReconcileFailed
+		if errors.Is(err, errCredentialNotReady) {
+			reason = reasonProviderNotReady
+		}
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+			return nil, statusErr
+		}
+		return nil, err
+	}
+	return valid, nil
 }
 
 func (r *Reconciler) namespaceAllowed(namespace string) bool {

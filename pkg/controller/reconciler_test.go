@@ -1433,6 +1433,74 @@ func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T
 	}
 }
 
+func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T) {
+	ctx := context.Background()
+	r, healthy := reconcilerFixture(t)
+	providerB := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: healthy.Namespace, UID: "provider-b-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+	}
+	if err := r.Create(ctx, providerB); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
+		Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
+		t.Fatal(err)
+	}
+	weightOne, weightTwo := 1, 2
+	bad := healthy.DeepCopy()
+	bad.Name, bad.UID, bad.ResourceVersion = "bad", "bad-uid", ""
+	bad.Status = v1alpha1.ExternalModelStatus{}
+	bad.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "provider-b"}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightTwo},
+	}
+	if err := r.Create(ctx, bad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("healthy sibling reconciliation failed due to invalid weights: %v", err)
+	}
+	var published corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &published); err != nil {
+		t.Fatal(err)
+	}
+	var overlay envelope.Envelope
+	if err := json.Unmarshal([]byte(published.Data["routing-overlay.json"]), &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if len(overlay.Overlay.Candidates) != 1 || overlay.Overlay.Candidates[0].Name != healthy.Name {
+		t.Fatalf("published candidates = %#v, want only healthy model", overlay.Overlay.Candidates)
+	}
+	var gotBad v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(bad), &gotBad); err != nil {
+		t.Fatal(err)
+	}
+	if gotBad.Status.Phase != "Failed" {
+		t.Fatalf("invalid model phase = %q, want Failed", gotBad.Status.Phase)
+	}
+	var gotHealthy v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &gotHealthy); err != nil {
+		t.Fatal(err)
+	}
+	if gotHealthy.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("healthy model phase = %q, want Ready", gotHealthy.Status.Phase)
+	}
+	if err := r.Delete(ctx, &gotHealthy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
+		t.Fatalf("healthy sibling deletion blocked by invalid weights: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &gotHealthy); !apierrors.IsNotFound(err) {
+		t.Fatalf("deleted healthy model still exists: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: healthy.Namespace, Name: "routing-overlay"}, &published); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale overlay remains after healthy sibling deletion: %v", err)
+	}
+}
+
 func TestFinalExternalModelDeletionRemovesOwnedTransportAndOverlay(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
