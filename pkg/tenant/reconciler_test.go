@@ -129,7 +129,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 		}
 	}
 	writeOverlay(live)
-	_, required, err := r.providersForTenant(ctx, namespace)
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if err := fakeClient.Create(ctx, later); err != nil {
 		t.Fatal(err)
 	}
-	_, required, err = r.providersForTenant(ctx, namespace)
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required); err != nil || !ready {
 		t.Fatalf("overlay after later provider publication: ready=%t reason=%q err=%v", ready, reason, err)
 	}
-	candidates, err := r.runtimeCandidates(ctx, namespace)
+	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system")
 	if err != nil || len(candidates) != 2 {
 		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
 	}

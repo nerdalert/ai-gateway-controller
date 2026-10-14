@@ -321,7 +321,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	set, err = r.validateModelRouteSet(ctx, set, modelOwners, &model, report)
+	set, err = r.validateModelRouteSet(ctx, set, modelOwners, model, report)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
