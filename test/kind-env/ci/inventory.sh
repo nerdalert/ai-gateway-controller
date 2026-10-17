@@ -37,6 +37,58 @@ if [[ "$MODE" == before ]]; then
   : >"$RUN_ROOT/cluster-claim"
   echo 'claimed=true' >>"$GITHUB_OUTPUT"
 else
+  # Kind creates a shared Docker bridge named exactly "kind". Remove it only
+  # when this run demonstrably created it: it was absent before qualification,
+  # there were no Kind clusters before or after, and no containers remain
+  # attached. Preserve any pre-existing or in-use network.
+  if [[ -f "$RUN_ROOT/artifact/inventory-before/kind-clusters.txt" \
+    && -f "$RUN_ROOT/artifact/inventory-before/docker-networks.txt" ]]; then
+    cp "$OUT/docker-networks.txt" "$OUT/docker-networks-before-owned-cleanup.txt"
+    no_clusters_before=true
+    no_clusters_after=true
+    if awk 'NF && $0 != "No kind clusters found." { found=1 } END { exit found ? 0 : 1 }' \
+      "$RUN_ROOT/artifact/inventory-before/kind-clusters.txt"; then
+      no_clusters_before=false
+    fi
+    if awk 'NF && $0 != "No kind clusters found." { found=1 } END { exit found ? 0 : 1 }' "$OUT/kind-clusters.txt"; then
+      no_clusters_after=false
+    fi
+    kind_network_before=false
+    if awk 'NR > 1 && $2 == "kind" { found=1 } END { exit found ? 0 : 1 }' \
+      "$RUN_ROOT/artifact/inventory-before/docker-networks.txt"; then
+      kind_network_before=true
+    fi
+    if [[ "$no_clusters_before" == true && "$no_clusters_after" == true && "$kind_network_before" == false ]]; then
+      if docker network inspect kind >/dev/null 2>&1; then
+        endpoint_count=$(docker network inspect --format '{{len .Containers}}' kind)
+        if [[ "$endpoint_count" == 0 ]]; then
+          if docker network rm kind >"$OUT/kind-network-removal.txt" 2>&1; then
+            echo 'kind_network_removed=true reason=created_by_this_run_and_no_endpoints' >"$OUT/kind-network-cleanup.txt"
+          else
+            echo 'kind_network_removed=false reason=network_rm_failed' >"$OUT/kind-network-cleanup.txt"
+            cat "$OUT/kind-network-removal.txt" >>"$OUT/kind-network-cleanup.txt"
+            exit 1
+          fi
+        else
+          printf 'kind_network_removed=false reason=network_has_%s_endpoints\n' "$endpoint_count" \
+            >"$OUT/kind-network-cleanup.txt"
+          exit 1
+        fi
+      else
+        echo 'kind_network_removed=false reason=already_absent_after_cluster_deletion' >"$OUT/kind-network-cleanup.txt"
+      fi
+    else
+      echo 'kind_network_removed=false reason=preexisting_kind_network_or_cluster' >"$OUT/kind-network-cleanup.txt"
+    fi
+    docker network ls --no-trunc >"$OUT/docker-networks.txt" || {
+      echo 'post-cleanup Docker network inventory failed' >"$OUT/inventory-error.txt"
+      exit 1
+    }
+  else
+    echo 'run-start inventory unavailable; cannot establish ownership of a Docker network' >"$OUT/kind-network-cleanup.txt"
+    exit 1
+  fi
+
   printf 'cluster_name=%s\n' "$CLUSTER" >"$OUT/cleanup-check.txt"
   if rg -qx "$CLUSTER" "$OUT/kind-clusters.txt"; then
     echo 'cluster_removed=false' >>"$OUT/cleanup-check.txt"

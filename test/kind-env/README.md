@@ -63,7 +63,9 @@ pre/post cleanup inventories. Artifacts are retained for 30 days. The workflow
 uses only the mock providers and fixture credentials described in this README;
 it does not use real provider keys. Credential-like values are redacted before
 upload, and the scan verifies that no matching markers remain in the retained
-artifact.
+artifact. Cleanup removes the shared Docker `kind` bridge only when it was
+absent before the run, no Kind clusters remain, and the network has no attached
+containers; otherwise the workflow preserves it and records why.
 
 Runner tools and source dependencies are pinned by version, checksum, or full
 commit SHA in the workflow setup. The cluster uses the pinned `kindest/node`
