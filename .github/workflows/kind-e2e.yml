@@ -1,0 +1,439 @@
+name: Kind E2E Qualification
+
+on:
+  schedule:
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch in this repository to qualify; blank or main tests main
+        required: false
+        default: main
+        type: string
+
+permissions: {}
+
+# Serialize on the repository. Active runs are allowed to finish cleanup; each
+# run also owns a cluster name containing its unique run ID and attempt.
+concurrency:
+  group: aigc-kind-e2e-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  kind-e2e:
+    name: Kind E2E (${{ github.event_name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve target branch to one full SHA
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          STARTING_MAIN_SHA: 04bfbec1cea8fe2fc3abc027b26717348f2e0e7f
+        run: |
+          set -Eeuo pipefail
+          RUN_ROOT="$RUNNER_TEMP/aigc-kind-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          CLUSTER_NAME="aigc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$RUN_ROOT/artifact"
+          {
+            echo "run_root=$RUN_ROOT"
+            echo "cluster_name=$CLUSTER_NAME"
+          } >>"$GITHUB_OUTPUT"
+
+          # BEGIN TARGET REF RESOLUTION
+          case "$EVENT_NAME" in
+            schedule)
+              target_ref=main
+              ;;
+            workflow_dispatch)
+              target_ref=${TARGET_REF_INPUT:-main}
+              ;;
+            *)
+              echo "::error::Unsupported trigger: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
+          if ! git check-ref-format --branch "$target_ref" >/dev/null; then
+            echo "::error::target_ref must be a valid branch name in $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
+          remote_ref="refs/heads/$target_ref"
+          remote_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          remote_line=$(git ls-remote --exit-code "$remote_url" "$remote_ref") || {
+            echo "::error::Branch $target_ref was not found in $GITHUB_REPOSITORY"
+            exit 1
+          }
+          if [[ $(wc -l <<<"$remote_line") -ne 1 ]]; then
+            echo "::error::Expected one matching branch ref for $remote_ref"
+            exit 1
+          fi
+          target_sha=$(awk 'NR == 1 {print $1}' <<<"$remote_line")
+          resolved_ref=$(awk 'NR == 1 {print $2}' <<<"$remote_line")
+          if [[ "$resolved_ref" != "$remote_ref" || ! "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve exactly one full commit SHA for $remote_ref"
+            exit 1
+          fi
+          {
+            echo "target_ref=$target_ref"
+            echo "target_sha=$target_sha"
+          } >>"$GITHUB_OUTPUT"
+          # END TARGET REF RESOLUTION
+
+          {
+            printf 'event=%s\n' "$EVENT_NAME"
+            printf 'requested_target_ref=%s\n' "$TARGET_REF_INPUT"
+            printf 'resolved_target_ref=%s\n' "$target_ref"
+            printf 'tested_sha=%s\n' "$target_sha"
+            printf 'workflow_ref=%s\n' "$WORKFLOW_REF"
+            printf 'workflow_sha=%s\n' "$WORKFLOW_SHA"
+            printf 'feature_starting_main_sha=%s\n' "$STARTING_MAIN_SHA"
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'cluster_name=%s\n' "$CLUSTER_NAME"
+            printf 'kubectl_context=kind-%s\n' "$CLUSTER_NAME"
+            printf 'preflight_command=./test/kind-env/run.sh --preflight\n'
+            printf 'provision_command=./test/kind-env/run.sh --provision\n'
+            printf 'qualification_command=./test/kind-env/e2e.sh\n'
+            printf 'diagnostics_command=test/kind-env/ci/collect-diagnostics.sh\n'
+            printf 'teardown_command=./test/kind-env/run.sh --destroy\n'
+          } >"$RUN_ROOT/artifact/source-metadata.txt"
+          {
+            echo '## Kind E2E source'
+            echo
+            echo "- Trigger: \`$EVENT_NAME\`"
+            echo "- Requested target_ref: \`${TARGET_REF_INPUT:-<blank; defaults to main>}\`"
+            echo "- Resolved branch: \`$target_ref\`"
+            echo "- Tested full SHA: \`$target_sha\`"
+            echo "- Workflow revision: \`$WORKFLOW_REF\` at \`$WORKFLOW_SHA\`"
+            echo "- E2E entry point: \`./test/kind-env/e2e.sh\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the resolved target SHA
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ steps.resolve.outputs.target_sha }}
+          persist-credentials: false
+          clean: true
+
+      - name: Install the repository Go toolchain
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+          cache: false
+
+      - name: Verify checked-out source identity
+        id: source-check
+        env:
+          EXPECTED_SHA: ${{ steps.resolve.outputs.target_sha }}
+          RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: |
+          set -Eeuo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          printf 'expected_sha=%s\nactual_sha=%s\n' "$EXPECTED_SHA" "$actual_sha" >"$RUN_ROOT/artifact/checkout-identity.txt"
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]]
+
+      - name: Check workflow target-to-command contract
+        id: contract
+        continue-on-error: true
+        if: always() && steps.source-check.outcome == 'success'
+        env:
+          RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: |
+          set -Eeuo pipefail
+          set +e
+          python3 test/kind-env/ci/check-workflow-contract.py 2>&1 | tee "$RUN_ROOT/artifact/workflow-contract.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'exit_code=%s\n' "$result" >"$RUN_ROOT/artifact/workflow-contract.exit"
+          exit "$result"
+
+      - name: Install pinned runner tools and dependency sources
+        id: setup
+        continue-on-error: true
+        if: always() && steps.source-check.outcome == 'success' && steps.contract.outcome == 'success'
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_CLUSTER: ${{ steps.resolve.outputs.cluster_name }}
+        run: |
+          set -Eeuo pipefail
+          set +e
+          test/kind-env/ci/setup-runner.sh 2>&1 | tee "$AIGC_KIND_E2E_RUN_ROOT/artifact/setup-runner.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'exit_code=%s\n' "$result" >"$AIGC_KIND_E2E_RUN_ROOT/artifact/setup-runner.exit"
+          exit "$result"
+
+      - name: Record pre-run resource inventory and claim cluster name
+        id: inventory-before
+        continue-on-error: true
+        if: always()
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_CLUSTER: ${{ steps.resolve.outputs.cluster_name }}
+        run: test/kind-env/ci/inventory.sh before
+
+      - name: Preflight Kind harness and build pinned images
+        id: preflight
+        continue-on-error: true
+        if: always() && steps.setup.outcome == 'success' && steps.inventory-before.outputs.claimed == 'true'
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: |
+          set -Eeuo pipefail
+          set +e
+          ./test/kind-env/run.sh --preflight 2>&1 | tee "$AIGC_KIND_E2E_RUN_ROOT/artifact/preflight.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'exit_code=%s\n' "$result" >"$AIGC_KIND_E2E_RUN_ROOT/artifact/preflight.exit"
+          echo "exit_code=$result" >>"$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Provision the run-owned Kind cluster
+        id: provision
+        continue-on-error: true
+        if: always() && steps.preflight.outputs.exit_code == '0'
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: |
+          set -Eeuo pipefail
+          set +e
+          ./test/kind-env/run.sh --provision 2>&1 | tee "$AIGC_KIND_E2E_RUN_ROOT/artifact/provision.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'exit_code=%s\n' "$result" >"$AIGC_KIND_E2E_RUN_ROOT/artifact/provision.exit"
+          echo "exit_code=$result" >>"$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Capture built image identities
+        id: image-identities
+        if: always() && steps.inventory-before.outputs.claimed == 'true'
+        continue-on-error: true
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: |
+          set -Eeuo pipefail
+          images=(
+            "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "${EXTPROC_IMAGE:-praxis-extproc:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "${MAAS_API_IMAGE:-maas-api:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "${MAAS_CONTROLLER_IMAGE:-maas-controller:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "${PROVIDER_RECORDER_IMAGE:-provider-recorder:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "${KATAN_KIND_IMAGE:-llm-katan:gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+            "$KIND_NODE_IMAGE"
+          )
+          : >"$AIGC_KIND_E2E_RUN_ROOT/artifact/local-image-identities.txt"
+          for image in "${images[@]}"; do
+            if docker image inspect "$image" >/dev/null 2>&1; then
+              docker image inspect "$image" --format '{{.RepoTags}} {{.Id}} {{.RepoDigests}}' \
+                >>"$AIGC_KIND_E2E_RUN_ROOT/artifact/local-image-identities.txt"
+            else
+              printf 'not-present=%s\n' "$image" >>"$AIGC_KIND_E2E_RUN_ROOT/artifact/local-image-identities.txt"
+            fi
+          done
+
+      - name: Run the canonical Kind E2E
+        id: e2e
+        continue-on-error: true
+        if: always() && steps.provision.outputs.exit_code == '0'
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_EVIDENCE: ${{ steps.resolve.outputs.run_root }}/artifact/evidence/e2e
+        run: |
+          set -Eeuo pipefail
+          set +e
+          ./test/kind-env/e2e.sh 2>&1 | tee "$AIGC_KIND_E2E_RUN_ROOT/artifact/e2e-workflow.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'exit_code=%s\n' "$result" >"$AIGC_KIND_E2E_RUN_ROOT/artifact/e2e.exit"
+          echo "exit_code=$result" >>"$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Collect cluster and component diagnostics
+        id: diagnostics
+        if: always()
+        continue-on-error: true
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_CLUSTER: ${{ steps.resolve.outputs.cluster_name }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -x test/kind-env/ci/collect-diagnostics.sh && -d "$AIGC_KIND_E2E_RUN_ROOT" ]]; then
+            test/kind-env/ci/collect-diagnostics.sh
+          else
+            mkdir -p "$AIGC_KIND_E2E_RUN_ROOT/artifact"
+            echo 'diagnostics script or run directory unavailable' >"$AIGC_KIND_E2E_RUN_ROOT/artifact/diagnostics-unavailable.txt"
+            exit 1
+          fi
+
+      - name: Tear down only the claimed run-owned cluster
+        id: teardown
+        if: always()
+        continue-on-error: true
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_CLUSTER: ${{ steps.resolve.outputs.cluster_name }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -f "$AIGC_KIND_E2E_RUN_ROOT/cluster-created" && -x test/kind-env/run.sh ]]; then
+            set +e
+            ./test/kind-env/run.sh --destroy 2>&1 | tee "$AIGC_KIND_E2E_RUN_ROOT/artifact/teardown.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            printf 'exit_code=%s\n' "$result" >"$AIGC_KIND_E2E_RUN_ROOT/artifact/teardown.exit"
+            echo "exit_code=$result" >>"$GITHUB_OUTPUT"
+            exit "$result"
+          fi
+          mkdir -p "$AIGC_KIND_E2E_RUN_ROOT/artifact"
+          echo 'teardown_not_needed=true; no run-owned cluster was created' >"$AIGC_KIND_E2E_RUN_ROOT/artifact/teardown-not-needed.txt"
+          echo 'exit_code=0' >"$AIGC_KIND_E2E_RUN_ROOT/artifact/teardown.exit"
+          echo 'exit_code=0' >>"$GITHUB_OUTPUT"
+
+      - name: Verify post-cleanup inventory
+        id: inventory-after
+        if: always()
+        continue-on-error: true
+        env:
+          AIGC_KIND_E2E_RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          LOCAL_ENV_CLUSTER: ${{ steps.resolve.outputs.cluster_name }}
+        run: |
+          set -Eeuo pipefail
+          if command -v kind >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
+            test/kind-env/ci/inventory.sh after
+          else
+            mkdir -p "$AIGC_KIND_E2E_RUN_ROOT/artifact"
+            echo 'post-cleanup inventory tools unavailable' >"$AIGC_KIND_E2E_RUN_ROOT/artifact/inventory-after-unavailable.txt"
+            exit 1
+          fi
+
+      - name: Scan and sanitize retained evidence
+        id: credential-scan
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+        run: python3 test/kind-env/ci/scan-evidence.py "$RUN_ROOT/artifact"
+
+      - name: Finalize qualification report
+        id: report
+        if: always()
+        env:
+          RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TARGET_REF: ${{ inputs.target_ref }}
+          TARGET_RESOLUTION_RESULT: ${{ steps.resolve.outcome }}
+          RESOLVED_TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+          TESTED_SHA: ${{ steps.resolve.outputs.target_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_CHECK_RESULT: ${{ steps.source-check.outcome }}
+          CONTRACT_RESULT: ${{ steps.contract.outcome }}
+          SETUP_RESULT: ${{ steps.setup.outcome }}
+          INVENTORY_BEFORE_RESULT: ${{ steps.inventory-before.outcome }}
+          PREFLIGHT_EXIT: ${{ steps.preflight.outputs.exit_code || 'NOT_RUN' }}
+          PROVISION_EXIT: ${{ steps.provision.outputs.exit_code || 'NOT_RUN' }}
+          IMAGE_IDENTITIES_RESULT: ${{ steps.image-identities.outcome }}
+          E2E_EXIT: ${{ steps.e2e.outputs.exit_code || 'NOT_RUN' }}
+          DIAGNOSTICS_RESULT: ${{ steps.diagnostics.outcome }}
+          TEARDOWN_EXIT: ${{ steps.teardown.outputs.exit_code || 'NOT_RUN' }}
+          INVENTORY_AFTER_RESULT: ${{ steps.inventory-after.outcome }}
+          CREDENTIAL_SCAN_RESULT: ${{ steps.credential-scan.outcome }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUN_ROOT/artifact"
+          {
+            printf 'event=%s\n' "$EVENT_NAME"
+            printf 'requested_target_ref=%s\n' "$REQUESTED_TARGET_REF"
+            printf 'target_resolution=%s\n' "$TARGET_RESOLUTION_RESULT"
+            printf 'resolved_target_ref=%s\n' "$RESOLVED_TARGET_REF"
+            printf 'tested_sha=%s\n' "$TESTED_SHA"
+            printf 'workflow_ref=%s\n' "$WORKFLOW_REF"
+            printf 'workflow_sha=%s\n' "$WORKFLOW_SHA"
+            printf 'source_checkout=%s\n' "$SOURCE_CHECK_RESULT"
+            printf 'contract_check=%s\n' "$CONTRACT_RESULT"
+            printf 'runner_setup=%s\n' "$SETUP_RESULT"
+            printf 'pre_inventory=%s\n' "$INVENTORY_BEFORE_RESULT"
+            printf 'preflight_exit=%s\n' "$PREFLIGHT_EXIT"
+            printf 'provision_exit=%s\n' "$PROVISION_EXIT"
+            printf 'image_identity_capture=%s\n' "$IMAGE_IDENTITIES_RESULT"
+            printf 'e2e_exit=%s\n' "$E2E_EXIT"
+            printf 'diagnostics=%s\n' "$DIAGNOSTICS_RESULT"
+            printf 'teardown_exit=%s\n' "$TEARDOWN_EXIT"
+            printf 'post_inventory=%s\n' "$INVENTORY_AFTER_RESULT"
+            printf 'credential_scan=%s\n' "$CREDENTIAL_SCAN_RESULT"
+          } >"$RUN_ROOT/artifact/exit-statuses.txt"
+          {
+            echo '## Kind E2E result'
+            echo
+            echo "- Requested target_ref: \`${REQUESTED_TARGET_REF:-<blank; defaults to main>}\`"
+            echo "- Target resolution: \`$TARGET_RESOLUTION_RESULT\`"
+            echo "- Resolved target ref: \`${RESOLVED_TARGET_REF:-NOT_RESOLVED}\`"
+            echo "- Tested full SHA: \`${TESTED_SHA:-NOT_RESOLVED}\`"
+            echo "- Workflow revision: \`${WORKFLOW_REF:-unknown}\` at \`${WORKFLOW_SHA:-unknown}\`"
+            echo "- Preflight / provision / E2E exits: \`$PREFLIGHT_EXIT / $PROVISION_EXIT / $E2E_EXIT\`"
+            echo "- Diagnostics / teardown / post-inventory / credential scan: \`$DIAGNOSTICS_RESULT / $TEARDOWN_EXIT / $INVENTORY_AFTER_RESULT / $CREDENTIAL_SCAN_RESULT\`"
+            echo "- Evidence directory: \`$RUN_ROOT\`"
+          } >"$RUN_ROOT/artifact/run-summary.md"
+          cat "$RUN_ROOT/artifact/run-summary.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload source, E2E evidence, diagnostics, and cleanup inventory
+        id: upload
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aigc-kind-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.resolve.outputs.run_root }}/artifact
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce independent qualification and cleanup results
+        if: always()
+        env:
+          RUN_ROOT: ${{ steps.resolve.outputs.run_root }}
+          TARGET_RESOLUTION_RESULT: ${{ steps.resolve.outcome }}
+          CONTRACT_RESULT: ${{ steps.contract.outcome }}
+          SOURCE_CHECK_RESULT: ${{ steps.source-check.outcome }}
+          SETUP_RESULT: ${{ steps.setup.outcome }}
+          INVENTORY_BEFORE_RESULT: ${{ steps.inventory-before.outcome }}
+          PREFLIGHT_EXIT: ${{ steps.preflight.outputs.exit_code || 'NOT_RUN' }}
+          PROVISION_EXIT: ${{ steps.provision.outputs.exit_code || 'NOT_RUN' }}
+          IMAGE_IDENTITIES_RESULT: ${{ steps.image-identities.outcome }}
+          E2E_EXIT: ${{ steps.e2e.outputs.exit_code || 'NOT_RUN' }}
+          DIAGNOSTICS_RESULT: ${{ steps.diagnostics.outcome }}
+          TEARDOWN_EXIT: ${{ steps.teardown.outputs.exit_code || 'NOT_RUN' }}
+          INVENTORY_AFTER_RESULT: ${{ steps.inventory-after.outcome }}
+          CREDENTIAL_SCAN_RESULT: ${{ steps.credential-scan.outcome }}
+          UPLOAD_RESULT: ${{ steps.upload.outcome }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          set -Eeuo pipefail
+          {
+            echo
+            echo "Artifact: ${ARTIFACT_URL:-upload unavailable}"
+          } >>"$GITHUB_STEP_SUMMARY"
+          [[ "$SOURCE_CHECK_RESULT" == success \
+            && "$TARGET_RESOLUTION_RESULT" == success \
+            && "$CONTRACT_RESULT" == success \
+            && "$SETUP_RESULT" == success \
+            && "$INVENTORY_BEFORE_RESULT" == success \
+            && "$PREFLIGHT_EXIT" == 0 \
+            && "$PROVISION_EXIT" == 0 \
+            && "$IMAGE_IDENTITIES_RESULT" == success \
+            && "$E2E_EXIT" == 0 \
+            && "$DIAGNOSTICS_RESULT" == success \
+            && "$TEARDOWN_EXIT" == 0 \
+            && "$INVENTORY_AFTER_RESULT" == success \
+            && "$CREDENTIAL_SCAN_RESULT" == success \
+            && "$UPLOAD_RESULT" == success ]] || {
+            echo 'Kind E2E qualification failed one or more independent checks; see exit-statuses.txt and the uploaded run evidence.' >&2
+            exit 1
+          }
