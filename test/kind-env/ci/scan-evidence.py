@@ -12,7 +12,7 @@ from pathlib import Path
 MARKERS = [
     re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)([A-Za-z0-9._~+/-]{12,}={0,2})"),
     re.compile(
-        r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|credential|client[_-]?secret|secret[_-]?access[_-]?key|password)\s*[:=]\s*)(['\"]?)([A-Za-z0-9._~+/-]{12,}={0,2})(['\"]?)"
+        r"(?i)\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|credential|client[_-]?secret|secret[_-]?access[_-]?key|password)\b\s*[:=]\s*)(['\"]?)([A-Za-z0-9._~+/-]{12,}={0,2})(['\"]?)"
     ),
     re.compile(r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{30,})\b"),
     re.compile(r"\b(?:kind-only-dummy|transition-provider-key)\b"),
@@ -65,17 +65,30 @@ def main() -> int:
             redactions += matches
             affected.append(str(path.relative_to(root)))
 
+    residual_markers = 0
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        _, matches = redact_text(content)
+        residual_markers += matches
+
     result = {
         "files_scanned": files_scanned,
         "credential_markers_redacted": redactions,
+        "residual_credential_markers": residual_markers,
         "affected_files": affected,
-        "status": "PASS" if redactions == 0 else "FAIL_REDACTED",
+        "status": "FAIL_RESIDUAL" if residual_markers else ("PASS_SANITIZED" if redactions else "PASS"),
     }
     (root / "credential-scan.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(f"files_scanned={files_scanned} credential_markers_redacted={redactions} status={result['status']}")
+    print(
+        f"files_scanned={files_scanned} credential_markers_redacted={redactions} "
+        f"residual_credential_markers={residual_markers} status={result['status']}"
+    )
     if affected:
-        print("redacted files: " + ", ".join(affected))
-    return 0 if redactions == 0 else 1
+        print("sanitized files: " + ", ".join(affected))
+    return 1 if residual_markers else 0
 
 
 if __name__ == "__main__":

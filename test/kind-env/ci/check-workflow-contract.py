@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -17,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github/workflows/kind-e2e.yml"
 BEGIN = "# BEGIN TARGET REF RESOLUTION"
 END = "# END TARGET REF RESOLUTION"
+SCANNER = ROOT / "test/kind-env/ci/scan-evidence.py"
 
 
 def check(condition: bool, message: str) -> None:
@@ -73,6 +76,51 @@ def run_resolver(script: str, event: str, requested_ref: str) -> tuple[int, str]
         return result.returncode, output_file.read_text(encoding="utf-8") if output_file.exists() else result.stderr
 
 
+def check_evidence_scanner() -> None:
+    with tempfile.TemporaryDirectory(prefix="aigc-evidence-scan-contract-") as tmp:
+        artifact = Path(tmp) / "artifact"
+        artifact.mkdir()
+        fixture = artifact / "fixture.yaml"
+        fixture.write_text(
+            "serviceAccountToken:\n"
+            "  expirationSeconds: 3607\n"
+            "  path: token\n"
+            'apiKey: "sk-proj-abcdefghijklmnopqrstuvwxyz"\n'
+            "authorization: Bearer synthetic-test-token-1234567890\n"
+            "private: |\n"
+            "  -----BEGIN PRIVATE KEY-----\n"
+            "  synthetic-test-key-material\n"
+            "  -----END PRIVATE KEY-----\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCANNER), str(artifact)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        check(
+            result.returncode == 0,
+            f"evidence scanner failed its sanitization contract: {result.stdout}{result.stderr}",
+        )
+        report = json.loads((artifact / "credential-scan.json").read_text(encoding="utf-8"))
+        sanitized = fixture.read_text(encoding="utf-8")
+        check(report["status"] == "PASS_SANITIZED", f"scanner should pass after sanitizing detected markers: {report}")
+        check(report["credential_markers_redacted"] == 3, f"scanner should redact API key, bearer token, and private key: {report}")
+        check(report["residual_credential_markers"] == 0, f"scanner must verify that no markers remain: {report}")
+        check(
+            "serviceAccountToken" in sanitized
+            and "expirationSeconds: 3607" in sanitized
+            and "path: token" in sanitized,
+            "Kubernetes serviceAccountToken projection fields must not be mistaken for credential values",
+        )
+        check(
+            "sk-proj-abcdefghijklmnopqrstuvwxyz" not in sanitized
+            and "synthetic-test-token-1234567890" not in sanitized,
+            "test credential markers must be removed before artifacts are retained",
+        )
+
+
 def main() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     check('cron: "0 22 * * *"' in workflow, "daily workflow schedule must be 22:00 UTC")
@@ -114,7 +162,8 @@ def main() -> None:
     check(rc != 0, "resolver must reject a branch absent from the target repository")
     rc, _ = run_resolver(resolver, "workflow_dispatch", "duplicate-ref")
     check(rc != 0, "resolver must reject ambiguous branch resolution")
-    print("workflow target contract: PASS (schedule/main, blank/default, explicit branch, invalid branch, canonical e2e command)")
+    check_evidence_scanner()
+    print("workflow contract: PASS (target mapping and sanitized credential-marker scan)")
 
 
 if __name__ == "__main__":

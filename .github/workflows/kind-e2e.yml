@@ -141,7 +141,7 @@ jobs:
           printf 'expected_sha=%s\nactual_sha=%s\n' "$EXPECTED_SHA" "$actual_sha" >"$RUN_ROOT/artifact/checkout-identity.txt"
           [[ "$actual_sha" == "$EXPECTED_SHA" ]]
 
-      - name: Check workflow target-to-command contract
+      - name: Check workflow and evidence-scan contracts
         id: contract
         continue-on-error: true
         if: always() && steps.source-check.outcome == 'success'
