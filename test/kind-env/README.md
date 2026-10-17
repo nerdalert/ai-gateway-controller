@@ -79,6 +79,10 @@ sources with Kind-specific patches. It does not install the ODH/RHOAI operator
 chain or exercise `DataScienceCluster`-managed installation and upgrades; the
 tenant, Gateway, and test workloads are assembled by the harness.
 
+Because this Kind fixture does not install the Prometheus Operator, it omits
+the optional AIGC `ServiceMonitor` while retaining the metrics Service and
+controller Deployment.
+
 Kind uses test certificates, container images, and HTTPS provider recorders
 with test credentials. These checks cover a focused provider request path and
 its test transport, but do not qualify the

@@ -464,7 +464,15 @@ EOF
   else
   kustomize build "$ROOT/config/crd" | "${KCTL[@]}" apply --server-side -f -
   fi
-  kustomize build "$ROOT/config/self/default" | "${KCTL[@]}" apply --server-side --force-conflicts -f -
+  # Kind does not install the Prometheus Operator CRD. Keep the metrics
+  # Service/Deployment in the fixture, but omit only the optional
+  # ServiceMonitor resource that the API server cannot recognize.
+  kustomize build "$ROOT/config/self/default" \
+    | yq eval 'select(.kind != "ServiceMonitor")' - \
+    >"$EVIDENCE/aigc-kind-resources.yaml"
+  printf '%s\n' 'kind: ServiceMonitor omitted: Prometheus Operator CRD is not installed in this Kind fixture' \
+    >"$EVIDENCE/aigc-kind-manifest-exclusions.txt"
+  "${KCTL[@]}" apply --server-side --force-conflicts -f "$EVIDENCE/aigc-kind-resources.yaml"
   if [[ "${LOCAL_ENV_PATCH_EXTERNALMODEL_FINALIZER_RBAC:-false}" == true ]]; then
     # The source ClusterRole lacks patch on ExternalModels even though the
     # current controller adds its cleanup finalizer with Patch. This fixture
