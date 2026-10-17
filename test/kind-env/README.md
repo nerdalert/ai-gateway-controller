@@ -81,7 +81,10 @@ tenant, Gateway, and test workloads are assembled by the harness.
 
 Because this Kind fixture does not install the Prometheus Operator, it omits
 the optional AIGC `ServiceMonitor` while retaining the metrics Service and
-controller Deployment.
+controller Deployment. OpenShift service-ca normally creates the controller's
+metrics TLS Secret; on a fresh Kind cluster the harness generates a temporary
+test certificate for that Secret, keeps secure metrics enabled, and waits for
+the controller Deployment before continuing the tenant handoff.
 
 Kind uses test certificates, container images, and HTTPS provider recorders
 with test credentials. These checks cover a focused provider request path and

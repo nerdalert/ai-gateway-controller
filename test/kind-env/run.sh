@@ -473,6 +473,33 @@ EOF
   printf '%s\n' 'kind: ServiceMonitor omitted: Prometheus Operator CRD is not installed in this Kind fixture' \
     >"$EVIDENCE/aigc-kind-manifest-exclusions.txt"
   "${KCTL[@]}" apply --server-side --force-conflicts -f "$EVIDENCE/aigc-kind-resources.yaml"
+  # OpenShift service-ca normally creates this Secret from the metrics Service
+  # annotation. Kind has no service-ca, while the controller Deployment mounts
+  # the Secret even though the E2E does not scrape metrics. Create a short-lived
+  # test certificate on a fresh cluster; preserve any existing Secret for local
+  # runs and record that it was reused.
+  if "${KCTL[@]}" -n opendatahub get secret ai-gateway-controller-metrics-tls >/dev/null 2>&1; then
+    printf '%s\n' 'metrics_secret=ai-gateway-controller-metrics-tls source=preexisting (not overwritten)' \
+      >"$EVIDENCE/aigc-controller-metrics-certificate.txt"
+  else
+    controller_metrics_tmp=$(mktemp -d)
+    openssl req -x509 -nodes -newkey rsa:2048 -days 2 \
+      -keyout "$controller_metrics_tmp/tls.key" -out "$controller_metrics_tmp/tls.crt" \
+      -subj '/CN=ai-gateway-controller-metrics.opendatahub.svc' \
+      -addext 'basicConstraints=critical,CA:FALSE' \
+      -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+      -addext 'extendedKeyUsage=serverAuth' \
+      -addext 'subjectAltName=DNS:ai-gateway-controller-metrics,DNS:ai-gateway-controller-metrics.opendatahub.svc,DNS:ai-gateway-controller-metrics.opendatahub.svc.cluster.local' \
+      >/dev/null 2>&1
+    openssl x509 -in "$controller_metrics_tmp/tls.crt" -noout -issuer -subject -fingerprint -sha256 -ext subjectAltName \
+      >"$EVIDENCE/aigc-controller-metrics-certificate.txt"
+    printf 'secret=opendatahub/ai-gateway-controller-metrics-tls source=run-generated\n' \
+      >>"$EVIDENCE/aigc-controller-metrics-certificate.txt"
+    "${KCTL[@]}" -n opendatahub create secret tls ai-gateway-controller-metrics-tls \
+      --cert="$controller_metrics_tmp/tls.crt" --key="$controller_metrics_tmp/tls.key" \
+      --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
+    rm -rf "$controller_metrics_tmp"
+  fi
   if [[ "${LOCAL_ENV_PATCH_EXTERNALMODEL_FINALIZER_RBAC:-false}" == true ]]; then
     # The source ClusterRole lacks patch on ExternalModels even though the
     # current controller adds its cleanup finalizer with Patch. This fixture
@@ -510,6 +537,7 @@ EOF
     ] + $extra_known)}
   ]')
   "${KCTL[@]}" -n opendatahub patch deployment ai-gateway-controller --type=json -p="$controller_patch"
+  "${KCTL[@]}" -n opendatahub rollout status deployment/ai-gateway-controller --timeout=180s
   # Tenant-local ExtProc resources are now rendered and owned by ai-gateway-controller from
   # ExternalProvider references. Do not apply the former static tenant
   # Deployments here; doing so would create an unowned same-name object and
