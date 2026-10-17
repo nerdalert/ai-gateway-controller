@@ -32,6 +32,44 @@ qualification. Istio, Kuadrant, and the MaaS platform remain
 explicit prerequisites for the full authenticated chain; the provisioner
 records a failure rather than silently substituting them.
 
+The canonical harness in this repository is `test/kind-env/`; there is no
+`test/kind-dev/` directory on the current `main` branch. The GitHub Actions
+Kind E2E workflow uses `test/kind-env/run.sh` for preflight, provisioning, and
+teardown, and always runs the single canonical E2E entry point,
+`test/kind-env/e2e.sh`.
+
+### Scheduled and manually triggered qualification
+
+The `Kind E2E Qualification` workflow runs daily at **22:00 UTC**. It also
+supports `workflow_dispatch` with a `target_ref` branch
+input. Leave `target_ref` blank or keep its default `main` to qualify `main`;
+enter another branch name to qualify that branch in the same repository. The
+workflow rejects refs that are not branch names in the repository where the
+workflow is running.
+
+GitHub's **Run workflow** branch selector chooses the revision of the workflow
+definition. The separate `target_ref` input chooses the source code to test.
+For example, the workflow definition can come from the fork's `main` branch
+while `target_ref` points at a feature branch. The workflow resolves that
+target branch to one full commit SHA and checks out that SHA for the complete
+qualification. Scheduled runs always resolve and test `main`.
+
+Each run creates a uniquely named Kind cluster and an evidence directory.
+The Actions run summary identifies the workflow revision, requested and
+resolved target refs, and tested full SHA. The uploaded
+`aigc-kind-e2e-<run>-<attempt>` artifact contains E2E output, dependency and
+image identities, cluster diagnostics, credential-scan results, and
+pre/post cleanup inventories. Artifacts are retained for 30 days. The workflow
+uses only the mock providers and fixture credentials described in this README;
+it does not use real provider keys.
+
+Runner tools and source dependencies are pinned by version, checksum, or full
+commit SHA in the workflow setup. The cluster uses the pinned `kindest/node`
+image; Gateway API, cert-manager, Kuadrant, Istio, and the test backend use the
+versions and immutable image references recorded in the artifact. A failed
+preflight, provision, E2E, diagnostics, cleanup, or credential scan fails the
+workflow even when later cleanup succeeds.
+
 ### How this differs from a full RHOAI deployment
 
 This is a focused integration environment on Kind, not a deployment of RHOAI on
@@ -309,20 +347,20 @@ records only CA/certificate fingerprints and paths, never keys or credentials.
 Required source checkouts are supplied through environment variables:
 
 * `LLM_KATAN_REPO`
-* `PRAXIS_REPO`
 * `MAAS_CONTROLLER_REPO`
-* `KUADRANT_OPERATOR_REPO`
+* `KSERVE_REPO`
 * `PRAXIS_EXTPROC_REPO`
 
-Source selection and provenance are explicit. `PRAXIS_REPO` and
-`PRAXIS_EXTPROC_REPO` point at the checked-out integration sources; the
-expected revisions are recorded before each build. `MAAS_CONTROLLER_REPO`
+Source selection and provenance are explicit. `PRAXIS_EXTPROC_REPO` points at
+the ExtProc source used to build the image; the expected revision is recorded
+before each build. `MAAS_CONTROLLER_REPO`
 must point at the merged `main` branch for new runs (the harness verifies that
-the checkout is clean but does not enforce the branch name). `KUADRANT_OPERATOR_REPO`
-is the pinned dependency checkout used for platform fixtures. `LLM_KATAN_REPO`
-is optional in the normal workflow because the default provider image is the
-public digest-pinned artifact; a source checkout is used only for explicit
-development builds.
+the checkout is clean but does not enforce the branch name). `KSERVE_REPO`
+supplies the pinned KServe CRDs. The harness installs Kuadrant from its
+version-pinned Helm chart.
+`LLM_KATAN_REPO` is optional in the normal workflow because the default
+provider image is the public digest-pinned artifact; a source checkout is used
+only for explicit development builds.
 
 Each run records repository path, remote, branch or detached state, HEAD,
 tracked diff hash, and untracked-content hash before building. After

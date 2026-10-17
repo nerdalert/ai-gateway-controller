@@ -9,8 +9,8 @@ LLM_KATAN_REPO=${LLM_KATAN_REPO:-"$DEPS_DIR/llm-katan"}
 KATAN_DEFAULT_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
 KATAN_DEFAULT_AMD64_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:a8bf18109e2db641ef4a63efe65f69d4d6554f1128a174053de89a8b81b4284d
 KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_IMAGE}
-KATAN_KIND_IMAGE=${KATAN_IMAGE:-llm-katan:external-model-two-plane}
-PROVIDER_RECORDER_IMAGE=provider-recorder:issue28-kind
+KATAN_KIND_IMAGE=${KATAN_KIND_IMAGE:-${KATAN_IMAGE:-llm-katan:external-model-two-plane}}
+PROVIDER_RECORDER_IMAGE=${PROVIDER_RECORDER_IMAGE:-provider-recorder:issue28-kind}
 if [[ "${BUILD_KATAN:-false}" == true ]]; then
   KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}
   KATAN_KIND_IMAGE=$KATAN_EFFECTIVE_IMAGE
@@ -25,7 +25,6 @@ else
 fi
 APPLY_REAL_OPENAI_FIXTURE=${APPLY_REAL_OPENAI_FIXTURE:-false}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
-KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
 EXTPROC_IMAGE=${EXTPROC_IMAGE:-praxis-extproc:dev}
 ISTIOCTL=${ISTIOCTL:-/tmp/istio-1.27.3/bin/istioctl}
@@ -176,7 +175,6 @@ df -P "$ROOT" >"$EVIDENCE/disk.txt" 2>&1 || fail "disk check failed"
 free -b >"$EVIDENCE/memory.txt" 2>&1 || fail "memory check failed"
 if [[ "${BUILD_KATAN:-false}" == true ]]; then check_repo LLM_KATAN_REPO; fi
 check_repo MAAS_CONTROLLER_REPO
-check_repo KUADRANT_OPERATOR_REPO
 check_repo PRAXIS_EXTPROC_REPO
 if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
   extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
@@ -260,7 +258,20 @@ fi
 
 if [[ "${1:---preflight}" == "--provision" ]]; then
   printf '%s\n' "$EVIDENCE" >"$EVIDENCE_ROOT/.active-run"
-  kind get clusters | rg -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
+  kind_node_image_args=()
+  if [[ -n "${KIND_NODE_IMAGE:-}" ]]; then
+    kind_node_image_args=(--image "$KIND_NODE_IMAGE")
+  fi
+  if ! kind get clusters | rg -qx "$CLUSTER"; then
+    set +e
+    kind create cluster --name "$CLUSTER" "${kind_node_image_args[@]}"
+    kind_create_rc=$?
+    set -e
+    if kind get clusters | rg -qx "$CLUSTER" && [[ -n "${AIGC_KIND_E2E_RUN_ROOT:-}" ]]; then
+      : >"$AIGC_KIND_E2E_RUN_ROOT/cluster-created"
+    fi
+    (( kind_create_rc == 0 )) || exit "$kind_create_rc"
+  fi
   "${KCTL[@]}" cluster-info >"$EVIDENCE/cluster-info.txt"
   # Stop prior run-owned MaaS pods before replacing their node image tags;
   # containerd retains images referenced by live containers.
