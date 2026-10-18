@@ -53,6 +53,9 @@ func TestRender_HappyPath(t *testing.T) {
 	if c.Name != "m1" || c.Cluster != "provider-p1" || c.Kind != "inference_model" || c.Site != "site-a" || !c.Fresh {
 		t.Errorf("candidate mapping: %+v", c)
 	}
+	if c.APIFormat != "openai-chat" || c.Path != "/v1/chat/completions" || c.TargetModel != "t" {
+		t.Fatalf("trusted provider profile missing from candidate: %+v", c)
+	}
 	// Wire shape per praxis validate_revision_shape (overlay.rs):
 	// revision = {kind: "content_addressed", algorithm: "sha256", value}.
 	if env.Revision.Kind != "content_addressed" || env.Revision.Algorithm != "sha256" {
@@ -63,6 +66,34 @@ func TestRender_HappyPath(t *testing.T) {
 	}
 	if env.Provenance.SourceGeneration != 1 {
 		t.Errorf("first distribution source_generation: %d, want 1", env.Provenance.SourceGeneration)
+	}
+}
+
+func TestRenderPublishesDistinctProfilesForMixedProviderSelection(t *testing.T) {
+	openai := route("client-model", "openai", 1)
+	openai.Model, openai.ClientName = "external-model", "client-model"
+	openai.TargetModel, openai.Path, openai.APIFormat = "gpt-deployed", "/v1/chat/completions", "openai-chat"
+	anthropic := route("client-model", "anthropic", 1)
+	anthropic.Model, anthropic.ClientName = "external-model", "client-model"
+	anthropic.ProviderType, anthropic.TargetModel = "anthropic", "claude-deployed"
+	anthropic.APIFormat, anthropic.Path = "messages", "/v1/messages"
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/external-model", Routes: []resolver.Route{openai, anthropic}})
+	env, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(env.Overlay.Candidates))
+	}
+	profiles := map[string]Candidate{}
+	for _, candidate := range env.Overlay.Candidates {
+		profiles[candidate.StableID] = candidate
+	}
+	if got := profiles[CandidateStableID("external-model", "openai")]; got.APIFormat != "openai-chat" || got.Path != "/v1/chat/completions" || got.TargetModel != "gpt-deployed" {
+		t.Fatalf("OpenAI candidate profile = %+v", got)
+	}
+	if got := profiles[CandidateStableID("external-model", "anthropic")]; got.APIFormat != "messages" || got.Path != "/v1/messages" || got.TargetModel != "claude-deployed" {
+		t.Fatalf("Anthropic candidate profile = %+v", got)
 	}
 }
 

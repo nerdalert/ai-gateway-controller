@@ -112,15 +112,22 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 		t.Fatalf("%s request_body_mode missing: found=%v err=%v", name, found, err)
 	}
 	responseMode, _, _ := unstructured.NestedString(resource, "typed_config", "processing_mode", "response_body_mode")
+	sendBodyBeforeHeader, _, sendBodyErr := unstructured.NestedBool(resource, "typed_config", "send_body_without_waiting_for_header_response")
+	if sendBodyErr != nil {
+		t.Fatalf("%s send_body_without_waiting_for_header_response: %v", name, sendBodyErr)
+	}
 	switch name {
 	case "envoy.filters.http.ext_proc.ipp":
-		if mode != "BUFFERED" || responseMode != "BUFFERED" {
-			t.Fatalf("shared post-auth modes = request %q response %q, want BUFFERED/BUFFERED", mode, responseMode)
+		if mode != "BUFFERED" || responseMode != "STREAMED" {
+			t.Fatalf("shared post-auth modes = request %q response %q, want BUFFERED/STREAMED", mode, responseMode)
 		}
 		return "post"
 	case "envoy.filters.http.ext_proc.external-model":
 		if mode != "NONE" || responseMode != "NONE" {
 			t.Fatalf("ExternalModel post-auth modes = request %q response %q, want NONE/NONE", mode, responseMode)
+		}
+		if !sendBodyBeforeHeader {
+			t.Fatal("ExternalModel post-auth ExtProc must send streamed request-body messages before the header response")
 		}
 		return "external"
 	default:

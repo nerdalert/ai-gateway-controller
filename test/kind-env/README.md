@@ -266,10 +266,27 @@ content rotation does not alter the pod template; changing the referenced
 Secret set intentionally changes the template and may roll out the tenant
 ExtProc pod.
 
-The shared MaaS/KServe post-auth ExtProc filter remains BUFFERED. The
-ExternalModel-only filter is a separate SEND/NONE chain, disabled by default
-and enabled only by controller-owned route patches. Ordinary KServe routes on
-the same Gateway therefore retain their upstream body-processing behavior.
+The shared MaaS/KServe post-auth ExtProc keeps request buffering and streams
+response-body events so the opt-in Anthropic Messages translator can process
+progressive SSE. Translation filters remain absent when
+`MaasTenantConfig.spec.apiTranslation.enabled` is omitted or false; ordinary
+shared routes still traverse the ExtProc chain. The Kind qualification covers
+default-off passthrough and an unrelated OpenAI SSE route.
+
+The ExternalModel-only filter is a separate route-scoped chain. Its requests
+are buffered for selected-provider translation and its responses are streamed
+for JSON/SSE response handling. Controller-owned route patches limit the body
+processing to generated ExternalModel routes; ordinary KServe routes do not
+receive this ExternalModel chain. The selected-provider request filter applies
+a 1 MiB limit before model validation and target-model rewriting, including for
+OpenAI-compatible candidates; larger requests are rejected before the upstream
+provider. The dedicated ExtProc process keeps its 10 MiB accumulation ceiling,
+so the qualification checks the filter's structured `request_too_large`
+response rather than treating an Envoy or ExtProc 413 as proof of the filter
+limit. For Anthropic JSON responses, the translator buffers chunks in
+request-local filter state and enforces its 1 MiB limit. SSE remains
+incremental, and OpenAI-compatible responses pass through without this response
+buffer or limit.
 
 The transition fixture uses a real `MaasTenantConfig` explicitly set to
 `ipp` and MaaS model

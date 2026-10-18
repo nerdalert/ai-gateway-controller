@@ -374,6 +374,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		log.Error(err, "cannot render praxis-extproc resources for this tenant name; will not retry until the tenant changes")
 		return ctrl.Result{}, nil
 	}
+	apiTranslation, err := APITranslationEnabled(mtc)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("read authoritative MaaS apiTranslation setting: %w", err)
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, apiTranslation); err != nil {
+		return ctrl.Result{}, fmt.Errorf("configure shared ExtProc: %w", err)
+	}
 	tenantNamespace := mtc.GetNamespace()
 	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace, gatewayName, gatewayNamespace)
 	if err != nil {
@@ -393,7 +400,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
 			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 		}
-		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
+		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -406,7 +413,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
 	if hasModels {
-		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
+		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates, apiTranslation); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
 	} else {
@@ -592,7 +599,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	return result, availableRequired, nil
 }
 
-func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]envelope.Candidate, error) {
+func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, error) {
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
 		return nil, err
@@ -609,7 +616,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	for i := range providers.Items {
 		providerPtrs = append(providerPtrs, &providers.Items[i])
 	}
-	runtimeSet, err := resolver.ResolveAll(modelPtrs, providerPtrs)
+	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
 	if err != nil {
 		return nil, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
@@ -622,6 +629,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		candidate := envelope.Candidate{
 			Cluster: route.Cluster, StableID: envelope.CandidateStableID(route.Model, route.Provider),
 			Kind: "inference_model", Name: route.ClientName, Fresh: true,
+			APIFormat: route.APIFormat, Path: route.Path, TargetModel: route.TargetModel,
 		}
 		if strategy != "" {
 			candidate.Credential = &envelope.Credential{

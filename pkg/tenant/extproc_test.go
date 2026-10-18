@@ -41,7 +41,7 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 			},
 		},
 	}
-	if err := configureExternalModelExtProc(resources, "tenant-a", candidates); err != nil {
+	if err := configureExternalModelExtProc(resources, "tenant-a", candidates, true); err != nil {
 		t.Fatal(err)
 	}
 	data, found, err := unstructured.NestedStringMap(resources[0].Object, "data")
@@ -52,13 +52,42 @@ func TestConfigureExternalModelExtProcProjectsReferencesAndTrustedHandoff(t *tes
 	if !found {
 		t.Fatal("post-auth extproc.yaml is missing")
 	}
-	for _, want := range []string{"filter: intelligent_route", "filter: credential_inject", "provider_hop_clusters: [\"provider-provider-a\", \"provider-provider-b\"]", "strategy: bearer_token", "a-secret", "b-secret"} {
+	for _, want := range []string{
+		"filter: intelligent_route",
+		"filter: credential_inject",
+		"provider_hop_clusters: [\"provider-provider-a\", \"provider-provider-b\"]",
+		"max_body_bytes: 10485760",
+		"api_translation_enabled: true",
+		"max_body_bytes: 1048576",
+		"strategy: bearer_token",
+		"a-secret",
+		"b-secret",
+	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("post-auth config missing %q:\n%s", want, config)
 		}
 	}
+	profiled := []string{
+		"filter: intelligent_route",
+		"filter: openai_chat_completions_to_anthropic_stream",
+		"filter: openai_chat_completions_to_anthropic\n",
+		"filter: credential_inject",
+	}
+	positions := make([]int, len(profiled))
+	for i, want := range profiled {
+		positions[i] = strings.Index(config, want)
+		if positions[i] < 0 {
+			t.Fatalf("post-auth config missing %q:\n%s", want, config)
+		}
+		if i > 0 && positions[i] <= positions[i-1] {
+			t.Fatalf("provider selection, JSON, SSE, and credential filters are out of request/response order:\n%s", config)
+		}
+	}
 	if strings.Contains(config, "secret-value") {
 		t.Fatal("secret value appeared in post-auth configuration")
+	}
+	if strings.Contains(config, "allow_unbounded_body: true") {
+		t.Fatal("dedicated ExternalModel ExtProc must enforce its configured body accumulation ceiling")
 	}
 	volumes, _, err := unstructured.NestedSlice(resources[1].Object, "spec", "template", "spec", "volumes")
 	if err != nil {
@@ -86,7 +115,7 @@ func TestExternalModelConfigOmitsCredentialFilterWithoutReferences(t *testing.T)
 			}}},
 		}},
 	}
-	if err := configureExternalModelExtProc(resources, "tenant-a", nil); err != nil {
+	if err := configureExternalModelExtProc(resources, "tenant-a", nil, false); err != nil {
 		t.Fatal(err)
 	}
 	data, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
@@ -95,6 +124,9 @@ func TestExternalModelConfigOmitsCredentialFilterWithoutReferences(t *testing.T)
 	}
 	if strings.Contains(data["extproc.yaml"], "credential_inject") {
 		t.Fatalf("credential_inject must be omitted without credential references:\n%s", data["extproc.yaml"])
+	}
+	if !strings.Contains(data["extproc.yaml"], "api_translation_enabled: false") {
+		t.Fatalf("ExternalModel ExtProc must fail closed when tenant translation permission is off:\n%s", data["extproc.yaml"])
 	}
 	hash, found, err := unstructured.NestedString(resources[1].Object, "spec", "template", "metadata", "annotations", "ai-gateway-controller.opendatahub.io/extproc-config-sha256")
 	if err != nil || !found || hash == "" {
@@ -125,5 +157,109 @@ func TestExtprocCredentialsRejectsUnsupportedAuth(t *testing.T) {
 	}}
 	if _, err := extprocCredentials("tenant-a", candidates); err == nil || !strings.Contains(err.Error(), "unsupported ExtProc credential strategy") {
 		t.Fatalf("expected unsupported-auth rejection, got %v", err)
+	}
+}
+
+func TestSharedExtProcConfigDefaultOff(t *testing.T) {
+	config := sharedExtProcConfig(false)
+	if strings.Contains(config, "anthropic_messages_to_chat_completions") || strings.Contains(config, "path_rewrite") {
+		t.Fatalf("default-off shared chain unexpectedly contains translation:\n%s", config)
+	}
+	if !strings.Contains(config, "filter: request_id") {
+		t.Fatalf("default shared chain lost request_id:\n%s", config)
+	}
+}
+
+func TestSharedExtProcConfigUsesRegisteredOrderedMessagesFilters(t *testing.T) {
+	config := sharedExtProcConfig(true)
+	ordered := []string{
+		"filter: request_id",
+		"filter: anthropic_messages_request",
+		"filter: anthropic_messages_to_chat_completions",
+		"filter: anthropic_messages_to_chat_completions_stream",
+		"filter: headers",
+		"filter: path_rewrite",
+	}
+	previous := -1
+	for _, token := range ordered {
+		position := strings.Index(config, token)
+		if position <= previous {
+			t.Fatalf("filter %q appears out of order (position=%d):\n%s", token, position, config)
+		}
+		previous = position
+	}
+	for _, want := range []string{
+		"on_invalid: reject",
+		"path: \"/v1/messages\"",
+		"max_body_bytes: 1048576",
+		"max_partial_event_bytes: 10485760",
+		"content-type: \"text/event-stream\"",
+		"pattern: \"^/v1/messages$\"",
+		"replacement: \"/v1/chat/completions\"",
+		"- x-api-key",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("translation chain missing %q:\n%s", want, config)
+		}
+	}
+	for _, filter := range []string{"filter: headers", "filter: path_rewrite"} {
+		start := strings.Index(config, filter)
+		if start < 0 {
+			t.Fatalf("translation chain missing %q:\n%s", filter, config)
+		}
+		end := strings.Index(config[start+len(filter):], "\n      - filter:")
+		if end < 0 {
+			end = len(config) - start - len(filter)
+		}
+		block := config[start : start+len(filter)+end]
+		if !strings.Contains(block, "path: \"/v1/messages\"") {
+			t.Fatalf("filter %q must be restricted to the exact Messages path:\n%s", filter, block)
+		}
+	}
+}
+
+func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T) {
+	tenantID := "redteam"
+	gatewayNamespace := "openshift-ingress"
+	resources := []unstructured.Unstructured{
+		{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": PayloadProcessingPluginsConfigMapForTenant(tenantID), "namespace": gatewayNamespace},
+			"data":     map[string]any{"pre-extproc.yaml": "pre", "extproc.yaml": "old"},
+		}},
+		{Object: map[string]any{
+			"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{"name": PayloadProcessingDeploymentName(tenantID), "namespace": gatewayNamespace},
+			"spec": map[string]any{"template": map[string]any{
+				"metadata": map[string]any{"annotations": map[string]any{}},
+				"spec":     map[string]any{"containers": []any{map[string]any{"name": "payload-processing"}}},
+			}},
+		}},
+		{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), "namespace": "tenant-a"},
+			"data":     map[string]any{"extproc.yaml": "external-model-chain"},
+		}},
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, true); err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := unstructured.NestedStringMap(resources[0].Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data["pre-extproc.yaml"] != "pre" || !strings.Contains(data["extproc.yaml"], "anthropic_messages_request") {
+		t.Fatalf("unexpected shared ExtProc ConfigMap: %#v", data)
+	}
+	hash, found, err := unstructured.NestedString(resources[1].Object, "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation)
+	if err != nil || !found || hash == "" {
+		t.Fatalf("shared config hash missing: found=%v err=%v hash=%q", found, err, hash)
+	}
+	externalData, _, err := unstructured.NestedStringMap(resources[2].Object, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if externalData["extproc.yaml"] != "external-model-chain" {
+		t.Fatalf("shared config changed ExternalModel ExtProc: %#v", externalData)
 	}
 }
