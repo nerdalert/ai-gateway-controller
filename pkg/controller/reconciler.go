@@ -361,6 +361,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	want := modelTenantContext{
 		aitenantUID: live.aitenant.GetUID(), mtcUID: live.mtc.GetUID(),
 		gatewayName: gatewayName, gatewayNamespace: gatewayNamespace,
+		apiTranslationEnabled: live.apiTranslationEnabled,
 	}
 
 	validationErr := r.validateProvider(ctx, &provider)
@@ -492,13 +493,44 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
-	set, err := resolver.Resolve(modelPtrs, providerPtrs)
+	set, err := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, modelTenant.apiTranslationEnabled)
 	if err != nil {
 		reason := reasonReconcileFailed
+		message := err.Error()
 		if errors.Is(err, resolver.ErrNoRoutes) {
 			reason = reasonProviderNotReady
+			var skips []string
+			for _, modelRoutes := range set.Models {
+				for _, skip := range modelRoutes.Skips {
+					skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
+				}
+			}
+			if len(skips) > 0 {
+				message = "no routable ExternalModel provider remains: " + strings.Join(skips, "; ")
+			}
+			if allRoutesExcludedByPolicy(set) {
+				valid, liveErr := r.livePraxisBeforeWrite(ctx, req.Namespace, modelTenant)
+				if liveErr != nil {
+					return reconcile.Result{}, liveErr
+				}
+				if !valid {
+					return reconcile.Result{Requeue: true}, nil
+				}
+				if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.cleanupModelTransport(ctx, req.Namespace, nil); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.cleanupOverlay(ctx, req.Namespace); err != nil {
+					return reconcile.Result{}, err
+				}
+			}
 		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -584,11 +616,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 }
 
 type modelTenantContext struct {
-	aitenant         *unstructured.Unstructured
-	aitenantUID      types.UID
-	mtcUID           types.UID
-	gatewayName      string
-	gatewayNamespace string
+	aitenant              *unstructured.Unstructured
+	aitenantUID           types.UID
+	mtcUID                types.UID
+	gatewayName           string
+	gatewayNamespace      string
+	apiTranslationEnabled bool
 }
 
 // prepareModelTenant resolves the MaasTenantConfig selector and the owning
@@ -661,7 +694,11 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 	} else if err != nil {
 		return modelTenantContext{}, false, err
 	}
-	return modelTenantContext{aitenant: ait, aitenantUID: ait.GetUID(), mtcUID: live.mtc.GetUID(), gatewayName: gatewayName, gatewayNamespace: gatewayNamespace}, true, nil
+	return modelTenantContext{
+		aitenant: ait, aitenantUID: ait.GetUID(), mtcUID: live.mtc.GetUID(),
+		gatewayName: gatewayName, gatewayNamespace: gatewayNamespace,
+		apiTranslationEnabled: live.apiTranslationEnabled,
+	}, true, nil
 }
 
 // cleanupUnselectedModel releases only resources owned by this controller when
@@ -799,9 +836,92 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 // given model: its deletion, or its gatewayRefs no longer naming its own
 // tenant. Only the final served model may remove the shared serving state.
 func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
+	live, err := r.liveTenantResolution(ctx, deleted.Namespace)
+	if err != nil {
+		return err
+	}
+	if live.missingConfig || !live.selected || live.mtc == nil || live.aitenant == nil ||
+		live.status != tenant.PayloadProcessingStatusSteady || !tenant.DeployReady(live.aitenant) {
+		return errors.New("cannot republish remaining ExternalModels while the tenant handoff is not steady")
+	}
+	set, modelPtrs, modelOwners, err := r.resolveRemainingHomeModels(ctx, deleted, gatewayName, gatewayNamespace, live.apiTranslationEnabled)
+	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
+		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
+	if errors.Is(err, resolver.ErrNoRoutes) {
+		// Preserve serving state during provider/readiness failures. Policy-excluded
+		// candidates are not eligible to serve and may be removed safely.
+		if len(modelPtrs) > 0 && !allRoutesExcludedByPolicy(set) {
+			return err
+		}
+		if err := r.ensureHomeTenantBeforeWrite(ctx, deleted.Namespace, live, gatewayName, gatewayNamespace); err != nil {
+			return err
+		}
+		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
+			return err
+		}
+		if err := r.cleanupHomeModelServingState(ctx, deleted.Namespace, tenantID); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
+	}
+	set, rejected := excludeUnsupportedModelSelection(set)
+	if len(set.Routes()) == 0 && len(rejected) > 0 {
+		if err := r.ensureHomeTenantBeforeWrite(ctx, deleted.Namespace, live, gatewayName, gatewayNamespace); err != nil {
+			return err
+		}
+		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
+			return err
+		}
+		if err := r.cleanupHomeModelServingState(ctx, deleted.Namespace, tenantID); err != nil {
+			return err
+		}
+		return r.removeExternalModelFinalizer(ctx, deleted)
+	}
+	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
+		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
+	}
+	if err := r.ensureHomeTenantBeforeWrite(ctx, deleted.Namespace, live, gatewayName, gatewayNamespace); err != nil {
+		return err
+	}
+	return r.applyRemainingHomeModels(ctx, deleted, tenantID, gatewayName, gatewayNamespace, set, modelPtrs, modelOwners)
+}
+
+func homeModelTenantContext(live tenantResolution, gatewayName, gatewayNamespace string) modelTenantContext {
+	return modelTenantContext{
+		aitenantUID: live.aitenant.GetUID(), mtcUID: live.mtc.GetUID(),
+		gatewayName: gatewayName, gatewayNamespace: gatewayNamespace,
+		apiTranslationEnabled: live.apiTranslationEnabled,
+	}
+}
+
+func (r *Reconciler) ensureHomeTenantBeforeWrite(
+	ctx context.Context,
+	namespace string,
+	live tenantResolution,
+	gatewayName, gatewayNamespace string,
+) error {
+	valid, err := r.livePraxisBeforeWrite(ctx, namespace, homeModelTenantContext(live, gatewayName, gatewayNamespace))
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return errors.New("tenant changed before remaining ExternalModel state could be published; retrying")
+	}
+	return nil
+}
+
+func (r *Reconciler) resolveRemainingHomeModels(
+	ctx context.Context,
+	deleted *v1alpha1.ExternalModel,
+	gatewayName, gatewayNamespace string,
+	apiTranslationEnabled bool,
+) (*resolver.ResolvedRouteSet, []*v1alpha1.ExternalModel, map[string]*v1alpha1.ExternalModel, error) {
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
-		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
+		return nil, nil, nil, fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
@@ -815,62 +935,39 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	}
 	providerPtrs, err := r.providerInputs(ctx, deleted.Namespace)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	set, err := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
+	return set, modelPtrs, modelOwners, err
+}
+
+func (r *Reconciler) cleanupHomeModelServingState(ctx context.Context, namespace, tenantID string) error {
+	if err := r.deleteExternalModelRouteFiltersForTenant(ctx, namespace); err != nil {
 		return err
 	}
+	if tenantID != "" {
+		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
+			return err
+		}
+	}
+	if err := r.cleanupModelTransport(ctx, namespace, nil); err != nil {
+		return err
+	}
+	return r.cleanupOverlay(ctx, namespace)
+}
+
+// applyRemainingHomeModels reconciles the home tenant's remaining routes and
+// admitted attachments after a model is deleted or moved away from the tenant.
+func (r *Reconciler) applyRemainingHomeModels(
+	ctx context.Context,
+	deleted *v1alpha1.ExternalModel,
+	tenantID, gatewayName, gatewayNamespace string,
+	set *resolver.ResolvedRouteSet,
+	modelPtrs []*v1alpha1.ExternalModel,
+	modelOwners map[string]*v1alpha1.ExternalModel,
+) error {
 	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
 		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
-	set, err := resolver.Resolve(modelPtrs, providerPtrs)
-	if errors.Is(err, resolver.ErrNoRoutes) {
-		// A sibling still exists but is temporarily unroutable: retain the
-		// last-known-good transport and overlay and retry. Only final-model
-		// deletion is allowed to remove the shared serving state.
-		if len(modelPtrs) > 0 {
-			return err
-		}
-		// Attachments from other namespaces keep the tenant's overlay and
-		// route filter; only its own transport is removed.
-		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
-			return err
-		}
-		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		if tenantID != "" {
-			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
-				return err
-			}
-		}
-		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
-			return err
-		}
-		return r.cleanupOverlay(ctx, deleted.Namespace)
-	}
-	if err != nil {
-		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
-	}
-	set, rejected := excludeUnsupportedModelSelection(set)
-	if len(set.Routes()) == 0 && len(rejected) > 0 {
-		// No valid sibling can serve. Remove the deleted model's routes before
-		// releasing its finalizer; unsupported siblings remain unserved.
-		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
-			return err
-		}
-		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		if tenantID != "" {
-			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
-				return err
-			}
-		}
-		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
-			return err
-		}
-		return r.cleanupOverlay(ctx, deleted.Namespace)
-	}
-	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
-		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
-	}
 	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
 	if err != nil {
 		return err
@@ -887,13 +984,36 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.cleanupModelTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
 		return err
 	}
-	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, string(modelPtrs[0].UID)); err != nil {
+	sourceUID := string(deleted.UID)
+	if len(modelPtrs) > 0 {
+		sourceUID = string(modelPtrs[0].UID)
+	}
+	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, sourceUID); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
 	if excluded := excludedRoutes(attached); len(excluded) > 0 {
 		return r.gcAttachmentState(ctx, deleted.Namespace, excluded)
 	}
 	return nil
+}
+
+func allRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
+	if set == nil || len(set.Models) == 0 {
+		return false
+	}
+	sawPolicyExclusion := false
+	for _, model := range set.Models {
+		if len(model.Routes) > 0 || len(model.Skips) == 0 {
+			return false
+		}
+		for _, skip := range model.Skips {
+			if skip.Reason != resolver.SkipTranslationDisabled {
+				return false
+			}
+			sawPolicyExclusion = true
+		}
+	}
+	return sawPolicyExclusion
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
@@ -1060,11 +1180,12 @@ func (r *Reconciler) cleanupOverlay(ctx context.Context, namespace string) error
 }
 
 type tenantResolution struct {
-	mtc           *unstructured.Unstructured
-	aitenant      *unstructured.Unstructured
-	selected      bool
-	missingConfig bool
-	status        string
+	mtc                   *unstructured.Unstructured
+	aitenant              *unstructured.Unstructured
+	selected              bool
+	missingConfig         bool
+	status                string
+	apiTranslationEnabled bool
 }
 
 // providerTenantReadinessMessage explains why provider transport is waiting
@@ -1107,7 +1228,14 @@ func (r *Reconciler) resolveTenantForNamespace(ctx context.Context, namespace st
 	if err != nil {
 		return tenantResolution{}, err
 	}
-	return tenantResolution{mtc: mtc, aitenant: ait, selected: tenant.UsesPraxis(mtc), status: tenant.PayloadProcessingStatus(mtc)}, nil
+	apiTranslationEnabled, err := tenant.APITranslationEnabled(mtc)
+	if err != nil {
+		return tenantResolution{}, fmt.Errorf("read MaasTenantConfig.spec.apiTranslation: %w", err)
+	}
+	return tenantResolution{
+		mtc: mtc, aitenant: ait, selected: tenant.UsesPraxis(mtc),
+		status: tenant.PayloadProcessingStatus(mtc), apiTranslationEnabled: apiTranslationEnabled,
+	}, nil
 }
 
 func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (*unstructured.Unstructured, error) {
@@ -1145,7 +1273,14 @@ func (r *Reconciler) liveTenantResolution(ctx context.Context, namespace string)
 		}
 		return tenantResolution{}, fmt.Errorf("live get MaasTenantConfig %s/%s: %w", namespace, tenant.MaasTenantConfigInstanceName, err)
 	}
-	resolution := tenantResolution{mtc: mtc, selected: tenant.UsesPraxis(mtc), status: tenant.PayloadProcessingStatus(mtc)}
+	apiTranslationEnabled, err := tenant.APITranslationEnabled(mtc)
+	if err != nil {
+		return tenantResolution{}, fmt.Errorf("read live MaasTenantConfig.spec.apiTranslation: %w", err)
+	}
+	resolution := tenantResolution{
+		mtc: mtc, selected: tenant.UsesPraxis(mtc), status: tenant.PayloadProcessingStatus(mtc),
+		apiTranslationEnabled: apiTranslationEnabled,
+	}
 	name, ownerNamespace, ok := tenant.OwningAITenantRef(mtc)
 	if !ok {
 		return resolution, nil
@@ -1176,6 +1311,9 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 		return false, nil
 	}
 	if want.mtcUID != "" && live.mtc.GetUID() != want.mtcUID {
+		return false, nil
+	}
+	if want.apiTranslationEnabled != live.apiTranslationEnabled {
 		return false, nil
 	}
 	if want.aitenantUID != "" && live.aitenant.GetUID() != want.aitenantUID {
@@ -1441,11 +1579,11 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
-	kept := append(make([]any, 0, len(preserved)+len(routes)*2+2), preserved...)
+	kept := append(make([]any, 0, len(preserved)+len(routes)*3+len(attached)*3+2), preserved...)
 
-	byModel := map[string]int{}
+	byModel := map[string][]resolver.Route{}
 	for _, route := range routes {
-		byModel[route.Model]++
+		byModel[route.Model] = append(byModel[route.Model], route)
 	}
 	models := make([]string, 0, len(byModel))
 	for model := range byModel {
@@ -1459,12 +1597,23 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 	}
 	enabled := make([]routeRules, 0, len(models)+len(attached))
 	for _, model := range models {
-		// modelHTTPRouteSet emits two provider rules per route plus the
-		// canonical and header-only fail-closed sink rules.
-		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), byModel[model]*2 + 2})
+		// Keep per-route ExtProc enablement aligned with the same renderer that
+		// creates the HTTPRoute rules. Translation adds exact target-path rules,
+		// and attached routes need the same count as their rendered HTTPRoute.
+		httpRoute := modelHTTPRouteSet(byModel[model], modelNamespace, gatewayName, gatewayNamespace)
+		rules, found, err := unstructured.NestedSlice(httpRoute.Object, "spec", "rules")
+		if err != nil || !found {
+			return fmt.Errorf("ExternalModel %s route renderer did not produce HTTPRoute rules", model)
+		}
+		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), len(rules)})
 	}
 	for _, a := range attached {
-		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(a.routes)*2 + 2})
+		httpRoute := modelHTTPRouteSet(a.routes, a.model.Namespace, gatewayName, gatewayNamespace)
+		rules, found, err := unstructured.NestedSlice(httpRoute.Object, "spec", "rules")
+		if err != nil || !found {
+			return fmt.Errorf("attached ExternalModel %s/%s route renderer did not produce HTTPRoute rules", a.model.Namespace, a.model.Name)
+		}
+		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(rules)})
 	}
 	for _, route := range enabled {
 		for index := 0; index < route.count; index++ {
@@ -1485,7 +1634,11 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
-									"request_header_mode":   "SEND",
+									"request_header_mode": "SEND",
+									// The pre-auth processor extracts the model from JSON before
+									// authentication. Give its body-field-to-header filter the
+									// complete request body; only post-auth Praxis needs streamed
+									// chunks for selected-provider translation.
 									"request_body_mode":     "BUFFERED",
 									"response_header_mode":  "SKIP",
 									"response_body_mode":    "NONE",
@@ -1504,10 +1657,17 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 							"overrides": map[string]any{
 								"processing_mode": map[string]any{
 									"request_header_mode": "SEND",
-									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
-									"request_body_mode":     "STREAMED",
-									"response_header_mode":  "SEND",
-									"response_body_mode":    "NONE",
+									// Stream request bytes to the dedicated ExtProc. It holds the header response while
+									// the selected-provider translator validates the bounded body, then routes once.
+									"request_body_mode":    "STREAMED",
+									"response_header_mode": "SEND",
+									// Provider selection happens inside ExtProc after the request has
+									// already matched a no-candidate fallback route. Envoy does not
+									// renegotiate response processing mode for the active ExtProc stream
+									// when route cache is cleared, so every ExternalModel route must
+									// deliver response chunks. The selected filter converts Messages
+									// responses and passes OpenAI-compatible responses through.
+									"response_body_mode":    "STREAMED",
 									"request_trailer_mode":  "SKIP",
 									"response_trailer_mode": "SKIP",
 								},
@@ -1854,6 +2014,24 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 		}
 		seenProviders[candidate.Provider] = true
 		stableID := envelope.RouteStableID(candidate)
+		// A request translator may rewrite :path after intelligent_route has
+		// selected this provider. Envoy clears the route cache for that routing
+		// mutation, so a shared exact-path route (for example /v1/messages) can
+		// otherwise win over the broader ExternalModel route. This exact target
+		// path match carries the trusted candidate header; Gateway API precedence
+		// ranks it above an unqualified shared exact-path route. Requests on the
+		// shared route have no candidate header and continue to its own backend.
+		if candidate.Path != "" {
+			rules = append(rules, map[string]any{
+				"matches": []any{map[string]any{
+					"path":    map[string]any{"type": "Exact", "value": candidate.Path},
+					"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},
+				}},
+				"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+				"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
+				"timeouts":    map[string]any{"request": "300s"},
+			})
+		}
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},

@@ -92,6 +92,9 @@ type Candidate struct {
 	// group zero is emitted instead of being omitted by encoding/json.
 	SelectionGroup *uint32     `json:"selection_group,omitempty"`
 	Credential     *Credential `json:"credential,omitempty"`
+	APIFormat      string      `json:"api_format,omitempty"`
+	Path           string      `json:"path,omitempty"`
+	TargetModel    string      `json:"target_model,omitempty"`
 }
 
 // Provenance records who rendered this envelope and from what source state.
@@ -207,12 +210,15 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// duplicates, which would cause the second model to get 404/503.
 			// The Cluster stays shared (one transport per provider).
 			cand := Candidate{
-				Cluster:  r.Cluster,
-				StableID: RouteStableID(r),
-				Kind:     "inference_model",
-				Name:     r.ClientName,
-				Site:     scope.LocalSite,
-				Fresh:    true,
+				Cluster:     r.Cluster,
+				StableID:    RouteStableID(r),
+				Kind:        "inference_model",
+				Name:        r.ClientName,
+				Site:        scope.LocalSite,
+				Fresh:       true,
+				APIFormat:   r.APIFormat,
+				Path:        r.Path,
+				TargetModel: r.TargetModel,
 			}
 			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
 				group := group

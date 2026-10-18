@@ -261,8 +261,16 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	if nestedMapAt(t, headers, 0)["value"] != candidate.StableID {
 		t.Fatalf("route candidate header = %#v, want %q", headers, candidate.StableID)
 	}
+	rules := nestedSlice(t, route.Object, "spec", "rules")
+	exactMatch := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0)
+	if pathType := nestedString(t, exactMatch, "path", "type"); pathType != "Exact" || nestedString(t, exactMatch, "path", "value") != "/v1/chat/completions" {
+		t.Fatalf("attached translation target path match = %s %q", pathType, nestedString(t, exactMatch, "path", "value"))
+	}
+	if selected := nestedMapAt(t, nestedSlice(t, exactMatch, "headers"), 0); nestedString(t, selected, "name") != selectedProviderHeader || nestedString(t, selected, "value") != candidate.StableID {
+		t.Fatalf("attached exact-path selected-provider match = %#v", selected)
+	}
 	names := routeFilterNames(t, r, "tenant-b", "gateway-b")
-	if len(names) != 4 || names[0] != "team."+routeName+".0" {
+	if len(names) != 5 || names[0] != "team."+routeName+".0" {
 		t.Fatalf("route filter patches = %v", names)
 	}
 	got := getModel(t, r, model)
@@ -873,7 +881,7 @@ func TestAttachmentPreservesTenantOwnOverlayCandidates(t *testing.T) {
 		t.Fatalf("own candidate changed: before %#v after %#v", before, after)
 	}
 	names := routeFilterNames(t, r, "tenant-b", "gateway-b")
-	if len(names) != 8 || names[0] != "tenant-b.external-model-own.0" || names[4] != "team."+attachmentRouteName(model, gatewayB)+".0" {
+	if len(names) != 10 || names[0] != "tenant-b.external-model-own.0" || names[5] != "team."+attachmentRouteName(model, gatewayB)+".0" {
 		t.Fatalf("route filter patches = %v, want own patches then the attachment", names)
 	}
 
@@ -1125,7 +1133,7 @@ func TestTenantKeepsAttachmentsWhenItsOwnModelsServeNothing(t *testing.T) {
 		if env := overlayEnvelope(t, r, "tenant-b"); len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].StableID != "team/chat/team/openai" {
 			t.Fatalf("%s: overlay candidates = %#v, want the attachment", when, env.Overlay.Candidates)
 		}
-		if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 4 || names[0] != "team."+attachmentRouteName(model, gatewayB)+".0" {
+		if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 5 || names[0] != "team."+attachmentRouteName(model, gatewayB)+".0" {
 			t.Fatalf("%s: route filter patches = %v", when, names)
 		}
 	}

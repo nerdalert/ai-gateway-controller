@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -88,7 +89,23 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		applied = *object.DeepCopy()
 		return nil
 	}
-	routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
+	routes := []resolver.Route{
+		{Model: "demo-model", ClientName: "demo", Provider: "provider-a", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		{Model: "demo-model", ClientName: "demo", Provider: "provider-b", APIFormat: "messages", Path: "/v1/messages"},
+	}
+	rendered := modelHTTPRouteSet(routes, "tenant-a", "test-gateway", "gateway-system")
+	renderedRules := nestedSlice(t, rendered.Object, "spec", "rules")
+	expectedRoutes := make(map[string]bool, len(renderedRules))
+	if len(renderedRules) != 8 {
+		t.Fatalf("rendered route rules = %d, want 8 for two provider routes and two sinks", len(renderedRules))
+	}
+	expectedResponseModes := []string{"STREAMED", "STREAMED", "STREAMED", "STREAMED", "STREAMED", "STREAMED", "STREAMED", "STREAMED"}
+	expectedResponseModeByRoute := make(map[string]string, len(renderedRules))
+	for index := range renderedRules {
+		name := fmt.Sprintf("tenant-a.external-model-demo-model.%d", index)
+		expectedRoutes[name] = false
+		expectedResponseModeByRoute[name] = expectedResponseModes[index]
+	}
 	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +120,7 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		t.Fatalf("route EnvoyFilter workloadSelector = %#v found=%t err=%v, want selected Gateway", selector, found, err)
 	}
 	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
+	routePatchCount := 0
 	for _, raw := range patches {
 		patch, ok := raw.(map[string]any)
 		if !ok || patch["applyTo"] != "HTTP_ROUTE" {
@@ -112,17 +130,22 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		if match == "" {
 			continue
 		}
-		if match != "tenant-a.external-model-demo-model.0" && match != "tenant-a.external-model-demo-model.1" && match != "tenant-a.external-model-demo-model.2" && match != "tenant-a.external-model-demo-model.3" {
+		if _, exists := expectedRoutes[match]; !exists {
 			t.Fatalf("unexpected ExternalModel route patch name %q", match)
 		}
+		if expectedRoutes[match] {
+			t.Fatalf("duplicate ExternalModel route patch %q", match)
+		}
+		expectedRoutes[match] = true
+		routePatchCount++
 		overrides, found, err := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", externalModelExtProcFilter, "overrides")
 		if err != nil || !found {
 			t.Fatalf("route %q overrides=%#v found=%t err=%v, want supported enable override", match, overrides, found, err)
 		}
 		mode, found, err := unstructured.NestedMap(overrides, "processing_mode")
 		if err != nil || !found || mode["request_header_mode"] != "SEND" ||
-			mode["request_body_mode"] != "STREAMED" || mode["response_body_mode"] != "NONE" {
-			t.Fatalf("route %q processing mode=%#v found=%t err=%v, want SEND/STREAMED", match, mode, found, err)
+			mode["request_body_mode"] != "STREAMED" || mode["response_body_mode"] != expectedResponseModeByRoute[match] {
+			t.Fatalf("route %q processing mode=%#v found=%t err=%v, want streamed requests and provider-scoped response mode", match, mode, found, err)
 		}
 		sharedDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
 		if err != nil || !found || !sharedDisabled {
@@ -134,11 +157,19 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		}
 		preMode, found, err := unstructured.NestedMap(preOverrides, "processing_mode")
 		if err != nil || !found || preMode["request_body_mode"] != "BUFFERED" {
-			t.Fatalf("route %q pre-auth processing mode=%#v found=%t err=%v, want BUFFERED", match, preMode, found, err)
+			t.Fatalf("route %q pre-auth processing mode=%#v found=%t err=%v, want BUFFERED for model extraction", match, preMode, found, err)
 		}
 		preDisabled, found, err := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp-pre", "disabled")
 		if err != nil || !found || !preDisabled {
 			t.Fatalf("route %q shared pre-auth disabled=%t found=%t err=%v, want disabled", match, preDisabled, found, err)
+		}
+	}
+	if routePatchCount != len(renderedRules) {
+		t.Fatalf("ExternalModel route patches = %d, generated HTTPRoute rules = %d", routePatchCount, len(renderedRules))
+	}
+	for name, found := range expectedRoutes {
+		if !found {
+			t.Errorf("generated ExternalModel route %q has no ExtProc enablement patch", name)
 		}
 	}
 	// A stale route-level enablement is removed before new route patches are
@@ -221,7 +252,7 @@ func nestedMapAt(t *testing.T, values []any, index int) map[string]any {
 }
 
 func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
-	route := resolver.Route{Model: "model", ClientName: "client-model", Provider: "openai", Endpoint: "api.example.com"}
+	route := resolver.Route{Model: "model", ClientName: "client-model", Provider: "openai", Endpoint: "api.example.com", Path: "/v1/messages"}
 	obj := modelHTTPRoute(route, "tenant-a", "gateway", "maas-system")
 	parentRefs := nestedSlice(t, obj.Object, "spec", "parentRefs")
 	parent := nestedMapAt(t, parentRefs, 0)
@@ -229,20 +260,39 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 		t.Fatalf("route parent namespace = %q, want maas-system", nestedString(t, parent, "namespace"))
 	}
 	rules, found, err := unstructured.NestedSlice(obj.Object, "spec", "rules")
-	if err != nil || !found || len(rules) != 4 {
-		t.Fatalf("expected trusted canonical/body rules and fail-closed fallbacks, got found=%v len=%d err=%v", found, len(rules), err)
+	if err != nil || !found || len(rules) != 5 {
+		t.Fatalf("expected trusted canonical/target-path/body rules and fail-closed fallbacks, got found=%v len=%d err=%v", found, len(rules), err)
 	}
 	selectedMatches := nestedSlice(t, nestedMapAt(t, rules, 0), "matches")
 	selectedHeader := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, selectedMatches, 0), "headers"), 0)
 	if nestedString(t, selectedHeader, "name") != "X-AI-Routing-Candidate" || nestedString(t, selectedHeader, "value") != envelope.CandidateStableID("model", "openai") {
 		t.Fatalf("trusted provider header = %q=%q", nestedString(t, selectedHeader, "name"), nestedString(t, selectedHeader, "value"))
 	}
-	pathMatches := nestedSlice(t, nestedMapAt(t, rules, 2), "matches")
+	// This exact selected-provider rule wins a Gateway API tie against a
+	// shared exact /v1/messages route, which has fewer header match conditions.
+	targetMatches := nestedSlice(t, nestedMapAt(t, rules, 0), "matches")
+	targetMatch := nestedMapAt(t, targetMatches, 0)
+	if got := nestedString(t, targetMatch, "path", "type"); got != "Exact" {
+		t.Fatalf("selected target path match type = %q, want Exact", got)
+	}
+	if got := nestedString(t, targetMatch, "path", "value"); got != "/v1/messages" {
+		t.Fatalf("selected target path = %q, want /v1/messages", got)
+	}
+	targetHeaders := nestedSlice(t, targetMatch, "headers")
+	if len(targetHeaders) != 1 || nestedString(t, nestedMapAt(t, targetHeaders, 0), "name") != selectedProviderHeader ||
+		nestedString(t, nestedMapAt(t, targetHeaders, 0), "value") != envelope.CandidateStableID("model", "openai") {
+		t.Fatalf("selected target path headers = %#v, want trusted candidate header", targetHeaders)
+	}
+	targetBackend := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "backendRefs"), 0)
+	if got := nestedString(t, targetBackend, "name"); got != providerServicePrefix+"openai" {
+		t.Fatalf("selected target path backend = %q, want provider service", got)
+	}
+	pathMatches := nestedSlice(t, nestedMapAt(t, rules, 3), "matches")
 	path := nestedString(t, nestedMapAt(t, pathMatches, 0), "path", "value")
 	if path != "/tenant-a/client-model" {
 		t.Fatalf("path route = %q", path)
 	}
-	backendRefs := nestedSlice(t, nestedMapAt(t, rules, 2), "backendRefs")
+	backendRefs := nestedSlice(t, nestedMapAt(t, rules, 3), "backendRefs")
 	backend := nestedMapAt(t, backendRefs, 0)
 	if nestedString(t, backend, "name") != "provider-selection-required-model" {
 		t.Fatalf("backend name = %q, want fail-closed sink", nestedString(t, backend, "name"))
@@ -253,7 +303,7 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 	if _, found, err := unstructured.NestedString(backend, "namespace"); err != nil || found {
 		t.Fatal("route backend must remain in the tenant namespace; unexpected cross-namespace backend reference")
 	}
-	bodyMatches := nestedSlice(t, nestedMapAt(t, rules, 3), "matches")
+	bodyMatches := nestedSlice(t, nestedMapAt(t, rules, 4), "matches")
 	headers := nestedSlice(t, nestedMapAt(t, bodyMatches, 0), "headers")
 	name := nestedString(t, nestedMapAt(t, headers, 0), "name")
 	value := nestedString(t, nestedMapAt(t, headers, 0), "value")
@@ -267,17 +317,17 @@ func TestModelHTTPRoutePreservesPathAndBodyRouting(t *testing.T) {
 
 func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) {
 	routes := []resolver.Route{
-		{Model: "model", ClientName: "chat", Provider: "provider-b"},
-		{Model: "model", ClientName: "chat", Provider: "provider-a"},
+		{Model: "model", ClientName: "chat", Provider: "provider-b", Path: "/v1/messages"},
+		{Model: "model", ClientName: "chat", Provider: "provider-a", Path: "/v1/chat/completions"},
 	}
 	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
 	rules := nestedSlice(t, obj.Object, "spec", "rules")
-	if len(rules) != 6 {
-		t.Fatalf("rules = %d, want two trusted entry rules per provider plus path and body fallback", len(rules))
+	if len(rules) != 8 {
+		t.Fatalf("rules = %d, want three trusted entry rules per provider plus path and body fallback", len(rules))
 	}
 	for i, providerName := range []string{"provider-b", "provider-a"} {
 		wantStableID := envelope.CandidateStableID("model", providerName)
-		ruleIndex := i * 2
+		ruleIndex := i * 3
 		matches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
 		header := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, matches, 0), "headers"), 0)
 		if got := nestedString(t, header, "name"); got != selectedProviderHeader {
@@ -290,19 +340,32 @@ func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) 
 		if got := nestedString(t, backend, "name"); got != providerServicePrefix+providerName {
 			t.Fatalf("rule %d backend = %q, want %q", i, got, providerServicePrefix+providerName)
 		}
+		targetPath := routes[i].Path
+		targetMatches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
+		targetMatch := nestedMapAt(t, targetMatches, 0)
+		if got := nestedString(t, targetMatch, "path", "type"); got != "Exact" {
+			t.Fatalf("provider %s target path match type = %q, want Exact", providerName, got)
+		}
+		if got := nestedString(t, targetMatch, "path", "value"); got != targetPath {
+			t.Fatalf("provider %s target path = %q, want %q", providerName, got, targetPath)
+		}
+		targetHeader := nestedMapAt(t, nestedSlice(t, targetMatch, "headers"), 0)
+		if got := nestedString(t, targetHeader, "value"); got != wantStableID {
+			t.Fatalf("provider %s target path candidate = %q, want %q", providerName, got, wantStableID)
+		}
 	}
 }
 
 func TestModelHTTPRouteFailsClosedWithoutTrustedSelection(t *testing.T) {
 	routes := []resolver.Route{
-		{Model: "model", ClientName: "chat", Provider: "provider-a", Endpoint: "a.example.com"},
-		{Model: "model", ClientName: "chat", Provider: "provider-b", Endpoint: "b.example.com"},
+		{Model: "model", ClientName: "chat", Provider: "provider-a", Endpoint: "a.example.com", Path: "/v1/messages"},
+		{Model: "model", ClientName: "chat", Provider: "provider-b", Endpoint: "b.example.com", Path: "/v1/chat/completions"},
 	}
 	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
 	rules := nestedSlice(t, obj.Object, "spec", "rules")
 	sinkName := providerSelectionSinkName("model")
-	if len(rules) != 6 {
-		t.Fatalf("rules = %d, want two selected rules per provider and two sink rules", len(rules))
+	if len(rules) != 8 {
+		t.Fatalf("rules = %d, want three selected rules per provider and two sink rules", len(rules))
 	}
 	for i := 0; i < len(rules)-2; i++ {
 		matches := nestedSlice(t, nestedMapAt(t, rules, i), "matches")
@@ -2086,6 +2149,418 @@ func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {
 	var overlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "routing-overlay"}, &overlay); err != nil {
 		t.Fatalf("routing overlay after provider transport is ready = %v", err)
+	}
+}
+
+func TestUnsupportedActiveProviderPreservesLastKnownServingState(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("initial serving reconcile: %v", err)
+	}
+
+	var beforeOverlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &beforeOverlay); err != nil {
+		t.Fatalf("get initial overlay: %v", err)
+	}
+	beforeRoute := &unstructured.Unstructured{}
+	beforeRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	routeKey := client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}
+	if err := r.Get(ctx, routeKey, beforeRoute); err != nil {
+		t.Fatalf("get initial route: %v", err)
+	}
+	beforeRouteSpec, found, err := unstructured.NestedMap(beforeRoute.Object, "spec")
+	if err != nil || !found {
+		t.Fatalf("initial HTTPRoute spec = %#v, found=%t, err=%v", beforeRouteSpec, found, err)
+	}
+	var provider v1alpha1.ExternalProvider
+	providerKey := client.ObjectKey{Namespace: model.Namespace, Name: "provider"}
+	if err := r.Get(ctx, providerKey, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.Provider = "azure-openai"
+	if err := r.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+
+	applyCalls, publishCalls := 0, 0
+	r.ApplyResource = func(context.Context, client.Client, unstructured.Unstructured) error {
+		applyCalls++
+		return nil
+	}
+	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+		publishCalls++
+		return publisher.Result{}, nil
+	}
+	_, err = r.Reconcile(ctx, req)
+	if !errors.Is(err, resolver.ErrProviderCapabilityUnsupported) {
+		t.Fatalf("reconcile error = %v, want ErrProviderCapabilityUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "azure-openai") || !strings.Contains(err.Error(), "openai-chat") {
+		t.Fatalf("unsupported capability error lacks provider/API format: %v", err)
+	}
+	if applyCalls != 0 || publishCalls != 0 {
+		t.Fatalf("unsupported binding wrote serving resources: applies=%d overlayPublishes=%d", applyCalls, publishCalls)
+	}
+
+	var afterOverlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKeyFromObject(&beforeOverlay), &afterOverlay); err != nil {
+		t.Fatalf("get preserved overlay: %v", err)
+	}
+	if afterOverlay.Data["routing-overlay.json"] != beforeOverlay.Data["routing-overlay.json"] {
+		t.Fatal("unsupported active binding changed the last-known serving overlay")
+	}
+	afterRoute := &unstructured.Unstructured{}
+	afterRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(ctx, routeKey, afterRoute); err != nil {
+		t.Fatalf("get preserved route: %v", err)
+	}
+	afterRouteSpec, found, err := unstructured.NestedMap(afterRoute.Object, "spec")
+	if err != nil || !found || !reflect.DeepEqual(afterRouteSpec, beforeRouteSpec) {
+		t.Fatalf("unsupported active binding changed last-known HTTPRoute spec: got=%#v want=%#v err=%v", afterRouteSpec, beforeRouteSpec, err)
+	}
+	var failed v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status.Phase != "Failed" || !hasConditionReason(failed.Status.Conditions, conditionReady, reasonReconcileFailed) {
+		t.Fatalf("unsupported binding status = phase %q conditions %#v, want a clear reconcile failure", failed.Status.Phase, failed.Status.Conditions)
+	}
+	statusReportsUnsupported := false
+	for _, condition := range failed.Status.Conditions {
+		if strings.Contains(condition.Message, string(resolver.SkipAPIFormatUnsupported)) {
+			statusReportsUnsupported = true
+			break
+		}
+	}
+	if !statusReportsUnsupported {
+		t.Fatalf("unsupported binding status does not report %s: %#v", resolver.SkipAPIFormatUnsupported, failed.Status.Conditions)
+	}
+	for _, condition := range failed.Status.Conditions {
+		if strings.Contains(condition.Message, string(resolver.SkipTranslationDisabled)) {
+			t.Fatalf("unsupported binding status was mislabeled as operator-disabled translation: %#v", failed.Status.Conditions)
+		}
+	}
+}
+
+type servingStateSnapshot struct {
+	routeKey   client.ObjectKey
+	serviceKey client.ObjectKey
+	secretKey  client.ObjectKey
+	routeSpec  map[string]any
+	overlay    string
+	service    corev1.ServiceSpec
+}
+
+func captureServingStateSnapshot(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) servingStateSnapshot {
+	t.Helper()
+	snapshot := servingStateSnapshot{
+		routeKey:   client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)},
+		serviceKey: client.ObjectKey{Namespace: model.Namespace, Name: providerServicePrefix + "provider"},
+		secretKey:  client.ObjectKey{Namespace: model.Namespace, Name: "credentials"},
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), snapshot.serviceKey, &service); err != nil {
+		t.Fatalf("get initial provider Service: %v", err)
+	}
+	snapshot.service = *service.Spec.DeepCopy()
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("get initial overlay: %v", err)
+	}
+	snapshot.overlay = overlay.Data["routing-overlay.json"]
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), snapshot.routeKey, route); err != nil {
+		t.Fatalf("get initial route: %v", err)
+	}
+	var found bool
+	var err error
+	snapshot.routeSpec, found, err = unstructured.NestedMap(route.Object, "spec")
+	if err != nil || !found {
+		t.Fatalf("initial HTTPRoute spec = %#v, found=%t, err=%v", snapshot.routeSpec, found, err)
+	}
+	rules, found, err := unstructured.NestedSlice(snapshot.routeSpec, "rules")
+	if err != nil || !found || len(rules) == 0 {
+		t.Fatalf("initial HTTPRoute has no serving rules: rules=%#v found=%t err=%v", rules, found, err)
+	}
+	firstRule, ok := rules[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initial HTTPRoute rule has unexpected type %T", rules[0])
+	}
+	backends, found, err := unstructured.NestedSlice(firstRule, "backendRefs")
+	if err != nil || !found || len(backends) != 1 {
+		t.Fatalf("initial HTTPRoute backend refs = %#v found=%t err=%v", backends, found, err)
+	}
+	backend, ok := backends[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initial HTTPRoute backend has unexpected type %T", backends[0])
+	}
+	backendName, found, err := unstructured.NestedString(backend, "name")
+	if err != nil || !found || backendName != snapshot.serviceKey.Name {
+		t.Fatalf("initial HTTPRoute backend = %q, found=%t, want serving provider Service %q (err=%v)", backendName, found, snapshot.serviceKey.Name, err)
+	}
+	return snapshot
+}
+
+func assertServingStateSnapshotRetained(t *testing.T, r *Reconciler, snapshot servingStateSnapshot) {
+	t.Helper()
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: snapshot.routeKey.Namespace, Name: "routing-overlay"}, &overlay); err != nil {
+		t.Fatalf("get preserved overlay: %v", err)
+	}
+	if overlay.Data["routing-overlay.json"] != snapshot.overlay {
+		t.Fatal("unsupported active binding changed the last-known serving overlay")
+	}
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), snapshot.routeKey, route); err != nil {
+		t.Fatalf("get preserved route: %v", err)
+	}
+	afterRouteSpec, found, err := unstructured.NestedMap(route.Object, "spec")
+	if err != nil || !found || !reflect.DeepEqual(afterRouteSpec, snapshot.routeSpec) {
+		t.Fatalf("unsupported active binding changed last-known HTTPRoute spec: got=%#v want=%#v err=%v", afterRouteSpec, snapshot.routeSpec, err)
+	}
+	var service corev1.Service
+	if err := r.Get(context.Background(), snapshot.serviceKey, &service); err != nil {
+		t.Fatalf("unsupported binding removed the serving provider Service: %v", err)
+	}
+	if !reflect.DeepEqual(service.Spec, snapshot.service) {
+		t.Fatalf("unsupported binding changed serving provider Service spec: got=%#v want=%#v", service.Spec, snapshot.service)
+	}
+	var credential corev1.Secret
+	if err := r.Get(context.Background(), snapshot.secretKey, &credential); err != nil {
+		t.Fatalf("unsupported binding removed the serving provider credential reference: %v", err)
+	}
+}
+
+func configureAnthropicMessagesBinding(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) {
+	t.Helper()
+	ctx := context.Background()
+	providerKey := client.ObjectKey{Namespace: model.Namespace, Name: "provider"}
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, providerKey, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.Provider = "anthropic"
+	if err := r.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	var changedModel v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &changedModel); err != nil {
+		t.Fatal(err)
+	}
+	changedModel.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	changedModel.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	if err := r.Update(ctx, &changedModel); err != nil {
+		t.Fatal(err)
+	}
+	setControllerTranslationEnabled(t, r, model.Namespace, true)
+}
+
+func setControllerTranslationEnabled(t *testing.T, r *Reconciler, namespace string, enabled bool) {
+	t.Helper()
+	var mtc unstructured.Unstructured
+	mtc.SetGroupVersionKind(tenant.MaasTenantConfigGVK)
+	mtcKey := client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}
+	if err := r.Get(context.Background(), mtcKey, &mtc); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedMap(mtc.Object, map[string]any{"enabled": enabled}, "spec", "apiTranslation"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Update(context.Background(), &mtc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAnthropicMessagesServingState(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, snapshot servingStateSnapshot) {
+	t.Helper()
+	ctx := context.Background()
+	var provider v1alpha1.ExternalProvider
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Spec.Provider != "anthropic" {
+		t.Fatalf("serving provider type = %q, want anthropic", provider.Spec.Provider)
+	}
+	var mtc unstructured.Unstructured
+	mtc.SetGroupVersionKind(tenant.MaasTenantConfigGVK)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: tenant.MaasTenantConfigInstanceName}, &mtc); err != nil {
+		t.Fatal(err)
+	}
+	enabled, found, err := unstructured.NestedBool(mtc.Object, "spec", "apiTranslation", "enabled")
+	if err != nil || !found || !enabled {
+		t.Fatalf("translation permission before disable = %t found=%t err=%v, want enabled", enabled, found, err)
+	}
+	if !strings.Contains(snapshot.overlay, `"api_format": "messages"`) || !strings.Contains(snapshot.overlay, `"path": "/v1/messages"`) {
+		t.Fatalf("initial serving overlay does not identify Anthropic Messages profile: %s", snapshot.overlay)
+	}
+	routeSpec, err := json.Marshal(snapshot.routeSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(routeSpec), "/v1/messages") {
+		t.Fatalf("initial serving HTTPRoute does not include Messages path: %s", routeSpec)
+	}
+}
+
+func assertUnsupportedOpenAIMessagesFailure(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, err error) {
+	t.Helper()
+	if !errors.Is(err, resolver.ErrProviderCapabilityUnsupported) {
+		t.Fatalf("reconcile error = %v, want ErrProviderCapabilityUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "APIFormatUnsupported") || !strings.Contains(err.Error(), `provider "openai" with APIFormat "messages"`) {
+		t.Fatalf("unsupported openai/messages binding error is not specific: %v", err)
+	}
+	if strings.Contains(err.Error(), string(resolver.SkipTranslationDisabled)) {
+		t.Fatalf("unsupported openai/messages binding was mislabeled as operator-disabled translation: %v", err)
+	}
+	var failed v1alpha1.ExternalModel
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status.Phase != "Failed" || !hasConditionReason(failed.Status.Conditions, conditionReady, reasonReconcileFailed) {
+		t.Fatalf("unsupported binding status = phase %q conditions %#v, want a clear reconcile failure", failed.Status.Phase, failed.Status.Conditions)
+	}
+	unsupportedReasonReported, disabledReasonReported := false, false
+	for _, condition := range failed.Status.Conditions {
+		unsupportedReasonReported = unsupportedReasonReported || strings.Contains(condition.Message, string(resolver.SkipAPIFormatUnsupported))
+		disabledReasonReported = disabledReasonReported || strings.Contains(condition.Message, string(resolver.SkipTranslationDisabled))
+	}
+	if !unsupportedReasonReported || disabledReasonReported {
+		t.Fatalf("unsupported status reason mismatch: conditions=%#v", failed.Status.Conditions)
+	}
+}
+
+func TestUnsupportedMessagesBindingWithTranslationOmittedPreservesLastKnownServingState(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	providerKey := client.ObjectKey{Namespace: model.Namespace, Name: "provider"}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("initial provider transport reconcile: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("initial serving reconcile: %v", err)
+	}
+	before := captureServingStateSnapshot(t, r, model)
+	var changedModel v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &changedModel); err != nil {
+		t.Fatal(err)
+	}
+	changedModel.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	changedModel.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	if err := r.Update(ctx, &changedModel); err != nil {
+		t.Fatal(err)
+	}
+	applyCalls, publishCalls := 0, 0
+	r.ApplyResource = func(context.Context, client.Client, unstructured.Unstructured) error {
+		applyCalls++
+		return nil
+	}
+	r.PublishOverlay = func(context.Context, *resolver.ResolvedRouteSet, envelope.Scope, envelope.Options) (publisher.Result, error) {
+		publishCalls++
+		return publisher.Result{}, nil
+	}
+	_, err := r.Reconcile(ctx, req)
+	assertUnsupportedOpenAIMessagesFailure(t, r, model, err)
+	if applyCalls != 0 || publishCalls != 0 {
+		t.Fatalf("unsupported binding wrote serving resources: applies=%d overlayPublishes=%d", applyCalls, publishCalls)
+	}
+	assertServingStateSnapshotRetained(t, r, before)
+}
+
+func TestExplicitTranslationOffPolicyRemovesSupportedMessagesServingRoute(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	providerKey := client.ObjectKey{Namespace: model.Namespace, Name: "provider"}
+	modelReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	configureAnthropicMessagesBinding(t, r, model)
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: providerKey}); err != nil {
+		t.Fatalf("initial provider transport reconcile: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, modelReq); err != nil {
+		t.Fatalf("initial serving reconcile: %v", err)
+	}
+	before := captureServingStateSnapshot(t, r, model)
+	assertAnthropicMessagesServingState(t, r, model, before)
+	setControllerTranslationEnabled(t, r, model.Namespace, false)
+
+	_, err := r.Reconcile(ctx, modelReq)
+	if !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile with explicit translation-off policy = %v, want ErrNoRoutes", err)
+	}
+	var route unstructured.Unstructured
+	route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	routeKey := client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}
+	if err := r.Get(ctx, routeKey, &route); !apierrors.IsNotFound(err) {
+		t.Fatalf("supported Messages route after explicit translation disable = %v, want NotFound", err)
+	}
+	var overlay corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("routing overlay after explicit translation disable = %v, want NotFound", err)
+	}
+	var failed v1alpha1.ExternalModel
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status.Phase != "Failed" || !hasConditionReason(failed.Status.Conditions, conditionReady, reasonProviderNotReady) {
+		t.Fatalf("explicitly disabled Messages model status = phase %q conditions %#v, want the policy-excluded route to be Failed", failed.Status.Phase, failed.Status.Conditions)
+	}
+	messageExplainsPermission := false
+	for _, condition := range failed.Status.Conditions {
+		if strings.Contains(condition.Message, "apiTranslation.enabled must be true") {
+			messageExplainsPermission = true
+		}
+	}
+	if !messageExplainsPermission {
+		t.Fatalf("explicit translation-off status does not explain the required setting: %#v", failed.Status.Conditions)
+	}
+	var providerService corev1.Service
+	if err := r.Get(ctx, before.serviceKey, &providerService); err != nil {
+		t.Fatalf("explicitly disabling translation removed the provider-owned Service: %v", err)
+	}
+	var credential corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "credentials"}, &credential); err != nil {
+		t.Fatalf("explicitly disabling translation removed provider credentials: %v", err)
+	}
+}
+
+func TestAllRoutesExcludedByPolicyOnlyAcceptsTranslationOff(t *testing.T) {
+	cases := []struct {
+		name string
+		set  *resolver.ResolvedRouteSet
+		want bool
+	}{
+		{
+			name: "only translation disabled",
+			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipTranslationDisabled}}}}},
+			want: true,
+		},
+		{
+			name: "unsupported format is not policy",
+			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipAPIFormatUnsupported}}}}},
+			want: false,
+		},
+		{
+			name: "unexplained empty model is not policy",
+			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{}}},
+			want: false,
+		},
+		{
+			name: "empty model set is not policy",
+			set:  &resolver.ResolvedRouteSet{},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := allRoutesExcludedByPolicy(tc.set); got != tc.want {
+				t.Fatalf("allRoutesExcludedByPolicy() = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }
 
