@@ -33,17 +33,117 @@ type extprocCredential struct {
 	file      string
 }
 
+const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
+
+// configureSharedExtProc renders the shared post-auth chain from the
+// authoritative MaasTenantConfig permission. The translation filters are
+// restricted to Anthropic Messages requests and do not change the dedicated
+// ExternalModel processor.
+func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, apiTranslation bool) error {
+	wantCM := PayloadProcessingPluginsConfigMapForTenant(tenantID)
+	wantDeploy := PayloadProcessingDeploymentName(tenantID)
+	var configMap *unstructured.Unstructured
+	var deployment *unstructured.Unstructured
+	for i := range resources {
+		resource := &resources[i]
+		if resource.GetNamespace() != gatewayNamespace {
+			continue
+		}
+		if configMap == nil && resource.GetKind() == "ConfigMap" && resource.GetName() == wantCM {
+			configMap = resource
+		}
+		if deployment == nil && resource.GetKind() == "Deployment" && resource.GetName() == wantDeploy {
+			deployment = resource
+		}
+	}
+	if configMap == nil || deployment == nil {
+		return errors.New("shared ExtProc resources are missing the plugin ConfigMap or Deployment")
+	}
+	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
+	if err != nil {
+		return fmt.Errorf("read shared ExtProc ConfigMap data: %w", err)
+	}
+	if !found {
+		return errors.New("shared ExtProc ConfigMap data is missing")
+	}
+	config := sharedExtProcConfig(apiTranslation)
+	data["extproc.yaml"] = config
+	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
+		return fmt.Errorf("write shared ExtProc ConfigMap data: %w", err)
+	}
+	configHash := sha256.Sum256([]byte(config))
+	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation); err != nil {
+		return fmt.Errorf("write shared ExtProc config hash: %w", err)
+	}
+	return nil
+}
+
+// sharedExtProcConfig adds the registered Anthropic-client → Chat
+// Completions-backend filters only when the tenant permits translation.
+// The ordered chain validates the Messages envelope, translates buffered JSON,
+// converts SSE responses, strips the client Anthropic key, then rewrites the
+// exact Messages path. The pre-existing Envoy processing mode remains
+// unchanged and the ExternalModel processor is rendered separately.
+func sharedExtProcConfig(apiTranslation bool) string {
+	var b strings.Builder
+	b.WriteString("server:\n")
+	b.WriteString("  grpc_address: \"0.0.0.0:9004\"\n")
+	b.WriteString("  health_address: \"0.0.0.0:50052\"\n")
+	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	b.WriteString("  tls:\n")
+	b.WriteString("    mode: self_signed\n\n")
+	b.WriteString("filter_chains:\n")
+	b.WriteString("  - name: ipp\n")
+	b.WriteString("    filters:\n")
+	b.WriteString("      - filter: request_id\n")
+	if apiTranslation {
+		b.WriteString("      - filter: anthropic_messages_request\n")
+		b.WriteString("        on_invalid: reject\n")
+		b.WriteString("        conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              path: \"/v1/messages\"\n")
+		b.WriteString("      - filter: anthropic_messages_to_chat_completions\n")
+		b.WriteString("        max_body_bytes: 1048576\n")
+		b.WriteString("        conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              path: \"/v1/messages\"\n")
+		b.WriteString("      - filter: anthropic_messages_to_chat_completions_stream\n")
+		b.WriteString("        max_partial_event_bytes: 10485760\n")
+		b.WriteString("        max_tool_blocks: 10000\n")
+		b.WriteString("        response_conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              headers:\n")
+		b.WriteString("                content-type: \"text/event-stream\"\n")
+		b.WriteString("      - filter: headers\n")
+		b.WriteString("        request_remove:\n")
+		b.WriteString("          - x-api-key\n")
+		b.WriteString("        conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              path: \"/v1/messages\"\n")
+		b.WriteString("      - filter: path_rewrite\n")
+		b.WriteString("        replace:\n")
+		b.WriteString("          pattern: \"^/v1/messages$\"\n")
+		b.WriteString("          replacement: \"/v1/chat/completions\"\n")
+		b.WriteString("        conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              path: \"/v1/messages\"\n")
+	}
+	b.WriteString("\ninsecure_options:\n")
+	b.WriteString("  allow_unbounded_body: true\n")
+	return b.String()
+}
+
 // configureExternalModelExtProc completes the dedicated ExternalModel ExtProc
 // render with tenant-specific routing and credential references. The upstream
 // MaaS/KServe post-auth workload is intentionally not modified. Secret values
 // are never read: kubelet projects the referenced Secret into this workload and
 // credential_inject reads the mounted file at request time.
-func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate) error {
+func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
 	}
-	config := extprocPostAuthConfig(candidates, credentials)
+	config := extprocPostAuthConfig(candidates, credentials, apiTranslationEnabled)
 
 	var configMap *unstructured.Unstructured
 	var deployment *unstructured.Unstructured
@@ -71,7 +171,7 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 		return fmt.Errorf("write post-auth ExtProc ConfigMap data: %w", err)
 	}
 	configHash := sha256.Sum256([]byte(config))
-	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", "ai-gateway-controller.opendatahub.io/extproc-config-sha256"); err != nil {
+	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation); err != nil {
 		return fmt.Errorf("write post-auth ExtProc config hash: %w", err)
 	}
 
@@ -164,7 +264,7 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 	return credentials, nil
 }
 
-func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential) string {
+func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extprocCredential, apiTranslationEnabled bool) string {
 	clusterSet := make(map[string]bool, len(candidates))
 	for _, candidate := range candidates {
 		clusterSet[candidate.Cluster] = true
@@ -176,7 +276,11 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	sort.Strings(clusters)
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
-	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  tls:\n    mode: self_signed\n\n")
+	// Keep ExtProc's accumulation ceiling at its 10 MiB default for this
+	// dedicated ExternalModel process. The translation filter separately
+	// rejects request JSON above its 1 MiB limit, while streamed responses are
+	// bounded only when the selected Anthropic JSON translator buffers them.
+	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  max_body_bytes: 10485760\n  tls:\n    mode: self_signed\n\n")
 	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
@@ -187,6 +291,11 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		fmt.Fprintf(&b, "%q", cluster)
 	}
 	b.WriteString("]\n        reload: {enabled: true, debounce_ms: 500}\n")
+	b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
+	b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
+	b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
+	fmt.Fprintf(&b, "        api_translation_enabled: %t\n", apiTranslationEnabled)
+	b.WriteString("        max_body_bytes: 1048576\n")
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
@@ -194,7 +303,6 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n            file: %s\n", credential.key, credential.strategy, credential.file)
 		}
 	}
-	b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
 	return b.String()
 }
 

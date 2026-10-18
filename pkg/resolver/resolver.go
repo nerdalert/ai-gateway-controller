@@ -4,8 +4,9 @@
 // It reproduces the merged-config semantics of the IPP model-provider-resolver
 // (opendatahub-io/ai-gateway-payload-processing): model-ref config overrides
 // provider config except for tls.caCertificates, which configures shared
-// provider transport; refs are skipped (not failed) when individually bad, and
-// reconciliation fails only when a model resolves zero routes.
+// provider transport. Missing, unready, disabled, or policy-excluded refs are
+// skipped; an active binding with no qualified provider/API/credential profile
+// is a hard error so reconciliation cannot publish a silently reduced route.
 package resolver
 
 import (
@@ -37,6 +38,13 @@ const (
 	// SkipWeightDisabled: weight <= 0 disables the ref (IPP semantics:
 	// weight 0 means "no traffic", default 1 when unset).
 	SkipWeightDisabled SkipReason = "WeightDisabled"
+	// SkipTranslationDisabled prevents Anthropic Messages requests when the
+	// tenant has not enabled API translation.
+	SkipTranslationDisabled SkipReason = "APITranslationDisabled"
+	// SkipAPIFormatUnsupported records an unsupported disabled/preloaded
+	// provider/API binding. An active binding returns
+	// ErrProviderCapabilityUnsupported instead of being silently removed.
+	SkipAPIFormatUnsupported SkipReason = "APIFormatUnsupported"
 	// SkipPathUnresolved: the ref's path template contains a {key}
 	// placeholder with no entry in the merged config.
 	SkipPathUnresolved SkipReason = "PathUnresolved"
@@ -119,12 +127,27 @@ func (s *ResolvedRouteSet) Routes() []Route {
 // models Failed (IPP fails only when zero refs resolve).
 var ErrNoRoutes = errors.New("resolver: no provider refs resolved to routes")
 
+// ErrProviderCapabilityUnsupported means an active provider binding cannot be
+// served by the installed Praxis translation and credential runtime. The
+// caller must retain its last-known serving resources rather than publish a
+// reduced route set that silently drops this candidate.
+var ErrProviderCapabilityUnsupported = errors.New("resolver: provider capability is unsupported by the installed Praxis runtime")
+
 // Resolve merges model/provider pairs into a route set. Ordering guarantees:
 // models keep input order, routes keep ref order. A model whose refs all
 // skip is not an error by itself — its skips are reported and only a wholly
 // empty set returns ErrNoRoutes.
 func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
-	return resolve(models, providers, false)
+	return resolve(models, providers, false, false)
+}
+
+// ResolveWithAPITranslation resolves routes when the tenant explicitly permits
+// API translation. The permission allows supported Messages candidates; it
+// does not select a translator or alter OpenAI-compatible candidates. For an
+// ExternalModel, the selected candidate's trusted profile determines whether
+// Praxis applies translation.
+func ResolveWithAPITranslation(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, enabled bool) (*ResolvedRouteSet, error) {
+	return resolve(models, providers, false, enabled)
 }
 
 // ResolveAll resolves every valid provider binding, including weight-zero
@@ -133,10 +156,17 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 // the complete referenced provider/credential set, so changing the selected
 // provider is an overlay-only update and does not require a pod rollout.
 func ResolveAll(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
-	return resolve(models, providers, true)
+	return resolve(models, providers, true, false)
 }
 
-func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, includeDisabled bool) (*ResolvedRouteSet, error) {
+// ResolveAllWithAPITranslation retains weight-disabled bindings so ExtProc
+// can preload references before selection changes. The tenant permission
+// still gates Messages candidates, including weight-disabled references.
+func ResolveAllWithAPITranslation(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, enabled bool) (*ResolvedRouteSet, error) {
+	return resolve(models, providers, true, enabled)
+}
+
+func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, includeDisabled, translationEnabled bool) (*ResolvedRouteSet, error) {
 	type provKey struct{ ns, name string }
 	byKey := make(map[provKey]*v1alpha1.ExternalProvider, len(providers))
 	for _, p := range providers {
@@ -188,6 +218,23 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 					SkipWeightDisabled, fmt.Sprintf("weight %d disables this ref", weight)))
 				continue
 			}
+			if !supportedProviderFormat(prov.Spec.Provider, ref.APIFormat) {
+				message := fmt.Sprintf("provider %q with APIFormat %q has no qualified route and credential profile", prov.Spec.Provider, ref.APIFormat)
+				if weight == 0 {
+					// Disabled candidates are preloaded by ResolveAll, but cannot
+					// serve traffic. Keep them out of the runtime until qualified.
+					mr.Skips = append(mr.Skips, newSkip(base, SkipAPIFormatUnsupported, message))
+					continue
+				}
+				mr.Skips = append(mr.Skips, newSkip(base, SkipAPIFormatUnsupported, message))
+				set.Models = append(set.Models, mr)
+				return set, fmt.Errorf("%w: %s: model %s provider ref %s: %s", ErrProviderCapabilityUnsupported, SkipAPIFormatUnsupported, mref, ref.Ref.Name, message)
+			}
+			if ref.APIFormat == "messages" && !translationEnabled {
+				mr.Skips = append(mr.Skips, newSkip(base, SkipTranslationDisabled,
+					"MaasTenantConfig.spec.apiTranslation.enabled must be true for an Anthropic Messages provider"))
+				continue
+			}
 			if weight > 0 && activeProviders[prov.Name] {
 				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s", mref, prov.Name)
 			}
@@ -210,6 +257,12 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				// IPP #368: unresolved placeholders are a reconcile-time
 				// error, never a request-time surprise. Hard-fail the call.
 				return nil, fmt.Errorf("resolver: model %s ref %s: %w", mref, ref.Ref.Name, err)
+			}
+			if strings.TrimSpace(ref.TargetModel) == "" || len(ref.TargetModel) > 256 || strings.ContainsAny(ref.TargetModel, "\r\n\x00") {
+				return nil, fmt.Errorf("resolver: model %s ref %s: targetModel must be 1-256 printable bytes", mref, ref.Ref.Name)
+			}
+			if path == "" || len(path) > 2048 || !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "?#\r\n\x00") {
+				return nil, fmt.Errorf("resolver: model %s ref %s: resolved path must be a valid absolute path", mref, ref.Ref.Name)
 			}
 
 			auth := prov.Spec.Auth
@@ -241,6 +294,17 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		return set, ErrNoRoutes
 	}
 	return set, nil
+}
+
+func supportedProviderFormat(providerType, apiFormat string) bool {
+	switch {
+	case providerType == "openai" && apiFormat == "openai-chat":
+		return true
+	case providerType == "anthropic" && apiFormat == "messages":
+		return true
+	default:
+		return false
+	}
 }
 
 // newSkip returns a copy of base with a reason and message attached.
