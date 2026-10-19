@@ -700,6 +700,8 @@ def private_live_credential(provider):
         pattern = r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"
     elif provider == "openai":
         pattern = r"(?<![A-Za-z0-9])sk-(?!ant-)[A-Za-z0-9_-]{20,}"
+    elif provider == "bedrock":
+        pattern = r"(?im)^\s*(?:[-*]\s*)?bedrock\s*[-:]\s*`?(ABSK[A-Za-z0-9+/=_-]{20,})`?\s*$"
     else:
         return None
     matches = re.findall(pattern, source)
@@ -720,6 +722,8 @@ def live_response_model_matches(provider, configured_model, response_model, clie
         # in Chat Completions JSON/SSE, while the selected target model is sent
         # to Anthropic upstream.
         return response_model == client_model
+    if provider == "bedrock":
+        return response_model == configured_model
     if provider != "openai":
         return False
     if response_model == configured_model:
@@ -750,13 +754,6 @@ def wait_live_provider_ready(name):
 def qualify_live_provider(provider, auth_file):
     """Exercise a selected live provider only through the deployed Gateway."""
     global EXTERNAL_MODEL_CHANGED
-    if provider == "bedrock":
-        append_live_provider_result(provider, "SKIPPED", {
-            "reason": "no Bedrock credentials, endpoint, or model are present in the authorized key file; current AIGC resolver does not support aws-bedrock provider routing",
-            "direct_provider_request": False,
-        })
-        return
-
     credential = private_live_credential(provider)
     if credential is None:
         append_live_provider_result(provider, "SKIPPED", {
@@ -768,7 +765,9 @@ def qualify_live_provider(provider, auth_file):
     PROVIDER_TEST_KEYS.append(credential)
     if not PROVIDER_AWARE_CREATED:
         raise RuntimeError("live provider fixture requires the run-owned deterministic provider resources")
-    provider_name = f"api-translation-{provider}"
+    provider_name = ("api-translation-bedrock-mantle" if provider == "bedrock"
+                     else f"api-translation-{provider}")
+    provider_type = "bedrock-openai" if provider == "bedrock" else provider
     live_secret_name = f"api-translation-live-{provider}-credentials"
     existing_secret = kubectl("-n", NAMESPACE, "get", "secret", live_secret_name, check=False)
     if existing_secret.returncode == 0:
@@ -781,10 +780,11 @@ def qualify_live_provider(provider, auth_file):
     expected_mock_endpoint = {
         "anthropic": "provider-translation-ext.maas-system.svc.cluster.local",
         "openai": "provider-translation-openai-ext.maas-system.svc.cluster.local",
+        "bedrock": "provider-translation-bedrock-ext.maas-system.svc.cluster.local",
     }[provider]
     if (provider_before.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by")
             != "api-translation-kind-e2e"
-            or provider_before.get("spec", {}).get("provider") != provider
+            or provider_before.get("spec", {}).get("provider") != provider_type
             or provider_before.get("spec", {}).get("endpoint") != expected_mock_endpoint):
         raise RuntimeError("refusing to replace an ExternalProvider outside this run's mock fixture")
     save_json(EVIDENCE / f"live-{provider}-provider-fixture-before.json", {
@@ -801,6 +801,15 @@ def qualify_live_provider(provider, auth_file):
         "anthropic": ("api.anthropic.com", "claude-haiku-4-5-20251001", "messages", "/v1/messages"),
         "openai": ("api.openai.com", "gpt-4o-mini", "openai-chat", "/v1/chat/completions"),
     }
+    if provider == "bedrock":
+        region = os.environ.get("BEDROCK_MANTLE_REGION", "us-east-1").strip()
+        model = os.environ.get("BEDROCK_MANTLE_MODEL", "openai.gpt-oss-20b").strip()
+        if not re.fullmatch(r"[a-z0-9-]+", region):
+            raise RuntimeError("BEDROCK_MANTLE_REGION must contain only lowercase letters, digits, and hyphens")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+            raise RuntimeError("BEDROCK_MANTLE_MODEL has an invalid model identifier")
+        endpoint_and_target["bedrock"] = (
+            f"bedrock-mantle.{region}.api.aws", model, "openai-chat", "/v1/chat/completions")
     endpoint, target_model, api_format, path = endpoint_and_target[provider]
     client_model = "demo"
     provider_object = {
@@ -809,7 +818,7 @@ def qualify_live_provider(provider, auth_file):
         "metadata": {"name": provider_name, "namespace": NAMESPACE,
                      "labels": {"app.kubernetes.io/managed-by": "api-translation-kind-e2e"}},
         "spec": {
-            "provider": provider,
+            "provider": provider_type,
             "endpoint": endpoint,
             "auth": {"type": "apikey", "secretRef": {"name": live_secret_name}},
         },
@@ -877,12 +886,17 @@ def qualify_live_provider(provider, auth_file):
         return
 
     externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
+    live_max_token_field = "max_completion_tokens" if provider == "bedrock" else "max_tokens"
+    live_max_tokens = 256 if provider == "bedrock" else 16
     json_marker = f"ipp-live-{provider}-json-synthetic"
     json_request_id = f"{ROUTE_TRACE_PREFIX}live-{provider}-json"
+    json_request = {
+        "model": client_model,
+        live_max_token_field: live_max_tokens,
+        "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {json_marker}"}],
+    }
     json_rc, json_status, json_raw = curl_request(
-        f"live-{provider}-json", externalmodel_url,
-        {"model": client_model, "max_tokens": 16,
-         "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {json_marker}"}]},
+        f"live-{provider}-json", externalmodel_url, json_request,
         auth_file=auth_file,
         extra_headers=[f"x-ipp-diagnostic-id: {json_request_id}"],
         correlation_id=json_request_id,
@@ -894,15 +908,34 @@ def qualify_live_provider(provider, auth_file):
     except json.JSONDecodeError:
         json_response = {}
     json_choices = json_response.get("choices", [])
+    json_choice_shapes = [
+        {
+            "finish_reason": choice.get("finish_reason"),
+            "message_keys": sorted(choice.get("message", {}).keys())
+            if isinstance(choice.get("message"), dict) else [],
+            "message_content_type": type(choice.get("message", {}).get("content")).__name__
+            if isinstance(choice.get("message"), dict) else "missing",
+            "message_refusal_present": bool(choice.get("message", {}).get("refusal"))
+            if isinstance(choice.get("message"), dict) else False,
+            "tool_call_count": len(choice.get("message", {}).get("tool_calls", []))
+            if isinstance(choice.get("message"), dict)
+            and isinstance(choice.get("message", {}).get("tool_calls"), list) else 0,
+        }
+        for choice in json_choices if isinstance(choice, dict)
+    ]
     json_ok = (json_rc == 0 and json_status == "200" and bool(json_choices)
                and isinstance(json_choices[0].get("message", {}).get("content"), str))
 
     stream_marker = f"ipp-live-{provider}-sse-synthetic"
     stream_request_id = f"{ROUTE_TRACE_PREFIX}live-{provider}-sse"
+    stream_request = {
+        "model": client_model,
+        live_max_token_field: live_max_tokens,
+        "stream": True,
+        "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {stream_marker}"}],
+    }
     stream_rc, stream_status, stream_raw, first_ms, total_ms, content_type = progressive_stream_request(
-        f"live-{provider}-sse", externalmodel_url,
-        {"model": client_model, "max_tokens": 16, "stream": True,
-         "messages": [{"role": "user", "content": f"Reply with the word blue. Marker: {stream_marker}"}]},
+        f"live-{provider}-sse", externalmodel_url, stream_request,
         extra_headers=[f"x-ipp-diagnostic-id: {stream_request_id}", f"x-request-id: {stream_request_id}"],
         record_result=True,
         request_timeout=60,
@@ -911,9 +944,38 @@ def qualify_live_provider(provider, auth_file):
     stream_trace = capture_runtime_route_trace(stream_request_id, f"live-{provider}-sse", gateway_pod)
     stream_events = sse_events(stream_raw)
     stream_data = [event["data"] for event in stream_events]
+    stream_choice_shapes = [
+        {
+            "finish_reason": choice.get("finish_reason"),
+            "delta_keys": sorted(choice.get("delta", {}).keys())
+            if isinstance(choice.get("delta"), dict) else [],
+            "delta_content_type": type(choice.get("delta", {}).get("content")).__name__
+            if isinstance(choice.get("delta"), dict) else "missing",
+        }
+        for item in stream_data if isinstance(item, dict)
+        for choice in item.get("choices", []) if isinstance(choice, dict)
+    ]
+    stream_terminal_choice = next((choice for item in reversed(stream_data) if isinstance(item, dict)
+                                   for choice in reversed(item.get("choices", []))
+                                   if isinstance(choice, dict)), {})
+    stream_terminal_finish_reason = stream_terminal_choice.get("finish_reason")
+    stream_done_sentinel = "[DONE]" in stream_data
+    stream_finish_reasons = {"stop", "length", "content_filter", "tool_calls", "function_call"}
+    stream_terminal_chunk_valid = (
+        stream_terminal_finish_reason in stream_finish_reasons
+        and stream_rc == 0
+    )
+    stream_termination_valid = stream_done_sentinel or (
+        provider == "bedrock" and stream_terminal_chunk_valid
+    )
+    stream_termination_mode = (
+        "done_sentinel" if stream_done_sentinel
+        else "finish_reason_and_clean_eof" if provider == "bedrock" and stream_terminal_chunk_valid
+        else "missing_completion_marker"
+    )
     stream_ok = (stream_rc == 0 and stream_status == "200" and content_type.startswith("text/event-stream")
                  and any(isinstance(item, dict) and item.get("choices") for item in stream_data)
-                 and "[DONE]" in stream_data and len(stream_events) > 1 and total_ms > first_ms)
+                 and stream_termination_valid and len(stream_events) > 1 and total_ms > first_ms)
     json_model = json_response.get("model")
     stream_models = {item.get("model") for item in stream_data
                      if isinstance(item, dict) and isinstance(item.get("model"), str)}
@@ -943,10 +1005,14 @@ def qualify_live_provider(provider, auth_file):
         "client_gateway_path": "/models-as-a-service/demo/v1/chat/completions",
         "json": {"http_status": json_status, "curl_exit_status": json_rc,
                  "openai_choices": len(json_choices), "response_model": json_model,
+                 "choice_shapes": json_choice_shapes,
                  "valid_chat_response": json_ok, "model_matches_selected_provider": json_model_ok,
                  "runtime_route_ok": json_route_ok, "runtime_route": json_trace},
         "sse": {"http_status": stream_status, "curl_exit_status": stream_rc,
-                "content_type": content_type, "events": len(stream_events), "termination": "[DONE]" in stream_data,
+                "content_type": content_type, "events": len(stream_events),
+                "termination": stream_done_sentinel, "termination_mode": stream_termination_mode,
+                "terminal_finish_reason": stream_terminal_finish_reason,
+                "choice_shapes": stream_choice_shapes,
                 "first_event_latency_ms": round(first_ms, 1), "total_response_ms": round(total_ms, 1),
                 "valid_chat_stream": stream_ok, "response_models": sorted(stream_models),
                 "model_matches_selected_provider": stream_model_ok,
@@ -954,6 +1020,7 @@ def qualify_live_provider(provider, auth_file):
         "effective_selected_route": envoy_route,
         "response_model_policy": (
             "preserve the OpenAI client model alias" if provider == "anthropic"
+            else "return the configured Bedrock Mantle model id" if provider == "bedrock"
             else "configured model or date-versioned provider snapshot"
         ),
         "shared_mock_received_neither_request": shared_markers_absent,
@@ -1185,6 +1252,30 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
             return snapshot
         time.sleep(0.5)
     raise RuntimeError(f"ExternalModel published, mounted, accepted, serving, and endpoint revisions did not converge: {label}")
+
+
+def externalmodel_snapshot_serves_revision(snapshot, expected_clusters, expected_revision):
+    replicas = snapshot.get("deployment_replicas", 0) or 0
+    ready_pods = [pod for pod in snapshot.get("pods", []) if pod["ready"] and not pod["deleting"]]
+    ready_names = {pod["name"] for pod in ready_pods}
+    ready_endpoints = {endpoint["target"] for endpoint in snapshot.get("endpoints", []) if endpoint["ready"]}
+    endpoint_targets = {endpoint["target"] for endpoint in snapshot.get("endpoints", [])}
+    return (
+        snapshot.get("published_digest") == expected_revision
+        and set(snapshot.get("demo_model_candidate_clusters", [])) == set(expected_clusters)
+        and snapshot.get("deployment_observed_generation", 0) >= snapshot.get("deployment_generation", 0)
+        and snapshot.get("deployment_updated_replicas", 0) == replicas
+        and snapshot.get("deployment_ready_replicas", 0) == replicas
+        and snapshot.get("deployment_available_replicas", 0) == replicas
+        and bool(ready_pods)
+        and len(ready_pods) == replicas
+        and all(pod["mounted_overlay_matches_published"]
+                and pod["accepted_revision"] == expected_revision
+                and pod["serving_revision"] == expected_revision for pod in ready_pods)
+        and ready_endpoints == ready_names
+        and endpoint_targets == ready_names
+        and all(endpoint["ready"] for endpoint in snapshot.get("endpoints", []))
+    )
 
 
 def wait_observation(predicate, label):
@@ -2418,24 +2509,35 @@ def test_externalmodel_provider_aware_translation(auth_file):
     EXTERNAL_MODEL_ORIGINAL_REFS = original.get("spec", {}).get("externalProviderRefs", [])
     save_json(EVIDENCE / "externalmodel-before-provider-aware-test.json", original)
     EXTERNAL_MODEL_ORIGINAL_OVERLAY = overlay_state("before-provider-aware-test")
+    # Mark the fixture as cleanup-owned before creating any resources. If
+    # setup fails before the first ExternalModel patch, cleanup can still
+    # verify the unchanged overlay and remove the partially created fixture.
+    EXTERNAL_MODEL_CHANGED = True
     externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
     names = {
         "openai_provider": "api-translation-openai",
         "anthropic_provider": "api-translation-anthropic",
+        "bedrock_provider": "api-translation-bedrock-mantle",
         "openai_secret": "api-translation-openai-credentials",
         "anthropic_secret": "api-translation-anthropic-credentials",
+        "bedrock_secret": "api-translation-bedrock-credentials",
         "openai_backend_secret": "api-translation-openai-backend-credential",
         "anthropic_backend_secret": "api-translation-anthropic-backend-credential",
+        "bedrock_backend_secret": "api-translation-bedrock-backend-credential",
     }
     for kind, namespace, name in (
         ("externalprovider", NAMESPACE, names["openai_provider"]),
         ("externalprovider", NAMESPACE, names["anthropic_provider"]),
+        ("externalprovider", NAMESPACE, names["bedrock_provider"]),
         ("secret", NAMESPACE, names["openai_secret"]), ("secret", NAMESPACE, names["anthropic_secret"]),
+        ("secret", NAMESPACE, names["bedrock_secret"]),
         ("secret", "maas-system", names["openai_backend_secret"]),
         ("secret", "maas-system", names["anthropic_backend_secret"]),
+        ("secret", "maas-system", names["bedrock_backend_secret"]),
         ("deployment", "maas-system", "api-translation-provider-aware-mock"),
         ("service", "maas-system", "provider-translation-ext"),
         ("service", "maas-system", "provider-translation-openai-ext"),
+        ("service", "maas-system", "provider-translation-bedrock-ext"),
     ):
         resource = f"{kind}/{name}"
         if kubectl("-n", namespace, "get", resource, check=False).returncode == 0:
@@ -2444,11 +2546,14 @@ def test_externalmodel_provider_aware_translation(auth_file):
     PROVIDER_AWARE_CREATED = True
     openai_key = secrets.token_urlsafe(32)
     anthropic_key = secrets.token_urlsafe(32)
-    PROVIDER_TEST_KEYS.extend([openai_key, anthropic_key])
+    bedrock_key = secrets.token_urlsafe(32)
+    PROVIDER_TEST_KEYS.extend([openai_key, anthropic_key, bedrock_key])
     create_test_secret(NAMESPACE, names["openai_secret"], openai_key)
     create_test_secret(NAMESPACE, names["anthropic_secret"], anthropic_key)
+    create_test_secret(NAMESPACE, names["bedrock_secret"], bedrock_key)
     create_test_secret("maas-system", names["openai_backend_secret"], openai_key)
     create_test_secret("maas-system", names["anthropic_backend_secret"], anthropic_key)
+    create_test_secret("maas-system", names["bedrock_backend_secret"], bedrock_key)
 
     provider_ca = kubectl("-n", "maas-system", "get", "configmap", "external-model-e2e-provider-ca",
                           "-o", r"jsonpath={.data.ca\.crt}").stdout
@@ -2486,10 +2591,22 @@ def test_externalmodel_provider_aware_translation(auth_file):
                 "config": {"tls.caCertificates": "/etc/external-model-e2e/provider-ca/ca.crt"},
             },
         },
+        {
+            "apiVersion": "inference.opendatahub.io/v1alpha1",
+            "kind": "ExternalProvider",
+            "metadata": {"name": names["bedrock_provider"], "namespace": NAMESPACE,
+                         "labels": {"app.kubernetes.io/managed-by": "api-translation-kind-e2e"}},
+            "spec": {
+                "provider": "bedrock-openai",
+                "endpoint": "provider-translation-bedrock-ext.maas-system.svc.cluster.local",
+                "auth": {"type": "apikey", "secretRef": {"name": names["bedrock_secret"]}},
+                "config": {"tls.caCertificates": "/etc/external-model-e2e/provider-ca/ca.crt"},
+            },
+        },
     ]
     for provider in providers:
         kubectl("-n", NAMESPACE, "apply", "-f", "-", input_text=json.dumps(provider))
-    for name in (names["openai_provider"], names["anthropic_provider"]):
+    for name in (names["openai_provider"], names["anthropic_provider"], names["bedrock_provider"]):
         ready_provider = None
         for _ in range(120):
             result = kubectl("-n", NAMESPACE, "get", "externalprovider", name, "-o", "json", check=False)
@@ -3600,6 +3717,287 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "published_revision": after_cancel["published_digest"],
             "accepted_serving_revision": after_cancel["published_digest"]})
 
+    bedrock_host = "provider-translation-bedrock-ext.maas-system.svc.cluster.local"
+    bedrock_ref = {"ref": {"name": names["bedrock_provider"]},
+                   "targetModel": "openai.gpt-oss-20b", "apiFormat": "openai-chat",
+                   "path": "/v1/chat/completions", "weight": 1}
+    openai_bedrock_refs = [dict(refs[0], weight=1), bedrock_ref]
+    kubectl("-n", NAMESPACE, "patch", "externalmodel", "demo-model", "--type=merge", "-p",
+            json.dumps({"spec": {"externalProviderRefs": openai_bedrock_refs}}))
+    bedrock_mixed = wait_externalmodel_revision(
+        {"provider-api-translation-openai", "provider-api-translation-bedrock-mantle"},
+        "bedrock-mantle-mixed-openai-chat")
+    bedrock_profile = next((candidate for candidate in bedrock_mixed["demo_model_candidates"]
+                            if candidate.get("stable_id") == "demo-model/provider-api-translation-bedrock-mantle"), {})
+    record("bedrock_mantle_overlay_uses_openai_chat_profile",
+           bedrock_profile.get("api_format") == "openai-chat"
+           and bedrock_profile.get("path") == "/v1/chat/completions"
+           and bedrock_profile.get("target_model") == "openai.gpt-oss-20b",
+           {"stable_id": bedrock_profile.get("stable_id"), "api_format": bedrock_profile.get("api_format"),
+            "path": bedrock_profile.get("path"), "target_model": bedrock_profile.get("target_model"),
+            "published_revision": bedrock_mixed["published_digest"]})
+    verify_externalmodel_extproc_image()
+    bedrock_route_trace_pod = install_runtime_route_trace()
+
+    # A direct no-key request proves the fixture rejects absent provider
+    # credentials. The request body and response contain no credential value.
+    bedrock_forward, bedrock_port = start_port_forward("provider-translation-bedrock-ext", 443)
+    no_key_marker = "bedrock-mantle-no-provider-key"
+    no_key_result = run([
+        "curl", "--noproxy", "*", "-sS", "--connect-timeout", "5", "--max-time", "10",
+        "--cacert", str(PROVIDER_CA_FILE), "--connect-to",
+        f"{bedrock_host}:443:127.0.0.1:{bedrock_port}",
+        "-H", "content-type: application/json", "-H", f"X-Translation-Request-Id: {no_key_marker}",
+        "-o", os.devnull, "-w", "%{http_code}", "--data-binary",
+        json.dumps({"model": "openai.gpt-oss-20b", "messages": [{"role": "user", "content": no_key_marker}]}),
+        f"https://{bedrock_host}/v1/chat/completions",
+    ], check=False, timeout=12)
+    no_key_observation = wait_provider_observation(
+        lambda item: item.get("request_id") == no_key_marker, "Bedrock no-key control")
+    bedrock_forward.terminate()
+    bedrock_forward.wait(timeout=5)
+    record("bedrock_mantle_recorder_rejects_missing_bearer_credential",
+           no_key_result.returncode == 0 and no_key_result.stdout.strip() == "401"
+           and no_key_observation.get("credential_ok") is False,
+           {"http_status": no_key_result.stdout.strip() or "unknown",
+            "curl_exit_status": no_key_result.returncode,
+            "credential_ok": no_key_observation.get("credential_ok"),
+            "credential_value_saved": False})
+
+    bedrock_counts = {"openai": 0, "bedrock-mantle": 0, "unexpected": 0}
+    bedrock_samples = []
+    bedrock_cluster = "provider-translation-bedrock-ext.maas-system.svc.cluster.local"
+    openai_cluster = "provider-translation-openai-ext.maas-system.svc.cluster.local"
+    openai_authority = openai_cluster
+    for index in range(24):
+        marker = f"bedrock-mantle-mixed-{index}"
+        diagnostic_id = f"{ROUTE_TRACE_PREFIX}bedrock-mixed-{index}"
+        rc, status, raw = curl_request(
+            f"bedrock-mantle-mixed-{index}", externalmodel_url,
+            {"model": "demo", "messages": [{"role": "user", "content": marker}]},
+            auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {diagnostic_id}"])
+        trace = capture_runtime_route_trace(diagnostic_id, f"bedrock-mixed-{index}", bedrock_route_trace_pod)
+        try:
+            downstream = json.loads(raw)
+        except json.JSONDecodeError:
+            downstream = {}
+        observation = wait_provider_observation(lambda item: marker in item.get("message_text", []), marker)
+        upstream_cluster = trace.get("upstream_cluster", "")
+        if bedrock_cluster in upstream_cluster:
+            selected = "bedrock-mantle"
+            expected_host = bedrock_host
+            expected_model = "openai.gpt-oss-20b"
+            candidate = "demo-model/provider-api-translation-bedrock-mantle"
+            expected_cluster = bedrock_cluster
+        elif openai_cluster in upstream_cluster:
+            selected = "openai"
+            expected_host = openai_authority
+            expected_model = "mock-openai-model"
+            candidate = "demo-model/provider-api-translation-openai"
+            expected_cluster = openai_cluster
+        else:
+            selected = "unexpected"
+            expected_host = ""
+            expected_model = ""
+            candidate = ""
+            expected_cluster = ""
+        bedrock_counts[selected] += 1
+        route_ok = (trace.get("captured") is True and bool(expected_host)
+                    and expected_cluster in upstream_cluster
+                    and observation.get("authority") == expected_host
+                    and trace.get("route_name", "").startswith(
+                        "models-as-a-service.external-model-demo-model.")
+                    and trace.get("response_code") == status
+                    and trace.get("model_header") == "demo")
+        format_ok = (observation.get("path") == "/v1/chat/completions"
+                     and observation.get("model") == expected_model
+                     and observation.get("authorization_present") is True
+                     and observation.get("authorization_scheme") == "Bearer"
+                     and observation.get("x_api_key_present") is False
+                     and observation.get("credential_ok") is True
+                     and observation.get("tls") is True and observation.get("sni_ok") is True
+                     and observation.get("authority_ok") is True)
+        response_ok = (isinstance(downstream.get("choices"), list) and bool(downstream["choices"])
+                       and downstream.get("model") == expected_model)
+        bedrock_samples.append({"index": index, "provider": selected, "status": status,
+                                "candidate": candidate,
+                                "revision": bedrock_mixed["published_digest"],
+                                "upstream_model": observation.get("model"),
+                                "upstream_path": observation.get("path"), "route_ok": route_ok,
+                                "transport_and_credential_ok": format_ok, "response_ok": response_ok,
+                                "upstream_cluster": upstream_cluster,
+                                "backend_authority": observation.get("authority"),
+                                "x_api_key_present": observation.get("x_api_key_present"),
+                                "response_flags": trace.get("response_flags"),
+                                "credential_value_saved": False})
+        if rc != 0 or status != "200" or not route_ok or not format_ok or not response_ok:
+            break
+    save_json(EVIDENCE / "externalmodel-bedrock-mantle-mixed-samples.json", bedrock_samples)
+    bedrock_after_samples = externalmodel_runtime_snapshot("bedrock-mantle-mixed-after-samples")
+    bedrock_revision_stable = externalmodel_snapshot_serves_revision(
+        bedrock_after_samples,
+        {"provider-api-translation-openai", "provider-api-translation-bedrock-mantle"},
+        bedrock_mixed["published_digest"],
+    )
+    record("bedrock_mantle_and_openai_mixed_json_route_credential_tls",
+           len(bedrock_samples) == 24 and all(item["status"] == "200" and item["route_ok"]
+               and item["transport_and_credential_ok"] and item["response_ok"] for item in bedrock_samples)
+           and bedrock_counts["openai"] > 0 and bedrock_counts["bedrock-mantle"] > 0
+           and bedrock_counts["unexpected"] == 0 and bedrock_revision_stable,
+           {"requests": len(bedrock_samples), "provider_counts": bedrock_counts,
+            "exact_split_required": False,
+            "serving_revision": bedrock_mixed["published_digest"],
+            "revision_stable_before_and_after_samples": bedrock_revision_stable,
+            "serving_pods_after_samples": [{"name": pod["name"], "uid": pod["uid"],
+                "serving_revision": pod["serving_revision"]} for pod in bedrock_after_samples["pods"]],
+            "unexpected_or_unattributed_responses": sum(
+                1 for item in bedrock_samples if item["status"] != "200" or not item["route_ok"]),
+            "credential_values_saved": False})
+
+    bedrock_active = [dict(refs[0], weight=0), dict(bedrock_ref, weight=1)]
+    kubectl("-n", NAMESPACE, "patch", "externalmodel", "demo-model", "--type=merge", "-p",
+            json.dumps({"spec": {"externalProviderRefs": bedrock_active}}))
+    bedrock_only = wait_externalmodel_revision({"provider-api-translation-bedrock-mantle"},
+                                               "bedrock-mantle-forced", changed_from=bedrock_mixed["published_digest"])
+    stream_marker = "bedrock-mantle-progressive-sse"
+    stream_trace_id = f"{ROUTE_TRACE_PREFIX}bedrock-progressive-sse"
+    _, stream_status, stream_raw, stream_first_ms, stream_total_ms, stream_type = progressive_stream_request(
+        "bedrock-mantle-progressive-sse", externalmodel_url,
+        {"model": "demo", "stream": True,
+         "messages": [{"role": "user", "content": stream_marker}]},
+        extra_headers=[f"x-ipp-diagnostic-id: {stream_trace_id}"])
+    stream_trace = capture_runtime_route_trace(stream_trace_id, "bedrock-progressive-sse", bedrock_route_trace_pod)
+    stream_observation = wait_provider_observation(
+        lambda item: stream_marker in item.get("message_text", []), "Bedrock progressive SSE")
+    stream_events = sse_events(stream_raw)
+    stream_data = [event["data"] for event in stream_events]
+    bedrock_after_sse = externalmodel_runtime_snapshot("bedrock-mantle-after-progressive-sse")
+    stream_revision_stable = externalmodel_snapshot_serves_revision(
+        bedrock_after_sse,
+        {"provider-api-translation-bedrock-mantle"},
+        bedrock_only["published_digest"],
+    )
+    stream_attribution_ok = (
+        bedrock_cluster in stream_trace.get("upstream_cluster", "")
+        and stream_trace.get("response_code") == stream_status
+        and stream_trace.get("route_name", "").startswith(
+            "models-as-a-service.external-model-demo-model.")
+        and stream_trace.get("model_header") == "demo"
+        and stream_observation.get("authority") == bedrock_host
+        and stream_observation.get("model") == "openai.gpt-oss-20b"
+        and stream_observation.get("credential_ok") is True
+        and stream_observation.get("tls") is True
+        and stream_observation.get("sni_ok") is True
+        and stream_observation.get("authority_ok") is True
+    )
+    record("bedrock_mantle_openai_compatible_sse_is_progressive",
+           stream_status == "200" and stream_type.startswith("text/event-stream")
+           and stream_total_ms - stream_first_ms >= 500
+           and any(isinstance(item, dict) and "choices" in item for item in stream_data)
+           and "[DONE]" in stream_data
+           and stream_revision_stable and stream_attribution_ok,
+           {"http_status": stream_status, "content_type": stream_type,
+            "event_count": len(stream_events), "done_event": "[DONE]" in stream_data,
+            "first_event_latency_ms": round(stream_first_ms, 1),
+            "total_response_ms": round(stream_total_ms, 1),
+            "progressive_delivery_gap_ms": round(stream_total_ms - stream_first_ms, 1),
+            "serving_revision": bedrock_only["published_digest"],
+            "serving_revision_after_stream": bedrock_after_sse["published_digest"],
+            "upstream_cluster": stream_trace.get("upstream_cluster"),
+            "backend_authority": stream_observation.get("authority"),
+            "candidate_attribution_source": "Envoy upstream cluster plus provider recorder authority and model",
+            "credential_value_saved": False})
+
+    reload_marker = "externalmodel-overlay-reload-active-bedrock-stream"
+    reload_trace_id = f"{ROUTE_TRACE_PREFIX}bedrock-overlay-reload-sse"
+    def reload_bedrock_overlay():
+        updated = [dict(refs[0], weight=0), dict(bedrock_ref, targetModel="openai.gpt-oss-20b-reloaded")]
+        kubectl("-n", NAMESPACE, "patch", "externalmodel", "demo-model", "--type=merge", "-p",
+                json.dumps({"spec": {"externalProviderRefs": updated}}))
+        reloaded = wait_externalmodel_revision({"provider-api-translation-bedrock-mantle"},
+            "bedrock-mantle-inflight-overlay-reload", changed_from=bedrock_only["published_digest"])
+        RESULT.setdefault("bedrock_overlay_reload", {}).update({
+            "original_revision": bedrock_only["published_digest"],
+            "new_revision": reloaded["published_digest"],
+            "serving_revision": reloaded["published_digest"],
+            "new_target_model": "openai.gpt-oss-20b-reloaded",
+            "serving_pods": [{"name": pod["name"], "uid": pod["uid"],
+                "serving_revision": pod["serving_revision"]} for pod in reloaded["pods"]],
+            "stream_open_after_first_event_when_new_revision_serves": True,
+        })
+
+    _, reload_status, reload_raw, reload_first_ms, reload_total_ms, reload_type = progressive_stream_request(
+        "bedrock-mantle-overlay-reload-sse", externalmodel_url,
+        {"model": "demo", "stream": True,
+         "messages": [{"role": "user", "content": reload_marker}]},
+        extra_headers=[f"x-ipp-diagnostic-id: {reload_trace_id}"],
+        on_first_event=reload_bedrock_overlay, request_timeout=20)
+    reload_trace = capture_runtime_route_trace(reload_trace_id, "bedrock-overlay-reload-sse", bedrock_route_trace_pod)
+    reload_observation = wait_provider_observation(
+        lambda item: reload_marker in item.get("message_text", []), "Bedrock in-flight overlay reload")
+    reload_events = sse_events(reload_raw)
+    reload_data = [event["data"] for event in reload_events]
+    new_revision = RESULT.get("bedrock_overlay_reload", {}).get("new_revision")
+    record("bedrock_mantle_inflight_stream_keeps_selected_profile_across_overlay_reload",
+           reload_status == "200" and reload_type.startswith("text/event-stream")
+           and any(isinstance(item, dict) and "choices" in item for item in reload_data)
+           and "[DONE]" in reload_data and bool(new_revision)
+           and new_revision != bedrock_only["published_digest"]
+           and RESULT.get("bedrock_overlay_reload", {}).get(
+               "stream_open_after_first_event_when_new_revision_serves") is True
+           and bedrock_cluster in reload_trace.get("upstream_cluster", "")
+           and reload_trace.get("response_code") == reload_status
+           and reload_observation.get("authority") == bedrock_host
+           and reload_observation.get("model") == "openai.gpt-oss-20b"
+           and reload_observation.get("credential_ok") is True
+           and reload_observation.get("tls") is True
+           and reload_observation.get("sni_ok") is True
+           and reload_observation.get("authority_ok") is True,
+           {"http_status": reload_status, "content_type": reload_type,
+            "event_count": len(reload_events), "done_event": "[DONE]" in reload_data,
+            "old_request_serving_revision": bedrock_only["published_digest"],
+            "new_published_serving_revision": new_revision,
+            "upstream_cluster": reload_trace.get("upstream_cluster"),
+            "backend_authority": reload_observation.get("authority"),
+            "candidate_attribution_source": "Envoy upstream cluster plus provider recorder authority and model",
+            "inflight_upstream_model": reload_observation.get("model"),
+            "first_event_latency_ms": round(reload_first_ms, 1),
+            "total_response_ms": round(reload_total_ms, 1), "credential_value_saved": False})
+    next_marker = "bedrock-mantle-after-overlay-reload"
+    next_trace_id = f"{ROUTE_TRACE_PREFIX}bedrock-after-overlay-reload"
+    rc, next_status, next_raw = curl_request("bedrock-mantle-after-overlay-reload", externalmodel_url,
+        {"model": "demo", "messages": [{"role": "user", "content": next_marker}]}, auth_file=auth_file,
+        extra_headers=[f"x-ipp-diagnostic-id: {next_trace_id}"])
+    next_trace = capture_runtime_route_trace(next_trace_id, "bedrock-after-overlay-reload", bedrock_route_trace_pod)
+    next_observation = wait_provider_observation(
+        lambda item: next_marker in item.get("message_text", []), "Bedrock request after overlay reload")
+    next_response = json.loads(next_raw) if next_raw else {}
+    bedrock_after_reload_request = externalmodel_runtime_snapshot(
+        "bedrock-mantle-after-overlay-reload-request")
+    next_revision_served = externalmodel_snapshot_serves_revision(
+        bedrock_after_reload_request,
+        {"provider-api-translation-bedrock-mantle"},
+        new_revision,
+    )
+    record("bedrock_mantle_next_request_uses_reloaded_profile",
+           rc == 0 and next_status == "200" and next_response.get("model") == "openai.gpt-oss-20b-reloaded"
+           and next_observation.get("model") == "openai.gpt-oss-20b-reloaded"
+           and next_revision_served
+           and bedrock_cluster in next_trace.get("upstream_cluster", "")
+           and next_trace.get("response_code") == next_status
+           and next_observation.get("authority") == bedrock_host
+           and next_observation.get("credential_ok") is True
+           and next_observation.get("tls") is True and next_observation.get("sni_ok") is True
+           and next_observation.get("authority_ok") is True,
+           {"http_status": next_status, "upstream_model": next_observation.get("model"),
+            "upstream_cluster": next_trace.get("upstream_cluster"),
+            "backend_authority": next_observation.get("authority"),
+            "candidate_attribution_source": "Envoy upstream cluster plus provider recorder authority and model",
+            "serving_revision": new_revision,
+            "serving_revision_after_request": bedrock_after_reload_request["published_digest"],
+            "response_bytes": len(next_raw),
+            "credential_value_saved": False})
+
 
 def sanitize_scan():
     patterns = [r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._~-]{12,}",
@@ -3612,6 +4010,8 @@ def sanitize_scan():
             except OSError:
                 continue
             if any(re.search(pattern, text) for pattern in patterns):
+                failures.append(str(path.relative_to(EVIDENCE)))
+            if any(key and key in text for key in PROVIDER_TEST_KEYS):
                 failures.append(str(path.relative_to(EVIDENCE)))
     (EVIDENCE / "credential-scan.txt").write_text(
         "clean=true\n" if not failures else "clean=false\nfiles=" + ",".join(failures) + "\n")
@@ -3715,15 +4115,19 @@ def cleanup():
         EXTERNAL_MODEL_CHANGED = False
         if PROVIDER_AWARE_CREATED:
             kubectl("-n", NAMESPACE, "delete", "externalprovider", "api-translation-openai",
-                    "api-translation-anthropic", "--ignore-not-found", "--wait=true", check=False)
+                    "api-translation-anthropic", "api-translation-bedrock-mantle",
+                    "--ignore-not-found", "--wait=true", check=False)
             kubectl("-n", "maas-system", "delete", "deployment", "api-translation-provider-aware-mock",
                     "--ignore-not-found", "--wait=true", check=False)
             kubectl("-n", "maas-system", "delete", "service", "provider-translation-ext",
-                    "provider-translation-openai-ext", "--ignore-not-found", "--wait=true", check=False)
+                    "provider-translation-openai-ext", "provider-translation-bedrock-ext",
+                    "--ignore-not-found", "--wait=true", check=False)
             kubectl("-n", NAMESPACE, "delete", "secret", "api-translation-openai-credentials",
-                    "api-translation-anthropic-credentials", "--ignore-not-found", "--wait=true", check=False)
+                    "api-translation-anthropic-credentials", "api-translation-bedrock-credentials",
+                    "--ignore-not-found", "--wait=true", check=False)
             kubectl("-n", "maas-system", "delete", "secret", "api-translation-openai-backend-credential",
-                    "api-translation-anthropic-backend-credential", "--ignore-not-found", "--wait=true", check=False)
+                    "api-translation-anthropic-backend-credential", "api-translation-bedrock-backend-credential",
+                    "--ignore-not-found", "--wait=true", check=False)
             PROVIDER_AWARE_CREATED = False
         for kind, name in reversed(LIVE_PROVIDER_RESOURCES):
             kubectl("-n", NAMESPACE, "delete", kind, name, "--ignore-not-found", "--wait=true", check=False)
@@ -3831,7 +4235,7 @@ def main():
     parser.add_argument("--scope", choices=("all", "shared", "externalmodel"), default="all",
                         help="qualify both pipelines (all), only the shared route, or only ExternalModel")
     parser.add_argument("--live-provider", choices=("anthropic", "openai", "bedrock", "all"),
-                        help="optionally qualify one live provider or all providers through the deployed Kind Gateway")
+                        help="optionally qualify one live provider or all through the deployed Gateway; Bedrock reads the local Bedrock key entry and accepts BEDROCK_MANTLE_REGION/MODEL overrides")
     parser.add_argument("--diagnostic-route-auth", action="store_true",
                         help="use run-owned route AuthPolicies that validate the MaaS key directly; diagnostic only, not final Gateway auth qualification")
     parser.add_argument("--diagnostic-bypass-auth", action="store_true",
@@ -3995,8 +4399,23 @@ def main():
     RECORDER_FORWARD, RECORDER_PORT = start_port_forward("translation-openai-mock", 8080, NAMESPACE)
     route_messages = wait_route("api-translation-messages")
     route_openai = wait_route("api-translation-openai")
-    gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
-    maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
+    externalmodel_auth_policy = None
+    if args.scope == "externalmodel":
+        # The ExternalModel route has its own enforced AuthPolicy. That route
+        # policy takes precedence over the inherited gateway policy, so the
+        # gateway AuthPolicy can correctly report Enforced=False/Overridden.
+        # Check the policy actually protecting the selected provider route.
+        externalmodel_auth_policy = wait_auth_policy("external-model-auth", namespace=NAMESPACE)
+        gateway_policy_result = kubectl(
+            "-n", "maas-system", "get", "authpolicy", "maas-gateway-auth", "-o", "json", check=False)
+        gateway_auth_policy = json.loads(gateway_policy_result.stdout) if gateway_policy_result.returncode == 0 else {}
+        maas_auth_status_result = kubectl(
+            "-n", NAMESPACE, "get", "maasauthpolicy", "kind-e2e-access", "-o", "json", check=False)
+        maas_auth_policy_ready = (json.loads(maas_auth_status_result.stdout).get("status", {}).get("conditions", [])
+                                  if maas_auth_status_result.returncode == 0 else [])
+    else:
+        gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
+        maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
     rate_limit_messages = wait_rate_limit_policy("api-translation-messages-rate-limit")
     rate_limit_openai = wait_rate_limit_policy("api-translation-openai-rate-limit")
     save_json(EVIDENCE / "route-and-policy-state.json", {
@@ -4004,6 +4423,7 @@ def main():
         "message_route": route_messages,
         "openai_route": route_openai,
         "gateway_auth_policy": gateway_auth_policy,
+        "externalmodel_auth_policy": externalmodel_auth_policy,
         "maas_auth_policy_ready_conditions": maas_auth_policy_ready,
         "message_rate_limit_policy": rate_limit_messages,
         "openai_rate_limit_policy": rate_limit_openai,
@@ -4011,9 +4431,14 @@ def main():
     record("routes_and_auth_policies", True, {
         "routes_accepted": ["api-translation-messages", "api-translation-openai"],
         "inherited_gateway_auth_policy": "maas-system/maas-gateway-auth",
-        "maas_auth_policy_ready": True,
+        "maas_auth_policy_ready": args.scope != "externalmodel",
+        "externalmodel_route_auth_policy": ("models-as-a-service/external-model-auth"
+                                            if args.scope == "externalmodel" else None),
         "gateway_authentication_methods": sorted(
             gateway_auth_policy.get("spec", {}).get("defaults", {}).get("rules", {}).get("authentication", {}).keys()),
+        "externalmodel_route_authentication_methods": sorted(
+            externalmodel_auth_policy.get("spec", {}).get("rules", {}).get("authentication", {}).keys())
+            if externalmodel_auth_policy else [],
         "rate_limit_policies": ["100 requests/minute per MaaS identity on each test route"],
         "authorization_backend": "real maas-api internal api-key validation endpoint",
     })
