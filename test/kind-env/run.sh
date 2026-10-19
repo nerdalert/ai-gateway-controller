@@ -1216,9 +1216,12 @@ EOF
   for _ in $(seq 1 90); do
     all_api_runtime_ready=true
     for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
-      api_deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$api_deployment" -o json)
-      api_selector=$(maas_api_deployment_pod_selector "$api_deployment_json")
-      api_pods_json=$("${KCTL[@]}" -n maas-system get pods -l "$api_selector" -o json)
+      if ! api_deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$api_deployment" -o json 2>/dev/null) ||
+         ! api_selector=$(maas_api_deployment_pod_selector "$api_deployment_json" 2>/dev/null) ||
+         ! api_pods_json=$("${KCTL[@]}" -n maas-system get pods -l "$api_selector" -o json 2>/dev/null); then
+        all_api_runtime_ready=false
+        break
+      fi
       if ! maas_api_pods_have_exact_ready_image "$api_pods_json" "$MAAS_API_RUNTIME_IMAGE" "$expected_maas_api_repo_digest"; then
         all_api_runtime_ready=false
         break
