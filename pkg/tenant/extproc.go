@@ -59,6 +59,9 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	if configMap == nil || deployment == nil {
 		return errors.New("shared ExtProc resources are missing the plugin ConfigMap or Deployment")
 	}
+	if err := configureSharedExtProcResponseMode(resources, tenantID, apiTranslation); err != nil {
+		return err
+	}
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
 	if err != nil {
 		return fmt.Errorf("read shared ExtProc ConfigMap data: %w", err)
@@ -78,12 +81,66 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 	return nil
 }
 
+// configureSharedExtProcResponseMode keeps streaming scoped to tenants that
+// explicitly enable API translation. The shared inference HTTPRoutes are not
+// owned here and do not have a stable controller-provided route identity, so a
+// route-level override cannot be safely attached by this reconciler.
+func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID string, apiTranslation bool) error {
+	want := "BUFFERED"
+	if apiTranslation {
+		want = "STREAMED"
+	}
+	filterName := PayloadProcessingEnvoyFilterName(tenantID)
+	filterFound := false
+	patched := 0
+	for i := range resources {
+		filter := &resources[i]
+		if filter.GetKind() != "EnvoyFilter" || filter.GetName() != filterName {
+			continue
+		}
+		filterFound = true
+		patches, found, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+		if err != nil {
+			return fmt.Errorf("read shared ExtProc EnvoyFilter %q configPatches: %w", filterName, err)
+		}
+		if !found {
+			return fmt.Errorf("shared ExtProc EnvoyFilter %q configPatches are missing", filterName)
+		}
+		for patchIndex, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			if !ok || patch["applyTo"] != "HTTP_FILTER" {
+				continue
+			}
+			name, found, err := unstructured.NestedString(patch, "patch", "value", "name")
+			if err != nil {
+				return fmt.Errorf("read shared ExtProc HTTP_FILTER patch %d name: %w", patchIndex, err)
+			}
+			if !found || name != "envoy.filters.http.ext_proc.ipp" {
+				continue
+			}
+			if err := unstructured.SetNestedField(patch, want, "patch", "value", "typed_config", "processing_mode", "response_body_mode"); err != nil {
+				return fmt.Errorf("set shared ipp response_body_mode in patch %d: %w", patchIndex, err)
+			}
+			patched++
+		}
+		if err := unstructured.SetNestedSlice(filter.Object, patches, "spec", "configPatches"); err != nil {
+			return fmt.Errorf("write shared ExtProc EnvoyFilter %q configPatches: %w", filterName, err)
+		}
+	}
+	if !filterFound || patched == 0 {
+		return fmt.Errorf("shared ExtProc EnvoyFilter %q has no ipp HTTP_FILTER patches", filterName)
+	}
+	return nil
+}
+
 // sharedExtProcConfig adds the registered Anthropic-client → Chat
 // Completions-backend filters only when the tenant permits translation.
 // The ordered chain validates the Messages envelope, translates buffered JSON,
 // converts SSE responses, strips the client Anthropic key, then rewrites the
-// exact Messages path. The pre-existing Envoy processing mode remains
-// unchanged and the ExternalModel processor is rendered separately.
+// exact Messages path. The tenant's permission also selects the shared ipp
+// response mode: BUFFERED by default and STREAMED when translation is enabled
+// so the Messages SSE filter can emit progressive events. The separate ipp-pre
+// mode and ExternalModel processor are unchanged.
 func sharedExtProcConfig(apiTranslation bool) string {
 	var b strings.Builder
 	b.WriteString("server:\n")

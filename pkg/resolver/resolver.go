@@ -227,7 +227,7 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 			}
 			if !supportedProviderFormat(prov.Spec.Provider, ref.APIFormat) {
 				message := fmt.Sprintf("provider %q with APIFormat %q has no qualified route and credential profile", prov.Spec.Provider, ref.APIFormat)
-				if weight == 0 {
+				if weight <= 0 {
 					// Disabled candidates are preloaded by ResolveAll, but cannot
 					// serve traffic. Keep them out of the runtime until qualified.
 					mr.Skips = append(mr.Skips, newSkip(base, SkipAPIFormatUnsupported, message))

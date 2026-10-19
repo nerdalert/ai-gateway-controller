@@ -201,8 +201,11 @@ before loading that platform image under a local Kind name. The local name is
 a container-runtime transport reference only; the published digest and source
 commit are recorded in provisioning evidence, and the fixture is still the
 published Katan image rather than a mock service.
-`KATAN_IMAGE` overrides the image and `BUILD_KATAN=true` is the explicit local
-source-build path.
+`KATAN_IMAGE` overrides the registry image pulled by the provisioner. Kind
+loads that image under the plain local `KATAN_KIND_IMAGE` tag (default
+`llm-katan:external-model-two-plane`); digest references stay on the pull side
+and are never used as Docker tag targets. `BUILD_KATAN=true` is the explicit
+local source-build path and requires a tag-valued image name.
 
 ### Kind-only security compatibility
 
@@ -341,6 +344,15 @@ is optional in the normal workflow because the default provider image is the
 public digest-pinned artifact; a source checkout is used only for explicit
 development builds.
 
+When the selected MaaS controller revision predates the `MaasTenantConfig`
+`spec.apiTranslation` field, the translation qualification must supply
+`MAAS_API_TRANSLATION_SCHEMA_REPO` pointing to a checkout containing the
+generated schema commit (default `bce7ddd52657a2ad4c2444757761806a8290db44`).
+The harness applies only that generated CRD file, verifies that its sole
+schema delta from the selected MaaS controller source is `spec.apiTranslation`,
+and records both revisions. The MaaS controller binary remains the configured
+controller source; the schema overlay does not deploy the newer MaaS code.
+
 Each run records repository path, remote, branch or detached state, HEAD,
 tracked diff hash, and untracked-content hash before building. After
 publication, the image reference is resolved to a registry digest and the
@@ -350,7 +362,12 @@ state is not silently changed by the harness.
 
 No kubeconfig context is read implicitly. Provisioning uses only
 `kind-${LOCAL_ENV_CLUSTER}`. Images are built from these checkouts when absent
-and loaded into Kind with `imagePullPolicy: Never`.
+and loaded into Kind. The MaaS API is published to a run-owned local registry
+because the active MaaS controller intentionally reconciles its API
+Deployments with `imagePullPolicy: Always`; the Kind node is configured to
+resolve only that registry reference, and the harness verifies the node's
+registry digest and image tag match the source-built image before fixture
+provisioning continues.
 
 ## Mock external provider
 
