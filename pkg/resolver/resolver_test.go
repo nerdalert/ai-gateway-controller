@@ -240,6 +240,28 @@ func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
 	}
 }
 
+func TestResolveAllSkipsNegativeWeightUnsupportedBinding(t *testing.T) {
+	active := ref("active", "target-a", "/v1/chat/completions")
+	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), -1)
+	model := model("ns1", "model", active, disabled)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+	}
+	providers[1].Spec.Provider = "azure-openai"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil {
+		t.Fatalf("ResolveAllWithAPITranslation() error = %v, want negative-weight unsupported binding treated as disabled", err)
+	}
+	if got := len(set.Routes()); got != 1 || set.Routes()[0].Provider != "active" {
+		t.Fatalf("preloaded routes = %+v, want only the active qualified provider", set.Routes())
+	}
+	if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+		t.Fatalf("negative-weight unsupported binding skips = %+v, want APIFormatUnsupported", set.Models[0].Skips)
+	}
+}
+
 func TestResolveAllDoesNotPreloadMessagesWhenTenantPermissionIsOff(t *testing.T) {
 	modelRef := withWeight(ref("prov-anthropic", "claude", "/v1/messages"), 0)
 	modelRef.APIFormat = "messages"

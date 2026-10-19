@@ -8,25 +8,6 @@ resources:
   - ../../../praxis-extproc/overlays/odh
   - external-model-envoy-filter.yaml
 
-# Keep the vendored ExtProc manifest identical to its pinned upstream commit.
-# The four post-auth insertion patches cover the supported RHCL/Istio anchors.
-# Shared Anthropic-client SSE translation needs response chunks as they arrive.
-patches:
-  - target:
-      group: networking.istio.io
-      version: v1alpha3
-      kind: EnvoyFilter
-      name: payload-processing
-    patch: |-
-      - op: replace
-        path: /spec/configPatches/1/patch/value/typed_config/processing_mode/response_body_mode
-        value: STREAMED
-      - op: replace
-        path: /spec/configPatches/3/patch/value/typed_config/processing_mode/response_body_mode
-        value: STREAMED
-      - op: replace
-        path: /spec/configPatches/5/patch/value/typed_config/processing_mode/response_body_mode
-        value: STREAMED
-      - op: replace
-        path: /spec/configPatches/7/patch/value/typed_config/processing_mode/response_body_mode
-        value: STREAMED
+# The shared filter's response mode is selected by the tenant reconciler from
+# MaasTenantConfig.spec.apiTranslation.enabled. Keep the rendered default
+# BUFFERED so tenants without translation permission retain the existing mode.

@@ -16,10 +16,29 @@ spec:
         app: api-translation-provider-aware-mock
         app.kubernetes.io/managed-by: api-translation-kind-e2e
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: provider-recorder
           image: provider-recorder:issue28-kind
           imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
           env:
             - name: PROVIDER_NAME
               value: provider-aware

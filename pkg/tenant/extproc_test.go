@@ -235,6 +235,7 @@ func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T
 				"spec":     map[string]any{"containers": []any{map[string]any{"name": "payload-processing"}}},
 			}},
 		}},
+		sharedEnvoyFilterFixture(tenantID, gatewayNamespace),
 		{Object: map[string]any{
 			"apiVersion": "v1", "kind": "ConfigMap",
 			"metadata": map[string]any{"name": PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID), "namespace": "tenant-a"},
@@ -255,11 +256,98 @@ func TestConfigureSharedExtProcDoesNotRewriteExternalModelResources(t *testing.T
 	if err != nil || !found || hash == "" {
 		t.Fatalf("shared config hash missing: found=%v err=%v hash=%q", found, err, hash)
 	}
-	externalData, _, err := unstructured.NestedStringMap(resources[2].Object, "data")
+	externalData, _, err := unstructured.NestedStringMap(resources[3].Object, "data")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if externalData["extproc.yaml"] != "external-model-chain" {
 		t.Fatalf("shared config changed ExternalModel ExtProc: %#v", externalData)
+	}
+	assertSharedResponseMode(t, resources[2], "STREAMED")
+}
+
+func TestConfigureSharedExtProcKeepsDefaultResponseModeWhenTranslationIsOff(t *testing.T) {
+	tenantID := "redteam"
+	gatewayNamespace := "openshift-ingress"
+	resources := []unstructured.Unstructured{
+		{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": PayloadProcessingPluginsConfigMapForTenant(tenantID), "namespace": gatewayNamespace},
+			"data":     map[string]any{"extproc.yaml": "old"},
+		}},
+		{Object: map[string]any{
+			"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{"name": PayloadProcessingDeploymentName(tenantID), "namespace": gatewayNamespace},
+			"spec": map[string]any{"template": map[string]any{
+				"metadata": map[string]any{"annotations": map[string]any{}},
+				"spec":     map[string]any{"containers": []any{map[string]any{"name": "payload-processing"}}},
+			}},
+		}},
+		sharedEnvoyFilterFixture(tenantID, gatewayNamespace),
+	}
+	if err := configureSharedExtProc(resources, tenantID, gatewayNamespace, false); err != nil {
+		t.Fatal(err)
+	}
+	assertSharedResponseMode(t, resources[2], "BUFFERED")
+}
+
+func sharedEnvoyFilterFixture(tenantID, namespace string) unstructured.Unstructured {
+	patches := make([]any, 0, 8)
+	for range 4 {
+		for _, filter := range []struct {
+			name string
+			mode string
+		}{
+			{name: "envoy.filters.http.ext_proc.ipp", mode: "BUFFERED"},
+			{name: "envoy.filters.http.ext_proc.ipp-pre", mode: "NONE"},
+		} {
+			patches = append(patches, map[string]any{
+				"applyTo": "HTTP_FILTER",
+				"patch": map[string]any{"value": map[string]any{
+					"name":         filter.name,
+					"typed_config": map[string]any{"processing_mode": map[string]any{"response_body_mode": filter.mode}},
+				}},
+			})
+		}
+	}
+	return unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "networking.istio.io/v1alpha3", "kind": "EnvoyFilter",
+		"metadata": map[string]any{"name": PayloadProcessingEnvoyFilterName(tenantID), "namespace": namespace},
+		"spec":     map[string]any{"configPatches": patches},
+	}}
+}
+
+func assertSharedResponseMode(t *testing.T, filter unstructured.Unstructured, want string) {
+	t.Helper()
+	patches, found, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+	if err != nil || !found {
+		t.Fatalf("shared EnvoyFilter configPatches: found=%t err=%v", found, err)
+	}
+	var ipp, ippPre int
+	for _, raw := range patches {
+		patch, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(patch, "patch", "value", "name")
+		mode, found, err := unstructured.NestedString(patch, "patch", "value", "typed_config", "processing_mode", "response_body_mode")
+		if err != nil || !found {
+			continue
+		}
+		switch name {
+		case "envoy.filters.http.ext_proc.ipp":
+			if mode != want {
+				t.Errorf("shared ipp response_body_mode = %q, want %q", mode, want)
+			}
+			ipp++
+		case "envoy.filters.http.ext_proc.ipp-pre":
+			if mode != "NONE" {
+				t.Errorf("shared ipp-pre response_body_mode = %q, want NONE", mode)
+			}
+			ippPre++
+		}
+	}
+	if ipp != 4 || ippPre != 4 {
+		t.Errorf("shared mode patches = ipp:%d ipp-pre:%d, want 4 each", ipp, ippPre)
 	}
 }
