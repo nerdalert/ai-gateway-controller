@@ -19,6 +19,7 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -403,13 +404,15 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
 			return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 		}
+		var homeCandidates []envelope.Candidate
+		var homeErr error
 		if hasModels {
-			runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+			homeCandidates, homeErr = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
 		}
-		runtimeCandidates = append(runtimeCandidates, attached...)
+		runtimeCandidates, err = combineRuntimeCandidates(homeCandidates, attached, homeErr)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
 		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 	}
@@ -663,6 +666,22 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
+}
+
+// combineRuntimeCandidates keeps an attachment-only tenant serving when its
+// home models are intentionally unavailable under the selected translation
+// mode. ErrNoRoutes remains an error when no admitted attachment can serve;
+// last-provider withdrawal behavior is handled separately by the route
+// reconciler and must not be inferred from an empty runtime candidate set.
+func combineRuntimeCandidates(home, attached []envelope.Candidate, homeErr error) ([]envelope.Candidate, error) {
+	if errors.Is(homeErr, resolver.ErrNoRoutes) && len(attached) > 0 {
+		home = nil
+		homeErr = nil
+	}
+	if homeErr != nil {
+		return nil, homeErr
+	}
+	return append(home, attached...), nil
 }
 
 // attachedOverlayCandidates returns the published overlay candidates that

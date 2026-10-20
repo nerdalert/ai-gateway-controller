@@ -19,6 +19,7 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -233,6 +234,21 @@ func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testin
 	ready, reason, err = r.routingOverlayReady(ctx, namespace, required)
 	if err != nil || ready || !strings.Contains(reason, "provider anthropic") {
 		t.Fatalf("enabled Anthropic binding without its candidate: ready=%t reason=%q err=%v, want not ready", ready, reason, err)
+	}
+
+	// The tenant still has an ExternalModel, so it enters the serving path. Its
+	// only home binding is intentionally skipped while translation is disabled;
+	// the published attachment must still drive the tenant ExtProc config.
+	homeCandidates, homeErr := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
+	if !errors.Is(homeErr, resolver.ErrNoRoutes) {
+		t.Fatalf("disabled Anthropic runtime candidates error = %v, want resolver.ErrNoRoutes", homeErr)
+	}
+	runtimeCandidates, err := combineRuntimeCandidates(homeCandidates, []envelope.Candidate{attachment}, homeErr)
+	if err != nil || len(runtimeCandidates) != 1 || runtimeCandidates[0].StableID != attachment.StableID {
+		t.Fatalf("attachment-only ExtProc runtime candidates = %#v, err=%v; want the served attachment", runtimeCandidates, err)
+	}
+	if _, err := combineRuntimeCandidates(homeCandidates, nil, homeErr); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("disabled home binding without an attachment error = %v, want resolver.ErrNoRoutes", err)
 	}
 }
 
