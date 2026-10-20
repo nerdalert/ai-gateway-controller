@@ -279,6 +279,75 @@ func TestWithdrawalKeepsSharedProviderForAnotherModel(t *testing.T) {
 	}
 }
 
+func TestWithdrawalPreservesServedAttachment(t *testing.T) {
+	ctx := context.Background()
+	r, home := reconcilerFixture(t)
+	r.Namespace = "" // Exercise a second namespace on the shared controller.
+	r.KnownClusters = append(r.KnownClusters, "provider-openai")
+	providerB := createWithdrawalProvider(t, r, home.Namespace, "provider-b")
+	remoteProvider, remoteSecret := attachmentProvider("team")
+	remote := attachmentModel("remote", "team", "remote-model", time.Unix(100, 0),
+		v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: home.Namespace})
+	for _, object := range []client.Object{remoteProvider, remoteSecret, remote} {
+		if err := r.Create(ctx, object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(remoteProvider)}); err != nil {
+		t.Fatalf("reconcile attached provider: %v", err)
+	}
+	reconcileModel(t, r, home)
+	reconcileModel(t, r, remote)
+	setRouteParentStatus(t, r, remote, remote.Spec.GatewayRefs[0], metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, remote)
+
+	home = getModel(t, r, home)
+	home.Spec.ExternalProviderRefs = append(home.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	if err := r.Update(ctx, home); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, home)
+	home = getModel(t, r, home)
+	home.Spec.ExternalProviderRefs = home.Spec.ExternalProviderRefs[:1]
+	if err := r.Update(ctx, home); err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(home)})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("stage home provider withdrawal with attachment: result=%#v err=%v", result, err)
+	}
+	assertRouteProviders(t, r, home.Namespace, home.Name, "provider", "provider-b")
+	wantAttachedID := envelope.ScopedStableID(remote.Namespace, remote.Name, remote.Namespace, remoteProvider.Name)
+	wantIDs := map[string]bool{envelope.CandidateStableID(home.Name, "provider"): true, wantAttachedID: true}
+	for _, candidate := range overlayEnvelope(t, r, home.Namespace).Overlay.Candidates {
+		delete(wantIDs, candidate.StableID)
+	}
+	if len(wantIDs) != 0 {
+		t.Fatalf("published overlay lost candidates: %#v", wantIDs)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, remote.Namespace, attachmentRouteName(remote, remote.Spec.GatewayRefs[0])); err != nil {
+		t.Fatalf("served attachment route was removed: %v", err)
+	}
+	home = getModel(t, r, home)
+	seedSafeExternalModelRuntime(t, r, "tenant", home.Namespace, []*v1alpha1.ExternalModel{home})
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(home)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start withdrawal drain with attachment: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, home.Namespace)
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(home)})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish withdrawal with attachment: result=%#v err=%v", result, err)
+	}
+	assertRouteProviders(t, r, home.Namespace, home.Name, "provider")
+	if _, err := getUnstructured(r, httpRouteGVK, remote.Namespace, attachmentRouteName(remote, remote.Spec.GatewayRefs[0])); err != nil {
+		t.Fatalf("served attachment route was removed after drain: %v", err)
+	}
+	if len(routeFilterNames(t, r, "tenant", home.Namespace)) == 0 {
+		t.Fatal("served attachment lost its gateway route filter after drain")
+	}
+}
+
 func TestRapidProviderWithdrawalAndReadditionKeepsRouteReachable(t *testing.T) {
 	ctx := context.Background()
 	r, model := reconcilerFixture(t)
@@ -864,6 +933,11 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 	candidates, err := tenant.ExternalModelRuntimeCandidates(routes, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, candidate := range overlayEnvelope(t, r, namespace).Overlay.Candidates {
+		if envelope.IsScopedStableID(candidate.StableID) {
+			candidates = append(candidates, candidate)
+		}
 	}
 	config, configHash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, false)
 	if err != nil {
