@@ -113,9 +113,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		r.readPodLogs = func(ctx context.Context, namespace, podName, container string) (string, error) {
 			tailLines := int64(300)
+			limitBytes := int64(1 << 20)
 			body, err := kubeClient.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
-				Container: container,
-				TailLines: &tailLines,
+				Container:  container,
+				TailLines:  &tailLines,
+				LimitBytes: &limitBytes,
 			}).Do(ctx).Raw()
 			return string(body), err
 		}
