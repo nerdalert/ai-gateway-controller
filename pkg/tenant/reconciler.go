@@ -391,7 +391,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	serving := hasModels || len(attached) > 0 || unreadableOverlay
 	var runtimeCandidates []envelope.Candidate
 	if serving {
-		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace)
+		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
 		if providerErr != nil {
 			return ctrl.Result{}, providerErr
 		}
@@ -579,10 +579,14 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 	return nil
 }
 
-func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
 		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
+	}
+	providerTypes := make(map[string]string, len(providers.Items))
+	for i := range providers.Items {
+		providerTypes[providers.Items[i].Name] = providers.Items[i].Spec.Provider
 	}
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
@@ -597,7 +601,8 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 				continue
 			}
 			referenced[name] = true
-			if ref.Weight == nil || *ref.Weight > 0 {
+			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && providerTypes[name] == "anthropic"
+			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
 				required[name] = true
 			}
 		}

@@ -140,7 +140,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 		}
 	}
 	writeOverlay(live)
-	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if err := fakeClient.Create(ctx, later); err != nil {
 		t.Fatal(err)
 	}
-	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +170,69 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil || len(candidates) != 2 {
 		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
+	}
+}
+
+func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testing.T) {
+	ctx := context.Background()
+	const namespace = "tenant-ns"
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "home-model", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref:         v1alpha1.ExternalProviderReference{Name: "anthropic"},
+			TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		}}},
+	}
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: namespace},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "anthropic.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	attachment := envelope.Candidate{
+		Cluster: "provider-openai", StableID: "attached/model/provider-openai",
+		Kind: "inference_model", Name: "attached", Site: "local", Fresh: true,
+		APIFormat: "openai-chat", Path: "/v1/chat/completions", TargetModel: "mock-openai-model",
+	}
+	rendered, err := envelope.Render(&resolver.ResolvedRouteSet{}, envelope.Scope{
+		Network: "external-model", Gateway: "gateway", Namespace: namespace, LocalSite: "local",
+	}, envelope.Revision{}, envelope.Options{PreservedCandidates: []envelope.Candidate{attachment}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: namespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner}},
+		Data: map[string]string{praxisOverlayDataKey: string(raw)},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, provider, configMap).Build()
+	r := &Reconciler{Client: fakeClient}
+
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 0 {
+		t.Fatalf("disabled Anthropic binding required in overlay = %#v, want no home providers", required)
+	}
+	ready, reason, err := r.routingOverlayReady(ctx, namespace, required)
+	if err != nil || !ready {
+		t.Fatalf("attachment-only overlay readiness with translation disabled: ready=%t reason=%q err=%v", ready, reason, err)
+	}
+
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 1 || !required["anthropic"] {
+		t.Fatalf("enabled Anthropic binding required providers = %#v, want anthropic", required)
+	}
+	ready, reason, err = r.routingOverlayReady(ctx, namespace, required)
+	if err != nil || ready || !strings.Contains(reason, "provider anthropic") {
+		t.Fatalf("enabled Anthropic binding without its candidate: ready=%t reason=%q err=%v, want not ready", ready, reason, err)
 	}
 }
 
