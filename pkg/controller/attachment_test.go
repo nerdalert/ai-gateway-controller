@@ -165,6 +165,19 @@ func routeFilterNames(t *testing.T, r *Reconciler, tenantID, gatewayNamespace st
 	return names
 }
 
+func assertExactSelectedPathRule(t *testing.T, route *unstructured.Unstructured, path, stableID string) {
+	t.Helper()
+	rules := nestedSlice(t, route.Object, "spec", "rules")
+	match := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0)
+	if pathType := nestedString(t, match, "path", "type"); pathType != "Exact" || nestedString(t, match, "path", "value") != path {
+		t.Fatalf("exact target path match = %s %q, want Exact %q", pathType, nestedString(t, match, "path", "value"), path)
+	}
+	selected := nestedMapAt(t, nestedSlice(t, match, "headers"), 0)
+	if nestedString(t, selected, "name") != selectedProviderHeader || nestedString(t, selected, "value") != stableID {
+		t.Fatalf("exact-path selected-provider match = %#v, want %s=%q", selected, selectedProviderHeader, stableID)
+	}
+}
+
 func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
@@ -261,14 +274,7 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	if nestedMapAt(t, headers, 0)["value"] != candidate.StableID {
 		t.Fatalf("route candidate header = %#v, want %q", headers, candidate.StableID)
 	}
-	rules := nestedSlice(t, route.Object, "spec", "rules")
-	exactMatch := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "matches"), 0)
-	if pathType := nestedString(t, exactMatch, "path", "type"); pathType != "Exact" || nestedString(t, exactMatch, "path", "value") != "/v1/chat/completions" {
-		t.Fatalf("attached translation target path match = %s %q", pathType, nestedString(t, exactMatch, "path", "value"))
-	}
-	if selected := nestedMapAt(t, nestedSlice(t, exactMatch, "headers"), 0); nestedString(t, selected, "name") != selectedProviderHeader || nestedString(t, selected, "value") != candidate.StableID {
-		t.Fatalf("attached exact-path selected-provider match = %#v", selected)
-	}
+	assertExactSelectedPathRule(t, route, "/v1/chat/completions", candidate.StableID)
 	names := routeFilterNames(t, r, "tenant-b", "gateway-b")
 	if len(names) != 5 || names[0] != "team."+routeName+".0" {
 		t.Fatalf("route filter patches = %v", names)
@@ -1146,6 +1152,50 @@ func TestTenantKeepsAttachmentsWhenItsOwnModelsServeNothing(t *testing.T) {
 		t.Fatalf("own deletion: %v", err)
 	}
 	assertServed("last own model deleted")
+}
+
+func TestTranslationDisabledHomeModelKeepsAttachmentServing(t *testing.T) {
+	r, attachment := servedAttachmentFixture(t)
+	provider, secret := attachmentProvider("tenant-b")
+	provider.Spec.Provider = "anthropic"
+	provider.Spec.Endpoint = "api.anthropic.com"
+	if err := r.Create(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile Anthropic provider: %v", err)
+	}
+	own := attachmentModel("messages", "tenant-b", "anthropic-model", time.Unix(300, 0))
+	own.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	own.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	if err := r.Create(context.Background(), own); err != nil {
+		t.Fatal(err)
+	}
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, own)
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 2 {
+		t.Fatalf("serving candidates before disabling translation = %#v, want home model and attachment", got)
+	}
+
+	setControllerTranslationEnabled(t, r, "tenant-b", false)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile with translation disabled = %v, want ErrNoRoutes", err)
+	}
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("remaining candidates = %#v, want the cross-namespace attachment", got)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName(own.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("home HTTPRoute survived translation disable: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(attachment, gatewayB)); err != nil {
+		t.Fatalf("attachment HTTPRoute was removed with the home route: %v", err)
+	}
+	if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 5 || names[0] != "team."+attachmentRouteName(attachment, gatewayB)+".0" {
+		t.Fatalf("remaining route filter patches = %v, want the attachment's five route rules", names)
+	}
 }
 
 func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {

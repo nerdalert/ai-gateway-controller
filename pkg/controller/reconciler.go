@@ -495,45 +495,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	}
 	set, err := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, modelTenant.apiTranslationEnabled)
 	if err != nil {
-		reason := reasonReconcileFailed
-		message := err.Error()
-		if errors.Is(err, resolver.ErrNoRoutes) {
-			reason = reasonProviderNotReady
-			var skips []string
-			for _, modelRoutes := range set.Models {
-				for _, skip := range modelRoutes.Skips {
-					skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
-				}
-			}
-			if len(skips) > 0 {
-				message = "no routable ExternalModel provider remains: " + strings.Join(skips, "; ")
-			}
-			if allRoutesExcludedByPolicy(set) {
-				valid, liveErr := r.livePraxisBeforeWrite(ctx, req.Namespace, modelTenant)
-				if liveErr != nil {
-					return reconcile.Result{}, liveErr
-				}
-				if !valid {
-					return reconcile.Result{Requeue: true}, nil
-				}
-				if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.cleanupModelTransport(ctx, req.Namespace, nil); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.cleanupOverlay(ctx, req.Namespace); err != nil {
-					return reconcile.Result{}, err
-				}
-			}
-		}
-		if statusErr := report(false, reason, message, nil); statusErr != nil {
-			return reconcile.Result{}, statusErr
-		}
-		return reconcile.Result{}, err
+		return r.handleHomeRouteResolutionError(ctx, req.Namespace, modelTenant, set, string(model.UID), err, report)
 	}
 	set, err = r.validateModelRouteSet(ctx, set, modelOwners, model, report)
 	if err != nil {
@@ -613,6 +575,64 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+func (r *Reconciler) handleHomeRouteResolutionError(
+	ctx context.Context,
+	namespace string,
+	modelTenant modelTenantContext,
+	set *resolver.ResolvedRouteSet,
+	sourceUID string,
+	routeErr error,
+	report modelStatusReporter,
+) (reconcile.Result, error) {
+	reason := reasonReconcileFailed
+	message := routeErr.Error()
+	if errors.Is(routeErr, resolver.ErrNoRoutes) {
+		reason = reasonProviderNotReady
+		var skips []string
+		for _, modelRoutes := range set.Models {
+			for _, skip := range modelRoutes.Skips {
+				skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
+			}
+		}
+		if len(skips) > 0 {
+			message = "no routable ExternalModel provider remains: " + strings.Join(skips, "; ")
+		}
+		if allRoutesExcludedByPolicy(set) {
+			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if !valid {
+				return reconcile.Result{Requeue: true}, nil
+			}
+			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
+				gateway: v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace}}
+			served, err := r.keepTenantAttachments(ctx, home, sourceUID)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if !served {
+				if err := r.enableExternalModelRoutes(ctx, home.tenantID, namespace, home.gateway.Name, home.gateway.Namespace, nil); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.deleteLegacyExternalModelRouteFilter(ctx, home.tenantID); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.cleanupModelTransport(ctx, namespace, nil); err != nil {
+					return reconcile.Result{}, err
+				}
+				if err := r.cleanupOverlay(ctx, namespace); err != nil {
+					return reconcile.Result{}, err
+				}
+			}
+		}
+	}
+	if err := report(false, reason, message, nil); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, routeErr
 }
 
 type modelTenantContext struct {
