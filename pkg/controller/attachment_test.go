@@ -1198,6 +1198,29 @@ func TestTranslationDisabledHomeModelKeepsAttachmentServing(t *testing.T) {
 	}
 }
 
+func TestNewAttachmentCarriesEnabledTranslationInHandoff(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	got := getModel(t, r, model)
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != resolver.PhaseReady || condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("attached model status = %#v, want Ready after translation-enabled handoff", got.Status)
+	}
+	env := overlayEnvelope(t, r, "tenant-b")
+	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("overlay candidates = %#v, want the accepted attachment", env.Overlay.Candidates)
+	}
+}
+
 func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {
 	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
 	tenantAlt, tenantAltSecret := namedProvider("tenant-b", "alt")

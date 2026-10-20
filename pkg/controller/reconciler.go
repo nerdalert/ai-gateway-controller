@@ -510,7 +510,8 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{Requeue: true}, nil
 	}
 	home := attachmentTenant{namespace: req.Namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
-		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
+		gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		apiTranslationEnabled: modelTenant.apiTranslationEnabled}
 	if len(set.Routes()) == 0 {
 		// Attachments from other namespaces keep the tenant's overlay and
 		// route filter; without one the existing cleanup applies.
@@ -608,7 +609,8 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 				return reconcile.Result{Requeue: true}, nil
 			}
 			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
-				gateway: v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace}}
+				gateway:               v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace},
+				apiTranslationEnabled: modelTenant.apiTranslationEnabled}
 			served, err := r.keepTenantAttachments(ctx, home, sourceUID)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -866,7 +868,8 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	}
 	set, modelPtrs, modelOwners, err := r.resolveRemainingHomeModels(ctx, deleted, gatewayName, gatewayNamespace, live.apiTranslationEnabled)
 	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
-		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
+		gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		apiTranslationEnabled: live.apiTranslationEnabled}
 	if errors.Is(err, resolver.ErrNoRoutes) {
 		// Preserve serving state during provider/readiness failures. Policy-excluded
 		// candidates are not eligible to serve and may be removed safely.
@@ -906,7 +909,8 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.ensureHomeTenantBeforeWrite(ctx, deleted.Namespace, live, gatewayName, gatewayNamespace); err != nil {
 		return err
 	}
-	return r.applyRemainingHomeModels(ctx, deleted, tenantID, gatewayName, gatewayNamespace, set, modelPtrs, modelOwners)
+	return r.applyRemainingHomeModels(ctx, deleted, tenantID, gatewayName, gatewayNamespace,
+		live.apiTranslationEnabled, set, modelPtrs, modelOwners)
 }
 
 func homeModelTenantContext(live tenantResolution, gatewayName, gatewayNamespace string) modelTenantContext {
@@ -982,12 +986,14 @@ func (r *Reconciler) applyRemainingHomeModels(
 	ctx context.Context,
 	deleted *v1alpha1.ExternalModel,
 	tenantID, gatewayName, gatewayNamespace string,
+	apiTranslationEnabled bool,
 	set *resolver.ResolvedRouteSet,
 	modelPtrs []*v1alpha1.ExternalModel,
 	modelOwners map[string]*v1alpha1.ExternalModel,
 ) error {
 	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
-		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
+		gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		apiTranslationEnabled: apiTranslationEnabled}
 	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
 	if err != nil {
 		return err

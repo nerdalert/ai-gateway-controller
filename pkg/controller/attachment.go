@@ -76,17 +76,22 @@ var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", V
 
 // attachmentTenant is the Praxis tenant that owns an attached Gateway.
 type attachmentTenant struct {
-	gateway     v1alpha1.NamespacedObjectReference
-	namespace   string // MaasTenantConfig namespace
-	tenantID    string
-	aitenantUID types.UID
-	mtcUID      types.UID
+	gateway               v1alpha1.NamespacedObjectReference
+	namespace             string // MaasTenantConfig namespace
+	tenantID              string
+	aitenantUID           types.UID
+	mtcUID                types.UID
+	apiTranslationEnabled bool
 }
 
 // handoff is the tenant handoff state the attachment was gated on, re-checked
 // live before writing into the tenant.
 func (t attachmentTenant) handoff() modelTenantContext {
-	return modelTenantContext{aitenantUID: t.aitenantUID, mtcUID: t.mtcUID, gatewayName: t.gateway.Name, gatewayNamespace: t.gateway.Namespace}
+	return modelTenantContext{
+		aitenantUID: t.aitenantUID, mtcUID: t.mtcUID,
+		gatewayName: t.gateway.Name, gatewayNamespace: t.gateway.Namespace,
+		apiTranslationEnabled: t.apiTranslationEnabled,
+	}
 }
 
 // attachmentResult is the outcome of one gateway attachment.
@@ -298,6 +303,7 @@ func (r *Reconciler) gateAttachmentTenant(ctx context.Context, ait *unstructured
 			break
 		}
 		t.aitenantUID, t.mtcUID = live.aitenant.GetUID(), live.mtc.GetUID()
+		t.apiTranslationEnabled = live.apiTranslationEnabled
 		result.ready = true
 	}
 	return t, result, false, nil
