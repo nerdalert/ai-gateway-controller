@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -1092,7 +1093,11 @@ func (r *Reconciler) cleanupPolicyExcludedHomeModels(
 		policyExcluded := false
 		for modelRef := range excluded {
 			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
-			if found && modelNamespace == home.namespace && strings.HasPrefix(routeName, modelNamespace+"."+modelRouteName(modelName)+".") {
+			if !found || modelNamespace != home.namespace {
+				continue
+			}
+			ruleIndex, matchesModel := strings.CutPrefix(routeName, modelNamespace+"."+modelRouteName(modelName)+".")
+			if _, err := strconv.Atoi(ruleIndex); matchesModel && err == nil {
 				policyExcluded = true
 				break
 			}

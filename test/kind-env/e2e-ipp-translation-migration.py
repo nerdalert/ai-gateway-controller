@@ -135,9 +135,13 @@ def get_json(namespace, resource, name):
 
 
 def get_configmap(check=True):
-    result = kubectl("-n", GATEWAY_NAMESPACE, "get", "configmap", CONFIGMAP_NAME,
-                     "-o", "json", check=check)
-    return json.loads(result.stdout) if result.returncode == 0 else None
+    args = ["-n", GATEWAY_NAMESPACE, "get", "configmap", CONFIGMAP_NAME, "-o", "json"]
+    if not check:
+        args.append("--ignore-not-found")
+    result = kubectl(*args, check=check)
+    if result.returncode:
+        raise RuntimeError(f"ConfigMap read failed rc={result.returncode}: {result.stderr[-1600:]}")
+    return json.loads(result.stdout) if result.stdout.strip() else None
 
 
 def annotations(mtc):

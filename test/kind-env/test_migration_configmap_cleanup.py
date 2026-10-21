@@ -1,8 +1,10 @@
 import os
 import runpy
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 DRIVER = Path(__file__).with_name("e2e-ipp-translation-migration.py")
@@ -70,6 +72,29 @@ class ConfigMapRestorePatchTests(unittest.TestCase):
         }
 
         self.assertEqual(self.driver["configmap_restore_patch"](snapshot, snapshot), [])
+
+    def test_optional_configmap_read_distinguishes_absence_from_failure(self):
+        get_configmap = self.driver["get_configmap"]
+        calls = []
+
+        def fake_kubectl(result):
+            def read(*args, **kwargs):
+                calls.append((args, kwargs))
+                return result
+            return read
+
+        absent = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        denied = subprocess.CompletedProcess([], 1, stdout="", stderr="Forbidden")
+        present = subprocess.CompletedProcess([], 0, stdout='{"data":{"extproc.yaml":"ok"}}', stderr="")
+        with patch.dict(get_configmap.__globals__, {"kubectl": fake_kubectl(absent)}):
+            self.assertIsNone(get_configmap(check=False))
+        with patch.dict(get_configmap.__globals__, {"kubectl": fake_kubectl(denied)}):
+            with self.assertRaisesRegex(RuntimeError, "Forbidden"):
+                get_configmap(check=False)
+        with patch.dict(get_configmap.__globals__, {"kubectl": fake_kubectl(present)}):
+            self.assertEqual(get_configmap(check=False)["data"], {"extproc.yaml": "ok"})
+        self.assertTrue(all("--ignore-not-found" in args and kwargs["check"] is False
+                            for args, kwargs in calls))
 
 
 if __name__ == "__main__":

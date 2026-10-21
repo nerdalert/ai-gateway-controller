@@ -2827,6 +2827,14 @@ func testTranslationOffRemovesMessagesServingRoute(t *testing.T, omitted bool) {
 func TestTranslationOffCleansDisabledRouteWhenSiblingProviderIsMissing(t *testing.T) {
 	r, messagesModel := reconcilerFixture(t)
 	ctx := context.Background()
+	if err := r.Delete(ctx, messagesModel); err != nil {
+		t.Fatalf("remove default model fixture: %v", err)
+	}
+	messagesModel.Name = "a"
+	messagesModel.ResourceVersion = ""
+	if err := r.Create(ctx, messagesModel); err != nil {
+		t.Fatalf("create Messages model a: %v", err)
+	}
 	configureAnthropicMessagesBinding(t, r, messagesModel)
 	missingProvider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "second-provider", Namespace: messagesModel.Namespace, UID: "second-provider-uid"},
@@ -2838,7 +2846,7 @@ func TestTranslationOffCleansDisabledRouteWhenSiblingProviderIsMissing(t *testin
 	}
 	secondSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "second-credentials", Namespace: messagesModel.Namespace}, Data: map[string][]byte{"api-key": []byte("fixture-only-second-secret")}}
 	secondModel := &v1alpha1.ExternalModel{
-		ObjectMeta: metav1.ObjectMeta{Name: "second-model", Namespace: messagesModel.Namespace, UID: "second-model-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "a.b", Namespace: messagesModel.Namespace, UID: "second-model-uid"},
 		Spec: v1alpha1.ExternalModelSpec{ModelName: "second-client", ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
 			Ref: v1alpha1.ExternalProviderReference{Name: missingProvider.Name}, TargetModel: "second-target",
 			APIFormat: "openai-chat", Path: "/v1/chat/completions",
@@ -2910,15 +2918,14 @@ func TestTranslationOffCleansDisabledRouteWhenSiblingProviderIsMissing(t *testin
 			continue
 		}
 		name, _, _ := unstructured.NestedString(patch, "match", "routeConfiguration", "vhost", "route", "name")
-		if strings.HasPrefix(name, messagesModel.Namespace+"."+modelRouteName(messagesModel.Name)+".") {
-			messagePatches++
-		}
 		if strings.HasPrefix(name, secondModel.Namespace+"."+modelRouteName(secondModel.Name)+".") {
 			secondPatches++
+		} else if strings.HasPrefix(name, messagesModel.Namespace+"."+modelRouteName(messagesModel.Name)+".") {
+			messagePatches++
 		}
 	}
-	if messagePatches != 0 || secondPatches == 0 {
-		t.Fatalf("route patches after policy cleanup = Messages:%d sibling:%d, want only sibling patches", messagePatches, secondPatches)
+	if messagePatches != 0 || secondPatches != 4 {
+		t.Fatalf("route patches after policy cleanup = Messages:%d sibling:%d, want four sibling patches only", messagePatches, secondPatches)
 	}
 }
 
