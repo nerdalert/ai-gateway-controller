@@ -2716,6 +2716,53 @@ func TestTranslationOffPolicyRemovesSupportedMessagesServingRoute(t *testing.T) 
 	}
 }
 
+func TestTranslationOffWithdrawsMessagesRouteWhenItsProviderIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		missing bool
+	}{
+		{name: "provider missing", missing: true},
+		{name: "provider not ready"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, model := reconcilerFixture(t)
+			ctx := context.Background()
+			configureAnthropicMessagesBinding(t, r, model)
+			modelReq := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			if _, err := r.Reconcile(ctx, modelReq); err != nil {
+				t.Fatalf("initial Messages reconcile: %v", err)
+			}
+			var provider v1alpha1.ExternalProvider
+			if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &provider); err != nil {
+				t.Fatal(err)
+			}
+			if tc.missing {
+				if err := r.Delete(ctx, &provider); err != nil {
+					t.Fatalf("delete Messages provider: %v", err)
+				}
+			} else {
+				provider.Status.Phase = "Pending"
+				if err := r.Status().Update(ctx, &provider); err != nil {
+					t.Fatalf("mark Messages provider not Ready: %v", err)
+				}
+			}
+			setControllerTranslationEnabled(t, r, model.Namespace, false)
+			if _, err := r.Reconcile(ctx, modelReq); !errors.Is(err, resolver.ErrNoRoutes) {
+				t.Fatalf("translation-off reconcile = %v, want ErrNoRoutes", err)
+			}
+			var route unstructured.Unstructured
+			route.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+			if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, &route); !apierrors.IsNotFound(err) {
+				t.Fatalf("Messages route after disabling translation = %v, want NotFound", err)
+			}
+			var overlay corev1.ConfigMap
+			if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+				t.Fatalf("Messages overlay after disabling translation = %v, want NotFound", err)
+			}
+		})
+	}
+}
+
 func testTranslationOffRemovesMessagesServingRoute(t *testing.T, omitted bool) {
 	t.Helper()
 	r, model := reconcilerFixture(t)

@@ -208,6 +208,16 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 			}
 
 			prov, ok := byKey[provKey{m.Namespace, ref.Ref.Name}]
+			// A Messages route cannot serve while translation is disabled, even
+			// when its previously serving Anthropic provider has disappeared or
+			// become unready. Classify that policy exclusion before availability
+			// so reconciliation withdraws the old route and candidate. A known
+			// non-Anthropic provider still reaches capability validation below.
+			if ref.APIFormat == "messages" && !translationEnabled && (!ok || prov.Spec.Provider == "anthropic") {
+				mr.Skips = append(mr.Skips, newSkip(base, SkipTranslationDisabled,
+					"MaasTenantConfig.spec.apiTranslation.enabled must be true for an Anthropic Messages provider"))
+				continue
+			}
 			if !ok {
 				mr.Skips = append(mr.Skips, newSkip(base,
 					SkipRefNotFound, "external provider not found in model namespace"))
@@ -239,11 +249,6 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				mr.Skips = append(mr.Skips, newSkip(base, SkipAPIFormatUnsupported, message))
 				set.Models = append(set.Models, mr)
 				return set, fmt.Errorf("%w: %s: model %s provider ref %s: %s", ErrProviderCapabilityUnsupported, SkipAPIFormatUnsupported, mref, ref.Ref.Name, message)
-			}
-			if ref.APIFormat == "messages" && !translationEnabled {
-				mr.Skips = append(mr.Skips, newSkip(base, SkipTranslationDisabled,
-					"MaasTenantConfig.spec.apiTranslation.enabled must be true for an Anthropic Messages provider"))
-				continue
 			}
 			if weight > 0 && activeProviders[prov.Name] {
 				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s", mref, prov.Name)
