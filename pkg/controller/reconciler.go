@@ -495,7 +495,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	}
 	set, err := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, modelTenant.apiTranslationEnabled)
 	if err != nil {
-		return r.handleHomeRouteResolutionError(ctx, req.Namespace, modelTenant, set, string(model.UID), err, report)
+		return r.handleHomeRouteResolutionError(ctx, req.Namespace, modelTenant, set, model.Name, string(model.UID), err, report)
 	}
 	set, err = r.validateModelRouteSet(ctx, set, modelOwners, model, report)
 	if err != nil {
@@ -556,7 +556,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	result, err := r.publishTenantOverlay(ctx, req.Namespace, gatewayName, set, attached, nil, string(model.UID))
+	result, err := r.publishTenantOverlay(ctx, req.Namespace, gatewayName, set, attached, nil, string(model.UID), modelTenant.apiTranslationEnabled)
 	if err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
@@ -583,6 +583,7 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 	namespace string,
 	modelTenant modelTenantContext,
 	set *resolver.ResolvedRouteSet,
+	modelName string,
 	sourceUID string,
 	routeErr error,
 	report modelStatusReporter,
@@ -593,6 +594,9 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		reason = reasonProviderNotReady
 		var skips []string
 		for _, modelRoutes := range set.Models {
+			if modelRoutes.ModelRef != namespace+"/"+modelName {
+				continue
+			}
 			for _, skip := range modelRoutes.Skips {
 				skips = append(skips, fmt.Sprintf("provider %s: %s", skip.ProviderRef, skip.Message))
 			}
@@ -600,7 +604,11 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		if len(skips) > 0 {
 			message = "no routable ExternalModel provider remains: " + strings.Join(skips, "; ")
 		}
-		if allRoutesExcludedByPolicy(set) {
+		policyExcluded := translationPolicyExcludedModels(set)
+		if len(policyExcluded) > 0 {
+			if policyExcluded[namespace+"/"+modelName] {
+				reason = reasonTranslationDisabled
+			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -608,27 +616,18 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 			if !valid {
 				return reconcile.Result{Requeue: true}, nil
 			}
+			// Report the policy failure before cleanup so a cleanup error cannot
+			// leave a previously Ready model status in place.
+			if err := report(false, reason, message, nil); err != nil {
+				return reconcile.Result{}, err
+			}
 			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
 				gateway:               v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace},
 				apiTranslationEnabled: modelTenant.apiTranslationEnabled}
-			served, err := r.keepTenantAttachments(ctx, home, sourceUID)
-			if err != nil {
+			if err := r.cleanupPolicyExcludedHomeModels(ctx, home, set, policyExcluded, sourceUID); err != nil {
 				return reconcile.Result{}, err
 			}
-			if !served {
-				if err := r.enableExternalModelRoutes(ctx, home.tenantID, namespace, home.gateway.Name, home.gateway.Namespace, nil); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.deleteLegacyExternalModelRouteFilter(ctx, home.tenantID); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.cleanupModelTransport(ctx, namespace, nil); err != nil {
-					return reconcile.Result{}, err
-				}
-				if err := r.cleanupOverlay(ctx, namespace); err != nil {
-					return reconcile.Result{}, err
-				}
-			}
+			return reconcile.Result{}, routeErr
 		}
 	}
 	if err := report(false, reason, message, nil); err != nil {
@@ -1014,7 +1013,7 @@ func (r *Reconciler) applyRemainingHomeModels(
 	if len(modelPtrs) > 0 {
 		sourceUID = string(modelPtrs[0].UID)
 	}
-	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, sourceUID); err != nil {
+	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, sourceUID, apiTranslationEnabled); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
 	if excluded := excludedRoutes(attached); len(excluded) > 0 {
@@ -1024,22 +1023,124 @@ func (r *Reconciler) applyRemainingHomeModels(
 }
 
 func allRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
-	if set == nil || len(set.Models) == 0 {
-		return false
+	return set != nil && len(set.Models) > 0 && len(translationPolicyExcludedModels(set)) == len(set.Models)
+}
+
+func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]bool {
+	excluded := make(map[string]bool)
+	if set == nil {
+		return excluded
 	}
-	sawPolicyExclusion := false
 	for _, model := range set.Models {
 		if len(model.Routes) > 0 || len(model.Skips) == 0 {
-			return false
+			continue
 		}
+		policyOnly := true
 		for _, skip := range model.Skips {
 			if skip.Reason != resolver.SkipTranslationDisabled {
-				return false
+				policyOnly = false
+				break
 			}
-			sawPolicyExclusion = true
+		}
+		if policyOnly {
+			excluded[model.ModelRef] = true
 		}
 	}
-	return sawPolicyExclusion
+	return excluded
+}
+
+// cleanupPolicyExcludedHomeModels removes only routes made ineligible by the
+// tenant's API-translation policy. Other models with provider/readiness errors
+// keep their last-known route patches and overlay candidates.
+func (r *Reconciler) cleanupPolicyExcludedHomeModels(
+	ctx context.Context,
+	home attachmentTenant,
+	set *resolver.ResolvedRouteSet,
+	excluded map[string]bool,
+	sourceUID string,
+) error {
+	candidates, err := r.ownOverlayCandidates(ctx, home.namespace)
+	if err != nil {
+		return fmt.Errorf("read current overlay candidates before translation-policy cleanup: %w", err)
+	}
+	keptCandidates := make([]envelope.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		policyExcluded := false
+		for modelRef := range excluded {
+			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
+			if found && modelNamespace == home.namespace && strings.HasPrefix(candidate.StableID, modelName+"/provider-") {
+				policyExcluded = true
+				break
+			}
+		}
+		if !policyExcluded {
+			keptCandidates = append(keptCandidates, candidate)
+		}
+	}
+
+	patches, err := r.ownRoutePatches(ctx, home)
+	if err != nil {
+		return fmt.Errorf("read current route patches before translation-policy cleanup: %w", err)
+	}
+	keptPatches := make([]any, 0, len(patches))
+	for _, raw := range patches {
+		patch, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		routeName, _, _ := unstructured.NestedString(patch, "match", "routeConfiguration", "vhost", "route", "name")
+		policyExcluded := false
+		for modelRef := range excluded {
+			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
+			if found && modelNamespace == home.namespace && strings.HasPrefix(routeName, modelNamespace+"."+modelRouteName(modelName)+".") {
+				policyExcluded = true
+				break
+			}
+		}
+		if !policyExcluded {
+			keptPatches = append(keptPatches, raw)
+		}
+	}
+
+	attachments, err := r.admittedAttachments(ctx, home, len(keptCandidates))
+	if err != nil {
+		return fmt.Errorf("resolve served attachments during translation-policy cleanup: %w", err)
+	}
+	if err := r.writeExternalModelRoutes(ctx, home.tenantID, home.namespace, home.gateway.Name, home.gateway.Namespace,
+		set.Routes(), keptPatches, attachments); err != nil {
+		return fmt.Errorf("remove translation-disabled model route patches: %w", err)
+	}
+	if err := r.cleanupExternalModelRouteFilters(ctx, home.namespace, home.tenantID, home.gateway.Name, home.gateway.Namespace); err != nil {
+		return err
+	}
+	if err := r.deleteLegacyExternalModelRouteFilter(ctx, home.tenantID); err != nil {
+		return err
+	}
+
+	keepRoutes := append([]resolver.Route(nil), set.Routes()...)
+	for _, model := range set.Models {
+		if excluded[model.ModelRef] {
+			continue
+		}
+		modelNamespace, modelName, found := strings.Cut(model.ModelRef, "/")
+		if found && modelNamespace == home.namespace && modelName != "" {
+			keepRoutes = append(keepRoutes, resolver.Route{Model: modelName})
+		}
+	}
+	if err := r.cleanupModelTransport(ctx, home.namespace, keepRoutes); err != nil {
+		return err
+	}
+	if len(keptCandidates) == 0 && len(servedAttachments(attachments)) == 0 {
+		if err := r.cleanupOverlay(ctx, home.namespace); err != nil {
+			return err
+		}
+	} else if _, err := r.publishTenantOverlay(ctx, home.namespace, home.gateway.Name, nil, attachments, keptCandidates, sourceUID, home.apiTranslationEnabled); err != nil {
+		return fmt.Errorf("publish overlay without translation-disabled candidates: %w", err)
+	}
+	if stale := excludedRoutes(attachments); len(stale) > 0 {
+		return r.gcAttachmentState(ctx, home.namespace, stale)
+	}
+	return nil
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
@@ -1449,6 +1550,9 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
+		if count := modelHTTPRouteRuleCount(model.Routes); count > maxHTTPRouteRules {
+			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
+		}
 		for _, route := range model.Routes {
 			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
 				weightConflicts[route.ClientName] = true
@@ -1620,18 +1724,19 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 	type routeRules struct {
 		namespace, name string
 		count           int
+		streamResponse  bool
 	}
 	enabled := make([]routeRules, 0, len(models)+len(attached))
 	for _, model := range models {
 		// Keep per-route ExtProc enablement aligned with the same renderer that
-		// creates the HTTPRoute rules. Translation adds exact target-path rules,
-		// and attached routes need the same count as their rendered HTTPRoute.
+		// creates the HTTPRoute rules. Translation and non-default provider paths
+		// add target-path matches; attachments use the same count as their route.
 		httpRoute := modelHTTPRouteSet(byModel[model], modelNamespace, gatewayName, gatewayNamespace)
 		rules, found, err := unstructured.NestedSlice(httpRoute.Object, "spec", "rules")
 		if err != nil || !found {
 			return fmt.Errorf("ExternalModel %s route renderer did not produce HTTPRoute rules", model)
 		}
-		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), len(rules)})
+		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), len(rules), routesNeedTranslation(byModel[model])})
 	}
 	for _, a := range attached {
 		httpRoute := modelHTTPRouteSet(a.routes, a.model.Namespace, gatewayName, gatewayNamespace)
@@ -1639,9 +1744,13 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 		if err != nil || !found {
 			return fmt.Errorf("attached ExternalModel %s/%s route renderer did not produce HTTPRoute rules", a.model.Namespace, a.model.Name)
 		}
-		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(rules)})
+		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(rules), routesNeedTranslation(a.routes)})
 	}
 	for _, route := range enabled {
+		responseMode := "NONE"
+		if route.streamResponse {
+			responseMode = "STREAMED"
+		}
 		for index := 0; index < route.count; index++ {
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
@@ -1687,13 +1796,10 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 									// the selected-provider translator validates the bounded body, then routes once.
 									"request_body_mode":    "STREAMED",
 									"response_header_mode": "SEND",
-									// Provider selection happens inside ExtProc after the request has
-									// already matched a no-candidate fallback route. Envoy does not
-									// renegotiate response processing mode for the active ExtProc stream
-									// when route cache is cleared, so every ExternalModel route must
-									// deliver response chunks. The selected filter converts Messages
-									// responses and passes OpenAI-compatible responses through.
-									"response_body_mode":    "STREAMED",
+									// Envoy chooses the response processing mode before the
+									// provider is selected. Stream all rules for a model that
+									// can select Messages; retain NONE for OpenAI-only models.
+									"response_body_mode":    responseMode,
 									"request_trailer_mode":  "SKIP",
 									"response_trailer_mode": "SKIP",
 								},
@@ -2022,6 +2128,34 @@ func modelHTTPRoute(route resolver.Route, ns, gateway, gatewayNS string) unstruc
 	return modelHTTPRouteSet([]resolver.Route{route}, ns, gateway, gatewayNS)
 }
 
+func modelHTTPRouteRuleCount(routes []resolver.Route) int {
+	if len(routes) == 0 {
+		return 0
+	}
+	count := 2 // Canonical path and model-header fallbacks.
+	seenProviders := map[string]bool{}
+	for _, route := range routes {
+		if seenProviders[route.Provider] {
+			continue
+		}
+		seenProviders[route.Provider] = true
+		// The body-routing rule also matches the selected provider's exact
+		// target path, so rewritten requests retain the selected backend without
+		// consuming another Gateway API rule.
+		count += 2
+	}
+	return count
+}
+
+func routesNeedTranslation(routes []resolver.Route) bool {
+	for _, route := range routes {
+		if route.APIFormat == "messages" {
+			return true
+		}
+	}
+	return false
+}
+
 func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) unstructured.Unstructured {
 	if len(routes) == 0 {
 		return unstructured.Unstructured{}
@@ -2040,24 +2174,6 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 		}
 		seenProviders[candidate.Provider] = true
 		stableID := envelope.RouteStableID(candidate)
-		// A request translator may rewrite :path after intelligent_route has
-		// selected this provider. Envoy clears the route cache for that routing
-		// mutation, so a shared exact-path route (for example /v1/messages) can
-		// otherwise win over the broader ExternalModel route. This exact target
-		// path match carries the trusted candidate header; Gateway API precedence
-		// ranks it above an unqualified shared exact-path route. Requests on the
-		// shared route have no candidate header and continue to its own backend.
-		if candidate.Path != "" {
-			rules = append(rules, map[string]any{
-				"matches": []any{map[string]any{
-					"path":    map[string]any{"type": "Exact", "value": candidate.Path},
-					"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},
-				}},
-				"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
-				"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
-				"timeouts":    map[string]any{"request": "300s"},
-			})
-		}
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},
@@ -2068,13 +2184,25 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			"timeouts":    map[string]any{"request": "300s"},
 		})
 		// Body-routed requests enter on a model header rather than the
-		// canonical path. The selected-provider header is still authoritative
-		// after post-auth ExtProc clears the route cache.
+		// canonical path. A translated request or a non-default provider path
+		// can be rewritten to candidate.Path before Envoy reselects its route;
+		// include that exact path with the trusted candidate to keep the provider
+		// route specific. The default OpenAI path needs no extra match, preserving
+		// main's OpenAI-only match set. Gateway API matches in one rule are
+		// alternatives and share the same backend.
+		bodyMatches := []any{map[string]any{"headers": []any{
+			map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
+			map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID},
+		}}}
+		profilePathRewriteEnabled := candidate.APITranslationEnabled
+		if profilePathRewriteEnabled && candidate.Path != "" && candidate.Path != "/v1/chat/completions" {
+			bodyMatches = append(bodyMatches, map[string]any{
+				"path":    map[string]any{"type": "Exact", "value": candidate.Path},
+				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},
+			})
+		}
 		rules = append(rules, map[string]any{
-			"matches": []any{map[string]any{"headers": []any{
-				map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
-				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID},
-			}}},
+			"matches":     bodyMatches,
 			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
 			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
 			"timeouts":    map[string]any{"request": "300s"},

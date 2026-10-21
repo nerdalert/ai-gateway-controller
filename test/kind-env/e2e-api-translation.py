@@ -1126,11 +1126,51 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
             and endpoint_targets == ready_names
             and all(endpoint["ready"] for endpoint in snapshot["endpoints"])
         )
+        selected_profile_filter_present = (
+            "filter: openai_chat_completions_to_anthropic\n" in snapshot["extproc_config"]
+        )
+        translation_enabled_marker = "api_translation_enabled: true" in snapshot["extproc_config"]
+        translation_stream_filter_present = (
+            "openai_chat_completions_to_anthropic_stream" in snapshot["extproc_config"]
+        )
+        # Translation is an opt-in rendering decision. Flag-off removes both
+        # the converter and its trusted profile input so targetModel is not
+        # rewritten on OpenAI-compatible requests.
+        translation_filter_state_matches = (
+            selected_profile_filter_present and translation_stream_filter_present
+            if api_translation_enabled else
+            not selected_profile_filter_present and not translation_stream_filter_present
+        )
+        translation_setting_state_matches = (
+            translation_enabled_marker if api_translation_enabled
+            else "api_translation_enabled:" not in snapshot["extproc_config"]
+        )
+        provider_profile_fields = ("api_format", "path", "target_model")
+        profile_candidates = snapshot["demo_model_candidates"]
+        provider_profile_state_matches = (
+            bool(profile_candidates) and all(
+                all(candidate.get(field) for field in provider_profile_fields)
+                for candidate in profile_candidates
+            )
+            if api_translation_enabled else
+            all(not any(field in candidate for field in provider_profile_fields)
+                for candidate in profile_candidates)
+        )
+        body_limit_state_matches = (
+            "max_body_bytes: 1048576" in snapshot["extproc_config"]
+            and translation_stream_filter_present
+            if api_translation_enabled else
+            "max_body_bytes" not in snapshot["extproc_config"]
+            and "allow_unbounded_body: true" in snapshot["extproc_config"]
+            and not translation_stream_filter_present
+        )
         if (set(snapshot["demo_model_candidate_clusters"]) == set(expected_clusters)
                 and snapshot["published_digest"]
                 and (changed_from is None or snapshot["published_digest"] != changed_from)
-                and "openai_chat_completions_to_anthropic" in snapshot["extproc_config"]
-                and f"api_translation_enabled: {str(api_translation_enabled).lower()}" in snapshot["extproc_config"]
+                and translation_filter_state_matches
+                and translation_setting_state_matches
+                and provider_profile_state_matches
+                and body_limit_state_matches
                 and rollout_ready and pods_ready and endpoints_ready):
             record(f"externalmodel_runtime_{'converged' if require_serving else 'published_mounted'}_{label}", True, {
                 "published_revision": snapshot["published_digest"],
@@ -1139,6 +1179,7 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
                 "endpoint_targets": sorted(endpoint_targets),
                 "terminating_pods": [pod["name"] for pod in snapshot["pods"] if pod["deleting"]],
                 "selected_candidate_clusters": sorted(expected_clusters),
+                "provider_profiles_match_translation_setting": provider_profile_state_matches,
                 "serving_revision_required": require_serving,
             })
             return snapshot
@@ -2146,7 +2187,7 @@ def capture_provider_cluster_endpoints(label, cluster_names):
 
 
 def selected_provider_route_precedence(label, profiles):
-    """Verify selected ExternalModel exact paths outrank shared exact routes."""
+    """Check selected model routes and translated target-path precedence."""
     route_configs = json.loads((EVIDENCE / f"envoy-{label}-routes.json").read_text())
     rows = []
     for route_config in route_configs:
@@ -2167,6 +2208,8 @@ def selected_provider_route_precedence(label, profiles):
                     "index": index,
                     "name": route.get("name"),
                     "path": match.get("path"),
+                    "path_separated_prefix": match.get("pathSeparatedPrefix"),
+                    "prefix": match.get("prefix"),
                     "cluster": route_action.get("cluster"),
                     "headers": match.get("headers", []),
                     "external_model_processing_mode": extproc,
@@ -2194,55 +2237,86 @@ def selected_provider_route_precedence(label, profiles):
     )
 
     checks = []
+    model_path_prefix = f"/{NAMESPACE}/demo"
+    model_request_path = f"{model_path_prefix}/v1/chat/completions"
     expected = (
         ("openai-chat", "/v1/chat/completions", "provider-translation-openai-ext.maas-system.svc.cluster.local", "STREAMED"),
         ("messages", "/v1/messages", "provider-translation-ext.maas-system.svc.cluster.local", "STREAMED"),
     )
     for api_format, path, backend, response_body_mode in expected:
+        # OpenAI's default path keeps main's two provider rules. The Messages
+        # target path adds an alternative match to its body-routing rule.
+        expected_candidate_route_count = 2 if api_format == "openai-chat" else 3
         candidate = profiles.get(api_format, {})
         stable_id = candidate.get("stable_id", "")
         exact_rows = [row for row in rows if row["path"] == path]
-        selected = [row for row in exact_rows if any(
-            header.get("name", "").lower() == "x-ai-routing-candidate"
-            and header.get("stringMatch", {}).get("exact") == stable_id
-            for header in row["headers"]
-        )]
+        selected_model_path = [row for row in rows
+                               if row["path_separated_prefix"] == model_path_prefix and any(
+                                   header.get("name", "").lower() == "x-ai-routing-candidate"
+                                   and header.get("stringMatch", {}).get("exact") == stable_id
+                                   for header in row["headers"]
+                               )]
         shared = [row for row in exact_rows if "translation-openai-mock.models-as-a-service.svc.cluster.local"
                   in (row["cluster"] or "")
                   and not any(header.get("name", "").lower() == "x-ai-routing-candidate"
                               for header in row["headers"])]
+        selected_target_path = [row for row in exact_rows if backend in (row["cluster"] or "") and any(
+            header.get("name", "").lower() == "x-ai-routing-candidate"
+            and header.get("stringMatch", {}).get("exact") == stable_id
+            for header in row["headers"]
+        )]
         candidate_routes = [row for row in rows if backend in (row["cluster"] or "") and any(
             header.get("name", "").lower() == "x-ai-routing-candidate"
             and header.get("stringMatch", {}).get("exact") == stable_id
             for header in row["headers"]
         )]
-        chosen = selected[0] if selected else {}
+        chosen = selected_model_path[0] if selected_model_path else {}
         public = shared[0] if shared else {}
+        if api_format == "openai-chat":
+            target_path_contract_valid = not selected_target_path
+        else:
+            target_path_contract_valid = (
+                len(selected_target_path) == 1 and bool(public)
+                and selected_target_path[0]["index"] < public["index"]
+                and backend in (selected_target_path[0].get("cluster") or "")
+            )
         checks.append({
             "api_format": api_format,
             "path": path,
+            "expected_candidate_route_count": expected_candidate_route_count,
+            "candidate_route_count_matches_contract": len(candidate_routes) == expected_candidate_route_count,
+            "model_request_path": model_request_path,
             "stable_id_present": bool(stable_id),
             "selected_provider_route": chosen,
+            "selected_model_path_routes": selected_model_path,
+            "selected_target_path_routes": selected_target_path,
             "selected_provider_routes": candidate_routes,
             "selection_fallback_routes": fallback_routes,
             "fallback_routes_stream_response_bodies": fallback_routes_stream_responses,
             "shared_exact_route": public,
             "selected_route_points_to_expected_backend": backend in (chosen.get("cluster") or ""),
+            "target_path_match_contract_valid": target_path_contract_valid,
+            "selected_route_contract_valid": (
+                backend in (chosen.get("cluster") or "")
+                and chosen.get("path_separated_prefix") == model_path_prefix
+                and target_path_contract_valid
+            ),
             "body_modes_match_provider_contract": (
-                len(candidate_routes) == 3
+                len(candidate_routes) == expected_candidate_route_count
                 and all(row.get("external_model_processing_mode", {}).get("requestBodyMode") == "STREAMED"
                         and row.get("external_model_effective_response_body_mode") == response_body_mode
                         and row.get("external_model_pre_request_body_mode") == "BUFFERED"
                         for row in candidate_routes)
             ),
             "pre_auth_model_body_buffered": (
-                len(candidate_routes) == 3
+                len(candidate_routes) == expected_candidate_route_count
                 and all(row.get("external_model_pre_request_body_mode") == "BUFFERED"
                         for row in candidate_routes)
             ),
-            "selected_route_precedes_shared_route": bool(chosen and public and chosen["index"] < public["index"]
-                and chosen["route_config"] == public["route_config"]
-                and chosen["virtual_host"] == public["virtual_host"]),
+            "selected_route_and_shared_route_use_same_virtual_host": bool(
+                chosen and public and chosen["route_config"] == public["route_config"]
+                and chosen["virtual_host"] == public["virtual_host"]
+            ),
         })
     save_json(EVIDENCE / f"route-collision-{label}.json", {"checks": checks})
     return checks
@@ -2468,14 +2542,18 @@ def test_externalmodel_provider_aware_translation(auth_file):
                         and check["fallback_routes_stream_response_bodies"] for check in route_precedence)),
             "send_body_without_waiting_for_header_response": send_body_before_header,
             "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
-            "dedicated_filter_request_limit_bytes": 1024 * 1024,
+            "configured_translation_filter_request_limit_bytes": 1024 * 1024,
+            "Praxis_request_limit_enforcement_proven": False,
             "scope": "controller-owned ExternalModel routes"})
-    record("selected_provider_exact_paths_outrank_shared_exact_routes",
+    record("externalmodel_selected_routes_respect_shared_route_contract",
            len(route_precedence) == 2 and all(
                check["selected_route_points_to_expected_backend"]
                and check["body_modes_match_provider_contract"]
                and check["fallback_routes_stream_response_bodies"]
-               and check["selected_route_precedes_shared_route"] for check in route_precedence),
+               and check["selected_route_contract_valid"]
+               and check["target_path_match_contract_valid"]
+               and check["selected_route_and_shared_route_use_same_virtual_host"]
+               for check in route_precedence),
            {"route_checks": route_precedence,
             "request_path_before_provider_rewrite": "/models-as-a-service/demo/v1/chat/completions",
             "selected_paths_after_translation": {"messages": "/v1/messages", "openai-chat": "/v1/chat/completions"}})
@@ -2830,10 +2908,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "shared_recorder_request_delta": (
                 shared_observations_after_under_limit - shared_observations_before_under_limit)})
 
-    # A response above Envoy's JSON usage-observation buffer limit is still
-    # received by the selected provider, but Envoy rejects it before the client
-    # receives it. Keep this explicit so the fixture does not misattribute the
-    # Gateway limitation to ExtProc or the OpenAI passthrough filter.
+    # Existing Envoy response-buffer control. Keep this separate from the
+    # translation review; it does not establish behavior at the translator's
+    # 1 MiB response limit.
     openai_large_response_marker = "externalmodel-openai-large-json-response"
     openai_large_response_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-response"
     shared_observations_before_large_response = len(observations())
@@ -2889,7 +2966,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
            and shared_observations_after_large_response == shared_observations_before_large_response,
            {"http_status": openai_large_response_status,
             "downstream_json_bytes": len(openai_large_response_raw),
-            "downstream_content_bytes": len(openai_large_response_content),
+            "downstream_content_bytes": len(openai_large_response_content.encode()),
             "response_payload_saved": False,
             "response_code_details": openai_large_response_route.get("response_code_details"),
             "rejection_layer": "Envoy response path; the filter responsible for the size rejection was not isolated",
@@ -2908,12 +2985,10 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "shared_recorder_request_delta": (
                 shared_observations_after_large_response - shared_observations_before_large_response)})
 
-    # Oversize requests must be rejected before either provider receives them.
-    # The pre-auth Envoy processor buffers the request to extract its model and
-    # can reject the body before provider selection. Record that Envoy result
-    # separately from the Praxis filter's structured limit error: only the
-    # latter proves the filter enforced its own 1 MiB limit. Keep the synthetic
-    # large body out of retained evidence.
+    # Existing Envoy preselection control: this proves the request was rejected
+    # before provider contact, not that the Praxis selected-provider filter
+    # enforced its own 1 MiB request limit. Keep the synthetic body out of
+    # retained evidence.
     openai_large_marker = "externalmodel-openai-body-limit"
     openai_large_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-request"
     openai_upstream_count = len(provider_aware_observations())
@@ -2925,18 +3000,10 @@ def test_externalmodel_provider_aware_translation(auth_file):
         extra_headers=[f"x-ipp-diagnostic-id: {openai_large_request_id}"],
         persist_response_payload=False,
     )
-    try:
-        openai_large_error = json.loads(openai_large_raw)
-    except json.JSONDecodeError:
-        openai_large_error = {}
     openai_large_route = capture_runtime_route_trace(
         openai_large_request_id, "openai-large-request", route_trace_gateway_pod)
     time.sleep(0.5)
     openai_upstream_after_limit = len(provider_aware_observations())
-    openai_filter_limit = (
-        openai_large_error.get("error", {}).get("code") == "request_too_large"
-        and "request body exceeds max_body_bytes" in openai_large_error.get("error", {}).get("message", "")
-    )
     openai_envoy_preselection_limit = (
         openai_large_route.get("response_code_details") == "request_payload_too_large"
         and openai_large_route.get("model_header") in (None, "-")
@@ -2945,20 +3012,17 @@ def test_externalmodel_provider_aware_translation(auth_file):
         and openai_large_route.get("upstream_host") in (None, "-")
     )
     openai_large_route_captured = openai_large_route.get("captured") is True
-    record("externalmodel_openai_request_body_limit_before_upstream",
+    record("externalmodel_openai_request_rejected_by_envoy_before_provider_selection",
            rc == 0 and openai_large_status == "413"
-           and (openai_filter_limit or openai_envoy_preselection_limit)
+           and openai_envoy_preselection_limit
            and len(openai_large_raw) < 4096
            and openai_upstream_after_limit == openai_upstream_count,
            {"http_status": openai_large_status,
             "request_bytes_exceed_configured_limit": True,
-            "downstream_filter_error_code": openai_large_error.get("error", {}).get("code"),
             "downstream_response_bytes": len(openai_large_raw),
-            "praxis_filter_limit_observed": openai_filter_limit,
+            "praxis_selected_provider_filter_reached": False,
             "envoy_preselection_limit_observed": openai_envoy_preselection_limit,
-            "rejection_layer": ("Praxis AI OpenAI-to-Anthropic request filter" if openai_filter_limit else
-                                "Envoy buffered pre-auth ExternalModel processor" if openai_envoy_preselection_limit else
-                                "unclassified"),
+            "rejection_layer": "Envoy buffered pre-auth ExternalModel processor",
             "route_trace_captured": openai_large_route_captured,
             "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
             "runtime_route_name": openai_large_route.get("route_name"),
@@ -2971,9 +3035,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "upstream_contact_count_before": openai_upstream_count,
             "upstream_contact_count_after": openai_upstream_after_limit})
 
-    # Disabling the permission must leave selected OpenAI-compatible traffic
-    # available. It only removes translation behavior; the selected provider
-    # profile still controls model rewrite, routing, and credentials.
+    # Disabling the permission leaves OpenAI-compatible traffic available and
+    # restores main-compatible rendering: provider profiles and the selected-
+    # provider translator are absent, so the client's model value is preserved.
     kubectl("-n", NAMESPACE, "patch", "maastenantconfig", "default-tenant", "--type=merge",
             "-p", '{"spec":{"apiTranslation":{"enabled":false}}}')
     openai_off_runtime = wait_externalmodel_revision(
@@ -2995,12 +3059,22 @@ def test_externalmodel_provider_aware_translation(auth_file):
     record("externalmodel_openai_pass_through_with_translation_permission_off",
            rc == 0 and openai_off_status == "200" and bool(openai_off_response.get("choices"))
            and openai_off_observation.get("path") == "/v1/chat/completions"
-           and openai_off_observation.get("model") == "mock-openai-model"
+           and openai_off_observation.get("model") == "demo"
            and openai_off_observation.get("credential_ok") is True
-           and "api_translation_enabled: false" in openai_off_runtime["extproc_config"],
+           and "api_translation_enabled:" not in openai_off_runtime["extproc_config"]
+           and "filter: openai_chat_completions_to_anthropic\n" not in openai_off_runtime["extproc_config"]
+           and "openai_chat_completions_to_anthropic_stream" not in openai_off_runtime["extproc_config"]
+           and "max_body_bytes" not in openai_off_runtime["extproc_config"]
+           and "allow_unbounded_body: true" in openai_off_runtime["extproc_config"]
+           and all(not any(field in candidate for field in ("api_format", "path", "target_model"))
+                   for candidate in openai_off_runtime["demo_model_candidates"]),
            {"http_status": openai_off_status, "provider_path": openai_off_observation.get("path"),
             "provider_model": openai_off_observation.get("model"),
             "provider_credential_ok": openai_off_observation.get("credential_ok"),
+            "client_model_preserved": openai_off_observation.get("model") == "demo",
+            "provider_profile_fields_absent": all(
+                not any(field in candidate for field in ("api_format", "path", "target_model"))
+                for candidate in openai_off_runtime["demo_model_candidates"]),
             "translation_permission": False,
             "selected_provider_clusters": openai_off_runtime["demo_model_candidate_clusters"]})
 
@@ -3133,7 +3207,8 @@ def test_externalmodel_provider_aware_translation(auth_file):
         oversized_request_id, "oversized-anthropic-json-response", route_trace_gateway_pod)
     oversized_filter_rejection = (
         oversized_response.get("error", {}).get("code") == "provider_response_too_large"
-        and "exceeds max_body_bytes" in oversized_response.get("error", {}).get("message", "")
+        and "Anthropic provider response exceeds a size limit set by the platform administrator."
+        in oversized_response.get("error", {}).get("message", "")
     )
     record("externalmodel_anthropic_response_limit_is_enforced_by_praxis_filter",
            rc == 0 and oversized_status == "502" and oversized_filter_rejection
@@ -3147,6 +3222,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
                in oversized_route.get("upstream_cluster", ""),
            {"http_status": oversized_status,
             "downstream_filter_error_code": oversized_response.get("error", {}).get("code"),
+            "downstream_filter_error_message": oversized_response.get("error", {}).get("message"),
             "downstream_response_bytes": len(oversized_raw),
             "upstream_response_exceeds_configured_bytes": (1 << 20) + 128,
             "upstream_path": oversized_observation.get("path"),
@@ -3210,6 +3286,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
            {"http_status": invalid_status, "upstream_contact_count_before": upstream_count,
             "upstream_contact_count_after": len(provider_aware_observations())})
 
+    # This large request is an Envoy preselection control, not a Praxis limit
+    # test: the pre-auth processor rejects it before the selected-provider
+    # filter receives a body.
     large_content = "x" * (1024 * 1024 + 128)
     upstream_count = len(provider_aware_observations())
     anthropic_large_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-large-request"
@@ -3218,18 +3297,10 @@ def test_externalmodel_provider_aware_translation(auth_file):
          "messages": [{"role": "user", "content": large_content}]}, auth_file=auth_file,
         extra_headers=[f"x-ipp-diagnostic-id: {anthropic_large_request_id}"],
         persist_response_payload=False)
-    try:
-        large_error = json.loads(large_raw)
-    except json.JSONDecodeError:
-        large_error = {}
     anthropic_large_route = capture_runtime_route_trace(
         anthropic_large_request_id, "anthropic-large-request", route_trace_gateway_pod)
     time.sleep(0.5)
     anthropic_upstream_after_limit = len(provider_aware_observations())
-    anthropic_filter_limit = (
-        large_error.get("error", {}).get("code") == "request_too_large"
-        and "request body exceeds max_body_bytes" in large_error.get("error", {}).get("message", "")
-    )
     anthropic_envoy_preselection_limit = (
         anthropic_large_route.get("response_code_details") == "request_payload_too_large"
         and anthropic_large_route.get("model_header") in (None, "-")
@@ -3237,18 +3308,15 @@ def test_externalmodel_provider_aware_translation(auth_file):
         and "provider-selection-required-demo-model" in anthropic_large_route.get("upstream_cluster", "")
         and anthropic_large_route.get("upstream_host") in (None, "-")
     )
-    record("externalmodel_anthropic_request_body_limit",
+    record("externalmodel_anthropic_request_rejected_by_envoy_before_provider_selection",
            rc == 0 and large_status == "413"
-           and (anthropic_filter_limit or anthropic_envoy_preselection_limit)
+           and anthropic_envoy_preselection_limit
            and len(large_raw) < 4096 and anthropic_upstream_after_limit == upstream_count,
            {"http_status": large_status, "request_bytes_exceed_configured_limit": True,
-            "downstream_filter_error_code": large_error.get("error", {}).get("code"),
             "downstream_response_bytes": len(large_raw),
-            "praxis_filter_limit_observed": anthropic_filter_limit,
+            "praxis_selected_provider_filter_reached": False,
             "envoy_preselection_limit_observed": anthropic_envoy_preselection_limit,
-            "rejection_layer": ("Praxis AI OpenAI-to-Anthropic request filter" if anthropic_filter_limit else
-                                "Envoy buffered pre-auth ExternalModel processor" if anthropic_envoy_preselection_limit else
-                                "unclassified"),
+            "rejection_layer": "Envoy buffered pre-auth ExternalModel processor",
             "route_trace_captured": anthropic_large_route.get("captured") is True,
             "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
             "upstream_contact_count_before": upstream_count,

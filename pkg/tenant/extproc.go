@@ -87,8 +87,10 @@ func configureSharedExtProc(resources []unstructured.Unstructured, tenantID, gat
 // route-level override cannot be safely attached by this reconciler.
 func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, tenantID string, apiTranslation bool) error {
 	want := "BUFFERED"
+	var routeCacheAction string
 	if apiTranslation {
 		want = "STREAMED"
+		routeCacheAction = "RETAIN"
 	}
 	filterName := PayloadProcessingEnvoyFilterName(tenantID)
 	filterFound := false
@@ -121,6 +123,13 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 			if err := unstructured.SetNestedField(patch, want, "patch", "value", "typed_config", "processing_mode", "response_body_mode"); err != nil {
 				return fmt.Errorf("set shared ipp response_body_mode in patch %d: %w", patchIndex, err)
 			}
+			if routeCacheAction != "" {
+				if err := unstructured.SetNestedField(patch, routeCacheAction, "patch", "value", "typed_config", "route_cache_action"); err != nil {
+					return fmt.Errorf("set shared ipp route_cache_action in patch %d: %w", patchIndex, err)
+				}
+			} else {
+				unstructured.RemoveNestedField(patch, "patch", "value", "typed_config", "route_cache_action")
+			}
 			patched++
 		}
 		if err := unstructured.SetNestedSlice(filter.Object, patches, "spec", "configPatches"); err != nil {
@@ -139,8 +148,10 @@ func configureSharedExtProcResponseMode(resources []unstructured.Unstructured, t
 // converts SSE responses, strips the client Anthropic key, then rewrites the
 // exact Messages path. The tenant's permission also selects the shared ipp
 // response mode: BUFFERED by default and STREAMED when translation is enabled
-// so the Messages SSE filter can emit progressive events. The separate ipp-pre
-// mode and ExternalModel processor are unchanged.
+// so the Messages SSE filter can emit progressive events. Retaining the route
+// cache is also scoped to translation-enabled tenants because only that shared
+// path rewrites Messages requests. The separate ipp-pre mode and ExternalModel
+// processor are unchanged.
 func sharedExtProcConfig(apiTranslation bool) string {
 	var b strings.Builder
 	b.WriteString("server:\n")
@@ -167,6 +178,9 @@ func sharedExtProcConfig(apiTranslation bool) string {
 		b.WriteString("      - filter: anthropic_messages_to_chat_completions_stream\n")
 		b.WriteString("        max_partial_event_bytes: 10485760\n")
 		b.WriteString("        max_tool_blocks: 10000\n")
+		b.WriteString("        conditions:\n")
+		b.WriteString("          - when:\n")
+		b.WriteString("              path: \"/v1/messages\"\n")
 		b.WriteString("        response_conditions:\n")
 		b.WriteString("          - when:\n")
 		b.WriteString("              headers:\n")
@@ -195,7 +209,7 @@ func sharedExtProcConfig(apiTranslation bool) string {
 // MaaS/KServe post-auth workload is intentionally not modified. Secret values
 // are never read: kubelet projects the referenced Secret into this workload and
 // credential_inject reads the mounted file at request time.
-func configureExternalModelExtProc(resources []unstructured.Unstructured, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) error {
+func configureExternalModelExtProc(resources []unstructured.Unstructured, tenantID, namespace string, candidates []envelope.Candidate, apiTranslationEnabled bool) error {
 	credentials, err := extprocCredentials(namespace, candidates)
 	if err != nil {
 		return err
@@ -226,6 +240,9 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 	data["extproc.yaml"] = config
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
 		return fmt.Errorf("write post-auth ExtProc ConfigMap data: %w", err)
+	}
+	if err := configureExternalModelRequestOrdering(resources, tenantID, apiTranslationEnabled); err != nil {
+		return err
 	}
 	configHash := sha256.Sum256([]byte(config))
 	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(configHash[:]), "spec", "template", "metadata", "annotations", extprocConfigHashAnnotation); err != nil {
@@ -288,6 +305,57 @@ func configureExternalModelExtProc(resources []unstructured.Unstructured, namesp
 	return nil
 }
 
+// configureExternalModelRequestOrdering enables early body delivery only for
+// translation-enabled tenants. Flag-off tenants retain the main Envoy request
+// ordering, including during a translation on-to-off reconciliation.
+func configureExternalModelRequestOrdering(resources []unstructured.Unstructured, tenantID string, apiTranslationEnabled bool) error {
+	wantFilter := PayloadProcessingExternalModelFilterNameForTenant(tenantID)
+	filterFound := false
+	patched := 0
+	for i := range resources {
+		filter := &resources[i]
+		if filter.GetKind() != "EnvoyFilter" || filter.GetName() != wantFilter {
+			continue
+		}
+		filterFound = true
+		patches, found, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+		if err != nil {
+			return fmt.Errorf("read ExternalModel EnvoyFilter %q configPatches: %w", wantFilter, err)
+		}
+		if !found {
+			return fmt.Errorf("ExternalModel EnvoyFilter %q configPatches are missing", wantFilter)
+		}
+		for patchIndex, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			if !ok || patch["applyTo"] != "HTTP_FILTER" {
+				continue
+			}
+			name, found, err := unstructured.NestedString(patch, "patch", "value", "name")
+			if err != nil {
+				return fmt.Errorf("read ExternalModel HTTP_FILTER patch %d name: %w", patchIndex, err)
+			}
+			if !found || name != "envoy.filters.http.ext_proc.external-model" {
+				continue
+			}
+			if apiTranslationEnabled {
+				if err := unstructured.SetNestedField(patch, true, "patch", "value", "typed_config", "send_body_without_waiting_for_header_response"); err != nil {
+					return fmt.Errorf("enable early ExternalModel body delivery in patch %d: %w", patchIndex, err)
+				}
+			} else {
+				unstructured.RemoveNestedField(patch, "patch", "value", "typed_config", "send_body_without_waiting_for_header_response")
+			}
+			patched++
+		}
+		if err := unstructured.SetNestedSlice(filter.Object, patches, "spec", "configPatches"); err != nil {
+			return fmt.Errorf("write ExternalModel EnvoyFilter %q configPatches: %w", wantFilter, err)
+		}
+	}
+	if !filterFound || patched == 0 {
+		return fmt.Errorf("ExternalModel EnvoyFilter %q has no post-auth HTTP_FILTER patches", wantFilter)
+	}
+	return nil
+}
+
 // extprocCredentials returns deterministic, reference-only file mappings.
 func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]extprocCredential, error) {
 	seen := map[string]bool{}
@@ -333,11 +401,14 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	sort.Strings(clusters)
 	var b strings.Builder
 	b.WriteString("server:\n  grpc_address: \"0.0.0.0:9004\"\n  health_address: \"0.0.0.0:50052\"\n")
-	// Keep ExtProc's accumulation ceiling at its 10 MiB default for this
-	// dedicated ExternalModel process. The translation filter separately
-	// rejects request JSON above its 1 MiB limit, while streamed responses are
-	// bounded only when the selected Anthropic JSON translator buffers them.
-	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n  max_body_bytes: 10485760\n  tls:\n    mode: self_signed\n\n")
+	b.WriteString("  metrics_address: \"0.0.0.0:9090\"\n")
+	// Bound buffered translation work only when the tenant opts in. With
+	// translation disabled, omit the translation and provider-profile filters
+	// and retain main's unbounded-body setting.
+	if apiTranslationEnabled {
+		b.WriteString("  max_body_bytes: 10485760\n")
+	}
+	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")
 	b.WriteString("        overlay_file: /etc/praxis/routing/routing-overlay.json\n")
 	b.WriteString("        model_header: X-Gateway-Model-Name\n        provider_hop_clusters: [")
@@ -348,17 +419,22 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		fmt.Fprintf(&b, "%q", cluster)
 	}
 	b.WriteString("]\n        reload: {enabled: true, debounce_ms: 500}\n")
-	b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
-	b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
-	b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
-	fmt.Fprintf(&b, "        api_translation_enabled: %t\n", apiTranslationEnabled)
-	b.WriteString("        max_body_bytes: 1048576\n")
+	if apiTranslationEnabled {
+		b.WriteString("      - filter: openai_chat_completions_to_anthropic_stream\n")
+		b.WriteString("        max_partial_event_bytes: 1048576\n        max_tool_blocks: 256\n")
+		b.WriteString("      - filter: openai_chat_completions_to_anthropic\n")
+		b.WriteString("        api_translation_enabled: true\n")
+		b.WriteString("        max_body_bytes: 1048576\n")
+	}
 	if len(credentials) > 0 {
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
 			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n", credential.name, credential.namespace)
 			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n            file: %s\n", credential.key, credential.strategy, credential.file)
 		}
+	}
+	if !apiTranslationEnabled {
+		b.WriteString("\ninsecure_options:\n  allow_unbounded_body: true\n")
 	}
 	return b.String()
 }

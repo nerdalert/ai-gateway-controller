@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -168,7 +169,7 @@ func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T
 	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required); err != nil || !ready {
 		t.Fatalf("overlay after later provider publication: ready=%t reason=%q err=%v", ready, reason, err)
 	}
-	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
+	candidates, _, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
 	if err != nil || len(candidates) != 2 {
 		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
 	}
@@ -239,16 +240,32 @@ func TestDisabledAnthropicTranslationDoesNotBlockAttachmentOnlyOverlay(t *testin
 	// The tenant still has an ExternalModel, so it enters the serving path. Its
 	// only home binding is intentionally skipped while translation is disabled;
 	// the published attachment must still drive the tenant ExtProc config.
-	homeCandidates, homeErr := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
-	if !errors.Is(homeErr, resolver.ErrNoRoutes) {
-		t.Fatalf("disabled Anthropic runtime candidates error = %v, want resolver.ErrNoRoutes", homeErr)
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system", false)
+	if !errors.Is(homeErr, resolver.ErrNoRoutes) || !policyExcludedOnly {
+		t.Fatalf("disabled Anthropic runtime candidates error = %v, policyExcludedOnly = %t; want ErrNoRoutes from policy exclusion", homeErr, policyExcludedOnly)
 	}
-	runtimeCandidates, err := combineRuntimeCandidates(homeCandidates, []envelope.Candidate{attachment}, homeErr)
+	runtimeCandidates, err := combineRuntimeCandidates(homeCandidates, []envelope.Candidate{attachment}, homeErr, policyExcludedOnly)
 	if err != nil || len(runtimeCandidates) != 1 || runtimeCandidates[0].StableID != attachment.StableID {
 		t.Fatalf("attachment-only ExtProc runtime candidates = %#v, err=%v; want the served attachment", runtimeCandidates, err)
 	}
-	if _, err := combineRuntimeCandidates(homeCandidates, nil, homeErr); !errors.Is(err, resolver.ErrNoRoutes) {
-		t.Fatalf("disabled home binding without an attachment error = %v, want resolver.ErrNoRoutes", err)
+	if candidates, err := combineRuntimeCandidates(homeCandidates, nil, homeErr, policyExcludedOnly); err != nil || len(candidates) != 0 {
+		t.Fatalf("disabled home binding without an attachment = %#v, error = %v; want empty candidate set for cleanup", candidates, err)
+	}
+}
+
+func TestMissingHomeProviderKeepsRuntimeConfiguration(t *testing.T) {
+	set, err := resolver.ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{{
+		ObjectMeta: metav1.ObjectMeta{Name: "home", Namespace: "tenant-ns"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: "missing"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		}}},
+	}}, nil, false)
+	if !errors.Is(err, resolver.ErrNoRoutes) || allRuntimeRoutesExcludedByPolicy(set) {
+		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, allRuntimeRoutesExcludedByPolicy(set))
+	}
+	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
+	if _, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("missing home provider with attachment error = %v, want ErrNoRoutes to retain last config", err)
 	}
 }
 
@@ -569,6 +586,43 @@ func TestReconcileAppliesWhenPendingWithGatewayRef(t *testing.T) {
 	}
 	if PayloadProcessingStatus(got) != PayloadProcessingStatusSteady {
 		t.Fatalf("status = %q, want %q after claim from Pending", PayloadProcessingStatus(got), PayloadProcessingStatusSteady)
+	}
+}
+
+func TestReconcileAppliesSharedResourcesWithOnlyDisabledMessagesModel(t *testing.T) {
+	requireManifests(t)
+	const namespace = "tenant-ns"
+	mtc := withMarker(newMTC(namespace, "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	if err := unstructured.SetNestedMap(mtc.Object, map[string]any{"enabled": false}, "spec", "apiTranslation"); err != nil {
+		t.Fatal(err)
+	}
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", namespace, namespace)
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "messages-only", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+			Ref: v1alpha1.ExternalProviderReference{Name: "anthropic"}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		}}},
+	}
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: namespace},
+		Spec:       v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "anthropic.example.com"},
+		Status:     v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+		WithObjects(mtc, aitenant, newGateway("my-gateway", namespace), model, provider).
+		WithInterceptorFuncs(rec.funcs()).Build()
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", ResyncInterval: time.Hour}
+	res, err := r.Reconcile(context.Background(), mtcRequest(namespace))
+	if err != nil || res.RequeueAfter != time.Hour {
+		t.Fatalf("Messages-only tenant reconcile: result=%#v err=%v, want shared resources applied", res, err)
+	}
+	patched, _, _ := rec.snapshot()
+	if !slices.Contains(patched, PayloadProcessingPluginsConfigMapForTenant("redteam")) {
+		t.Fatalf("shared ExtProc config was not applied: %v", patched)
+	}
+	if slices.Contains(patched, PayloadProcessingExternalModelPluginsConfigMapForTenant("redteam")) {
+		t.Fatalf("disabled Messages model unexpectedly installed ExternalModel ExtProc: %v", patched)
 	}
 }
 

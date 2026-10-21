@@ -93,10 +93,13 @@ type Route struct {
 	TargetModel       string
 	APIFormat         string
 	Path              string // fully resolved, no placeholders
-	Weight            int    // normalized: unset == 1; only positive weights survive
-	AuthType          string // merged auth type: apikey|sigv4|oauth2
-	SecretName        string // credential secret (same namespace as provider)
-	SecretKey         string // fixed "api-key" per the CRD contract
+	// APITranslationEnabled is the resolved tenant permission. It gates
+	// translation-only HTTPRoute alternatives that exist for rewritten paths.
+	APITranslationEnabled bool
+	Weight                int    // normalized: unset == 1; only positive weights survive
+	AuthType              string // merged auth type: apikey|sigv4|oauth2
+	SecretName            string // credential secret (same namespace as provider)
+	SecretKey             string // fixed "api-key" per the CRD contract
 	// StableID overrides the existing stable_id derivation for a route
 	// contributed to a tenant from another namespace. Empty keeps the
 	// existing <model>/provider-<provider> form.
@@ -149,10 +152,10 @@ func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 }
 
 // ResolveWithAPITranslation resolves routes when the tenant explicitly permits
-// API translation. The permission allows supported Messages candidates; it
-// does not select a translator or alter OpenAI-compatible candidates. For an
-// ExternalModel, the selected candidate's trusted profile determines whether
-// Praxis applies translation.
+// API translation. The permission allows supported Messages candidates and
+// enables trusted provider profiles for request conversion, including
+// targetModel rewriting on OpenAI-compatible routes. It does not choose which
+// provider is selected; the selected candidate's profile controls conversion.
 func ResolveWithAPITranslation(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider, enabled bool) (*ResolvedRouteSet, error) {
 	return resolve(models, providers, false, enabled)
 }
@@ -277,21 +280,22 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				auth = *ref.Auth
 			}
 			mr.Routes = append(mr.Routes, Route{
-				Model:             m.Name,
-				ClientName:        clientName,
-				Namespace:         m.Namespace,
-				Provider:          prov.Name,
-				ProviderType:      prov.Spec.Provider,
-				Cluster:           "provider-" + prov.Name,
-				Endpoint:          prov.Spec.Endpoint,
-				TLSCACertificates: caCertificates,
-				TargetModel:       ref.TargetModel,
-				APIFormat:         ref.APIFormat,
-				Path:              path,
-				Weight:            weight,
-				AuthType:          auth.Type,
-				SecretName:        auth.SecretRef.Name,
-				SecretKey:         "api-key",
+				Model:                 m.Name,
+				ClientName:            clientName,
+				Namespace:             m.Namespace,
+				Provider:              prov.Name,
+				ProviderType:          prov.Spec.Provider,
+				Cluster:               "provider-" + prov.Name,
+				Endpoint:              prov.Spec.Endpoint,
+				TLSCACertificates:     caCertificates,
+				TargetModel:           ref.TargetModel,
+				APIFormat:             ref.APIFormat,
+				Path:                  path,
+				APITranslationEnabled: translationEnabled,
+				Weight:                weight,
+				AuthType:              auth.Type,
+				SecretName:            auth.SecretRef.Name,
+				SecretKey:             "api-key",
 			})
 			resolved++
 		}

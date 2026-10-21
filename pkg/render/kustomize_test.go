@@ -112,22 +112,25 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 		t.Fatalf("%s request_body_mode missing: found=%v err=%v", name, found, err)
 	}
 	responseMode, _, _ := unstructured.NestedString(resource, "typed_config", "processing_mode", "response_body_mode")
-	sendBodyBeforeHeader, _, sendBodyErr := unstructured.NestedBool(resource, "typed_config", "send_body_without_waiting_for_header_response")
+	sendBodyBeforeHeader, sendBodyFound, sendBodyErr := unstructured.NestedBool(resource, "typed_config", "send_body_without_waiting_for_header_response")
 	if sendBodyErr != nil {
 		t.Fatalf("%s send_body_without_waiting_for_header_response: %v", name, sendBodyErr)
 	}
 	switch name {
 	case "envoy.filters.http.ext_proc.ipp":
+		if routeCacheAction, found, err := unstructured.NestedString(resource, "typed_config", "route_cache_action"); err != nil || found {
+			t.Fatalf("tenant-independent shared filter must leave route_cache_action unset: value=%q found=%t err=%v", routeCacheAction, found, err)
+		}
 		if mode != "BUFFERED" || responseMode != "BUFFERED" {
-			t.Fatalf("rendered shared post-auth modes = request %q response %q, want default BUFFERED/BUFFERED before tenant permission is applied", mode, responseMode)
+			t.Fatalf("rendered shared post-auth modes = request %q response %q, want main-compatible BUFFERED/BUFFERED defaults", mode, responseMode)
 		}
 		return "post"
 	case "envoy.filters.http.ext_proc.external-model":
 		if mode != "NONE" || responseMode != "NONE" {
 			t.Fatalf("ExternalModel post-auth modes = request %q response %q, want NONE/NONE", mode, responseMode)
 		}
-		if !sendBodyBeforeHeader {
-			t.Fatal("ExternalModel post-auth ExtProc must send streamed request-body messages before the header response")
+		if sendBodyFound || sendBodyBeforeHeader {
+			t.Fatal("default ExternalModel post-auth filter must retain main request ordering with early body delivery unset")
 		}
 		return "external"
 	default:

@@ -730,8 +730,9 @@ def cleanup():
                 legacy_keys = {"custom-ipp-config.yaml", "custom-pre-processing-ipp-config.yaml"}
                 remaining_legacy_keys = sorted(legacy_keys.intersection(
                     (configmap or {}).get("data", {}).keys()))
-                record("praxis_claims_cleanup_complete", True, {
-                    "cleanup_complete_consumed": True,
+                record("praxis_claims_cleanup_complete",
+                       status_value(mtc, STATUS_ANNOTATION) == STEADY and not remaining_legacy_keys, {
+                    "cleanup_complete_consumed": status_value(mtc, STATUS_ANNOTATION) == STEADY,
                     "final_status": status_value(mtc, STATUS_ANNOTATION),
                     "legacy_ipp_configmap_absent": not remaining_legacy_keys,
                     "remaining_legacy_ipp_keys": remaining_legacy_keys,

@@ -57,10 +57,6 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
             failure_mode_allow: false
             allow_mode_override: true
-            # Envoy may deliver body messages before the header response. The
-            # post-auth ExtProc holds them until selection and translation
-            # finish, so an over-limit body is rejected before routing.
-            send_body_without_waiting_for_header_response: true
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
@@ -146,7 +142,6 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
             failure_mode_allow: false
             allow_mode_override: true
-            send_body_without_waiting_for_header_response: true
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
@@ -176,7 +171,6 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
             failure_mode_allow: false
             allow_mode_override: true
-            send_body_without_waiting_for_header_response: true
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"
@@ -206,7 +200,6 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
             failure_mode_allow: false
             allow_mode_override: true
-            send_body_without_waiting_for_header_response: true
             processing_mode:
               request_header_mode: "SEND"
               response_header_mode: "SEND"

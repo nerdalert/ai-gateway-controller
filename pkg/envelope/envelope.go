@@ -158,6 +158,10 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
+	// IncludeProviderProfiles enables the newer Praxis AI profile fields used
+	// for API translation. Keep this false for flag-off overlays so older
+	// intelligent_route consumers receive the same candidate shape as main.
+	IncludeProviderProfiles bool
 	// PreservedCandidates are already-published candidates kept verbatim
 	// ahead of the rendered routes. A tenant's own candidates are preserved
 	// this way when only contributions from other namespaces change.
@@ -210,15 +214,17 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 			// duplicates, which would cause the second model to get 404/503.
 			// The Cluster stays shared (one transport per provider).
 			cand := Candidate{
-				Cluster:     r.Cluster,
-				StableID:    RouteStableID(r),
-				Kind:        "inference_model",
-				Name:        r.ClientName,
-				Site:        scope.LocalSite,
-				Fresh:       true,
-				APIFormat:   r.APIFormat,
-				Path:        r.Path,
-				TargetModel: r.TargetModel,
+				Cluster:  r.Cluster,
+				StableID: RouteStableID(r),
+				Kind:     "inference_model",
+				Name:     r.ClientName,
+				Site:     scope.LocalSite,
+				Fresh:    true,
+			}
+			if opts.IncludeProviderProfiles {
+				cand.APIFormat = r.APIFormat
+				cand.Path = r.Path
+				cand.TargetModel = r.TargetModel
 			}
 			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
 				group := group
@@ -236,6 +242,16 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				}
 			}
 			candidates = append(candidates, cand)
+		}
+	}
+	if !opts.IncludeProviderProfiles {
+		// Preserved candidates may have been published while translation was
+		// enabled. Strip the versioned profile fields before hashing a flag-off
+		// overlay so disabling the feature returns to the main wire contract.
+		for i := range candidates {
+			candidates[i].APIFormat = ""
+			candidates[i].Path = ""
+			candidates[i].TargetModel = ""
 		}
 	}
 

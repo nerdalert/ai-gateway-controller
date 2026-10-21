@@ -276,17 +276,28 @@ progressive SSE. Translation filters remain absent when
 shared routes still traverse the ExtProc chain. The Kind qualification covers
 default-off passthrough and an unrelated OpenAI SSE route.
 
-The ExternalModel-only filter is a separate route-scoped chain. Its requests
-are buffered for selected-provider translation and its responses are streamed
-for JSON/SSE response handling. Controller-owned route patches limit the body
-processing to generated ExternalModel routes; ordinary KServe routes do not
-receive this ExternalModel chain. The selected-provider request filter applies
-a 1 MiB limit before model validation and target-model rewriting, including for
+The ExternalModel-only filter is a separate route-scoped chain. Controller-
+owned route patches limit its processing to generated ExternalModel routes;
+ordinary KServe routes do not receive this chain. With
+`MaasTenantConfig.spec.apiTranslation.enabled` omitted or false, the controller
+keeps the main-compatible selected-provider path: it omits provider profile
+fields and translation filters, leaves the request model supplied by the client
+unchanged, and does not enable early body delivery. With the setting true, the
+selected-provider profile can rewrite the OpenAI Chat Completions request
+body's `model` to that provider's `ExternalProviderRef.targetModel`, even when
+the selected provider is OpenAI-compatible. The setting therefore opts into
+both API conversion and this provider-specific target-model mapping; there is
+not currently a separate switch for target-model rewriting.
+
+When translation is enabled, the selected-provider request filter applies a
+1 MiB limit before model validation and target-model rewriting, including for
 OpenAI-compatible candidates; larger requests are rejected before the upstream
-provider. The dedicated ExtProc process keeps its 10 MiB accumulation ceiling,
-so the qualification checks the filter's structured `request_too_large`
-response rather than treating an Envoy or ExtProc 413 as proof of the filter
-limit. For Anthropic JSON responses, the translator buffers chunks in
+provider. The dedicated ExtProc process uses a 10 MiB accumulation ceiling for
+that translation configuration. The Kind request-limit probe currently observes
+Envoy's preselection 413 before the request reaches Praxis, so it does not
+qualify the filter's 1 MiB limit. With translation disabled, the translation
+filter and its bounds are absent and the main `allow_unbounded_body` setting is
+retained. For Anthropic JSON responses, the translator buffers chunks in
 request-local filter state and enforces its 1 MiB limit. SSE remains
 incremental, and OpenAI-compatible responses pass through without this response
 buffer or limit.
