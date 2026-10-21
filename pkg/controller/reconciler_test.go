@@ -419,6 +419,47 @@ func TestOpenAIOnlyMultipleProvidersKeepMainMatchSet(t *testing.T) {
 	}
 }
 
+func TestTranslationEnabledOpenAIExactTargetPathUsesSelectedProvider(t *testing.T) {
+	routes := []resolver.Route{
+		{Model: "model", ClientName: "chat", Provider: "provider-b", APIFormat: "openai-chat", Path: "/v1/chat/completions", APITranslationEnabled: true},
+		{Model: "model", ClientName: "chat", Provider: "provider-a", APIFormat: "openai-chat", Path: "/v1/chat/completions", APITranslationEnabled: true},
+	}
+	obj := modelHTTPRouteSet(routes, "tenant-a", "gateway", "gateway-system")
+	rules := nestedSlice(t, obj.Object, "spec", "rules")
+	if len(rules) != 6 {
+		t.Fatalf("translation-enabled OpenAI rules = %d, want two rules per provider plus two fallbacks", len(rules))
+	}
+	for i, route := range routes {
+		bodyMatches := nestedSlice(t, nestedMapAt(t, rules, i*2+1), "matches")
+		if len(bodyMatches) != 2 {
+			t.Fatalf("provider %s body matches = %#v, want model-header and exact target-path matches", route.Provider, bodyMatches)
+		}
+		stableID := envelope.CandidateStableID(route.Model, route.Provider)
+		foundExactTargetPath := false
+		for _, raw := range bodyMatches {
+			match, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("body match has type %T, want map[string]any", raw)
+			}
+			pathType, hasPath, pathTypeErr := unstructured.NestedString(match, "path", "type")
+			pathValue, _, pathValueErr := unstructured.NestedString(match, "path", "value")
+			if pathTypeErr != nil || pathValueErr != nil {
+				t.Fatalf("read exact target path: type error=%v value error=%v", pathTypeErr, pathValueErr)
+			}
+			if hasPath && pathType == "Exact" && pathValue == route.Path {
+				headers := nestedSlice(t, match, "headers")
+				foundExactTargetPath = len(headers) == 1 &&
+					nestedString(t, nestedMapAt(t, headers, 0), "name") == selectedProviderHeader &&
+					nestedString(t, nestedMapAt(t, headers, 0), "value") == stableID
+			}
+		}
+		if !foundExactTargetPath {
+			t.Fatalf("provider %s lacks exact target path %q gated by selected candidate %q: %#v",
+				route.Provider, route.Path, stableID, bodyMatches)
+		}
+	}
+}
+
 func TestProviderTargetPathMatchRequiresTranslationPermission(t *testing.T) {
 	route := resolver.Route{
 		Model: "model", ClientName: "chat", Provider: "openai", APIFormat: "openai-chat",
@@ -512,9 +553,9 @@ func TestModelHTTPRouteHasOneTrustedRulePerProviderBeforeFallback(t *testing.T) 
 			t.Fatalf("rule %d backend = %q, want %q", i, got, providerServicePrefix+providerName)
 		}
 		targetMatches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex+1), "matches")
-		if routes[i].Path == "/v1/chat/completions" {
+		if routes[i].Path == "/v1/chat/completions" && !routes[i].APITranslationEnabled {
 			if len(targetMatches) != 1 {
-				t.Fatalf("provider %s default OpenAI path matches = %#v, want only the model-header match", providerName, targetMatches)
+				t.Fatalf("provider %s flag-off default OpenAI path matches = %#v, want only the model-header match", providerName, targetMatches)
 			}
 			continue
 		}

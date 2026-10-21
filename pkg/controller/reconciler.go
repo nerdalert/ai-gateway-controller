@@ -2189,18 +2189,18 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			"timeouts":    map[string]any{"request": "300s"},
 		})
 		// Body-routed requests enter on a model header rather than the
-		// canonical path. A translated request or a non-default provider path
-		// can be rewritten to candidate.Path before Envoy reselects its route;
-		// include that exact path with the trusted candidate to keep the provider
-		// route specific. The default OpenAI path needs no extra match, preserving
-		// main's OpenAI-only match set. Gateway API matches in one rule are
-		// alternatives and share the same backend.
+		// canonical path. When translation is enabled, the selected profile can
+		// rewrite the path to candidate.Path before Envoy reselects its route.
+		// Include that exact path with the trusted candidate, even for the
+		// canonical OpenAI path, so a shared exact-path route cannot win after
+		// rewriting. Flag-off routes keep main's match set. Gateway API matches
+		// in one rule are alternatives and share the same backend.
 		bodyMatches := []any{map[string]any{"headers": []any{
 			map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
 			map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID},
 		}}}
 		profilePathRewriteEnabled := candidate.APITranslationEnabled
-		if profilePathRewriteEnabled && candidate.Path != "" && candidate.Path != "/v1/chat/completions" {
+		if profilePathRewriteEnabled && candidate.Path != "" {
 			bodyMatches = append(bodyMatches, map[string]any{
 				"path":    map[string]any{"type": "Exact", "value": candidate.Path},
 				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},

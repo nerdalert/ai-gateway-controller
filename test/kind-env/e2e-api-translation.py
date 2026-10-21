@@ -2244,9 +2244,13 @@ def selected_provider_route_precedence(label, profiles):
         ("messages", "/v1/messages", "provider-translation-ext.maas-system.svc.cluster.local", "STREAMED"),
     )
     for api_format, path, backend, response_body_mode in expected:
-        # OpenAI's default path keeps main's two provider rules. The Messages
-        # target path adds an alternative match to its body-routing rule.
-        expected_candidate_route_count = 2 if api_format == "openai-chat" else 3
+        # OpenAI's exact target path is an alternative match on the existing
+        # body-routing rule when translation is enabled. It must precede the
+        # shared exact-path route without adding another Gateway rule.
+        # Envoy expands the model-header and exact-path alternatives into
+        # separate route entries. Both formats therefore expose three
+        # selected-provider entries after translation is enabled.
+        expected_candidate_route_count = 3
         candidate = profiles.get(api_format, {})
         stable_id = candidate.get("stable_id", "")
         exact_rows = [row for row in rows if row["path"] == path]
@@ -2273,7 +2277,11 @@ def selected_provider_route_precedence(label, profiles):
         chosen = selected_model_path[0] if selected_model_path else {}
         public = shared[0] if shared else {}
         if api_format == "openai-chat":
-            target_path_contract_valid = not selected_target_path
+            target_path_contract_valid = (
+                len(selected_target_path) == 1 and bool(public)
+                and selected_target_path[0]["index"] < public["index"]
+                and backend in (selected_target_path[0].get("cluster") or "")
+            )
         else:
             target_path_contract_valid = (
                 len(selected_target_path) == 1 and bool(public)
