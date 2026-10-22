@@ -4087,20 +4087,27 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
     # A direct no-key request proves the fixture rejects absent provider
     # credentials. The request body and response contain no credential value.
     bedrock_forward, bedrock_port = start_port_forward("provider-translation-bedrock-ext", 443)
-    no_key_marker = "bedrock-mantle-no-provider-key"
-    no_key_result = run([
-        "curl", "--noproxy", "*", "-sS", "--connect-timeout", "5", "--max-time", "10",
-        "--cacert", str(PROVIDER_CA_FILE), "--connect-to",
-        f"{bedrock_host}:443:127.0.0.1:{bedrock_port}",
-        "-H", "content-type: application/json", "-H", f"X-Translation-Request-Id: {no_key_marker}",
-        "-o", os.devnull, "-w", "%{http_code}", "--data-binary",
-        json.dumps({"model": "openai.gpt-oss-20b", "messages": [{"role": "user", "content": no_key_marker}]}),
-        f"https://{bedrock_host}/v1/chat/completions",
-    ], check=False, timeout=12)
-    no_key_observation = wait_provider_observation(
-        lambda item: item.get("request_id") == no_key_marker, "Bedrock no-key control")
-    bedrock_forward.terminate()
-    bedrock_forward.wait(timeout=5)
+    try:
+        no_key_marker = "bedrock-mantle-no-provider-key"
+        no_key_result = run([
+            "curl", "--noproxy", "*", "-sS", "--connect-timeout", "5", "--max-time", "10",
+            "--cacert", str(PROVIDER_CA_FILE), "--connect-to",
+            f"{bedrock_host}:443:127.0.0.1:{bedrock_port}",
+            "-H", "content-type: application/json", "-H", f"X-Translation-Request-Id: {no_key_marker}",
+            "-o", os.devnull, "-w", "%{http_code}", "--data-binary",
+            json.dumps({"model": "openai.gpt-oss-20b", "messages": [{"role": "user", "content": no_key_marker}]}),
+            f"https://{bedrock_host}/v1/chat/completions",
+        ], check=False, timeout=12)
+        no_key_observation = wait_provider_observation(
+            lambda item: item.get("request_id") == no_key_marker, "Bedrock no-key control")
+    finally:
+        if bedrock_forward.poll() is None:
+            bedrock_forward.terminate()
+        try:
+            bedrock_forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            bedrock_forward.kill()
+            bedrock_forward.wait(timeout=5)
     record("bedrock_mantle_recorder_rejects_missing_bearer_credential",
            no_key_result.returncode == 0 and no_key_result.stdout.strip() == "401"
            and no_key_observation.get("credential_ok") is False,
@@ -4255,12 +4262,33 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
 
     reload_marker = "externalmodel-overlay-reload-active-bedrock-stream"
     reload_trace_id = f"{ROUTE_TRACE_PREFIX}bedrock-overlay-reload-sse"
-    def reload_bedrock_overlay():
+    reload_result = {}
+    reload_first_event = threading.Event()
+    def run_bedrock_reload_stream():
+        try:
+            reload_result["result"] = progressive_stream_request(
+                "bedrock-mantle-overlay-reload-sse", externalmodel_url,
+                {"model": "demo", "stream": True,
+                 "messages": [{"role": "user", "content": reload_marker}]},
+                extra_headers=[f"x-ipp-diagnostic-id: {reload_trace_id}"],
+                record_result=False, on_first_event=reload_first_event.set, request_timeout=90)
+        except Exception as exc:
+            reload_result["error"] = repr(exc)
+
+    stream_thread = threading.Thread(target=run_bedrock_reload_stream, daemon=True)
+    stream_thread.start()
+    try:
+        if not reload_first_event.wait(timeout=10):
+            raise RuntimeError(f"Bedrock SSE first event did not arrive: {reload_result.get('error')}")
+        stream_open_before_reload = stream_thread.is_alive()
+        reload_observation = wait_provider_observation(
+            lambda item: reload_marker in item.get("message_text", []), "Bedrock in-flight overlay reload")
         updated = [dict(refs[0], weight=0), dict(bedrock_ref, targetModel="openai.gpt-oss-20b-reloaded")]
         kubectl("-n", NAMESPACE, "patch", "externalmodel", "demo-model", "--type=merge", "-p",
                 json.dumps({"spec": {"externalProviderRefs": updated}}))
         reloaded = wait_externalmodel_revision({"provider-api-translation-bedrock-mantle"},
             "bedrock-mantle-inflight-overlay-reload", changed_from=bedrock_only["published_digest"])
+        stream_open_when_new_revision_served = stream_thread.is_alive()
         RESULT.setdefault("bedrock_overlay_reload", {}).update({
             "original_revision": bedrock_only["published_digest"],
             "new_revision": reloaded["published_digest"],
@@ -4268,18 +4296,24 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
             "new_target_model": "openai.gpt-oss-20b-reloaded",
             "serving_pods": [{"name": pod["name"], "uid": pod["uid"],
                 "serving_revision": pod["serving_revision"]} for pod in reloaded["pods"]],
-            "stream_open_after_first_event_when_new_revision_serves": True,
+            "first_downstream_event_received": reload_first_event.is_set(),
+            "stream_open_when_reload_started": stream_open_before_reload,
+            "stream_open_after_first_event_when_new_revision_serves": stream_open_when_new_revision_served,
         })
-
-    _, reload_status, reload_raw, reload_first_ms, reload_total_ms, reload_type = progressive_stream_request(
-        "bedrock-mantle-overlay-reload-sse", externalmodel_url,
-        {"model": "demo", "stream": True,
-         "messages": [{"role": "user", "content": reload_marker}]},
-        extra_headers=[f"x-ipp-diagnostic-id: {reload_trace_id}"],
-        on_first_event=reload_bedrock_overlay, request_timeout=20)
+    finally:
+        stream_thread.join(timeout=100)
+    if stream_thread.is_alive():
+        raise RuntimeError("Bedrock SSE request did not complete after overlay reload")
+    if "result" not in reload_result:
+        raise RuntimeError(f"Bedrock SSE request failed after overlay reload: {reload_result.get('error')}")
+    _, reload_status, reload_raw, reload_first_ms, reload_total_ms, reload_type = reload_result["result"]
+    RESULT["requests"].append({"name": "bedrock-mantle-overlay-reload-sse",
+                               "http_status": reload_status, "curl_exit_status": 0,
+                               "path": externalmodel_url.split("?", 1)[0].rsplit("/", 1)[-1],
+                               "first_event_latency_ms": round(reload_first_ms, 1),
+                               "total_response_ms": round(reload_total_ms, 1)})
+    save_json(RESULTS, RESULT)
     reload_trace = capture_runtime_route_trace(reload_trace_id, "bedrock-overlay-reload-sse", bedrock_route_trace_pod)
-    reload_observation = wait_provider_observation(
-        lambda item: reload_marker in item.get("message_text", []), "Bedrock in-flight overlay reload")
     reload_events = sse_events(reload_raw)
     reload_data = [event["data"] for event in reload_events]
     new_revision = RESULT.get("bedrock_overlay_reload", {}).get("new_revision")
@@ -4288,6 +4322,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
            and any(isinstance(item, dict) and "choices" in item for item in reload_data)
            and "[DONE]" in reload_data and bool(new_revision)
            and new_revision != bedrock_only["published_digest"]
+           and RESULT.get("bedrock_overlay_reload", {}).get("stream_open_when_reload_started") is True
            and RESULT.get("bedrock_overlay_reload", {}).get(
                "stream_open_after_first_event_when_new_revision_serves") is True
            and bedrock_cluster in reload_trace.get("upstream_cluster", "")
@@ -4302,6 +4337,9 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
             "event_count": len(reload_events), "done_event": "[DONE]" in reload_data,
             "old_request_serving_revision": bedrock_only["published_digest"],
             "new_published_serving_revision": new_revision,
+            "first_downstream_event_received": reload_first_event.is_set(),
+            "stream_open_when_reload_started": stream_open_before_reload,
+            "stream_open_when_new_revision_served": stream_open_when_new_revision_served,
             "upstream_cluster": reload_trace.get("upstream_cluster"),
             "backend_authority": reload_observation.get("authority"),
             "candidate_attribution_source": "Envoy upstream cluster plus provider recorder authority and model",
