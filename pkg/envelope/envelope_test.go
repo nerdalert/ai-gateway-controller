@@ -213,7 +213,9 @@ func TestRender_BedrockMantleMapsAPIKeyToBearerReference(t *testing.T) {
 	r.Endpoint = "bedrock-mantle.us-east-2.api.aws"
 	r.Path = "/v1/chat/completions"
 	r.TargetModel = "openai.gpt-oss-20b"
-	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{
+		IncludeProviderProfiles: true,
+	})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
