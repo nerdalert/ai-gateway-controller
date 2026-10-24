@@ -236,7 +236,13 @@ func splitCandidateStableID(stableID string) (model, provider string, ok bool) {
 	return stableID[:index], stableID[index+len("/provider-"):], true
 }
 
-func (r *Reconciler) routeForWithdrawnCandidate(ctx context.Context, namespace string, candidate envelope.Candidate, modelName, providerNamespace, providerName string, applied map[string]resolver.Route) (resolver.Route, error) {
+func (r *Reconciler) routeForWithdrawnCandidate(
+	ctx context.Context,
+	namespace string,
+	candidate envelope.Candidate,
+	modelName, providerNamespace, providerName string,
+	applied map[string]resolver.Route,
+) (resolver.Route, error) {
 	stableID := candidate.StableID
 	if route, ok := applied[stableID]; ok {
 		route.ClientName = candidate.Name
