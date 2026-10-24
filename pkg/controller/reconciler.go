@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -631,6 +632,19 @@ func (r *Reconciler) reconcileModel(ctx context.Context, req reconcile.Request, 
 // gatewayRefs aggregate it with their other attachments into one write.
 type modelStatusReporter func(ready bool, reason, message string, env *envelope.Envelope) error
 
+type homeModelPublication struct {
+	result            publisher.Result
+	namespace         string
+	gateway           v1alpha1.NamespacedObjectReference
+	denied            string
+	unserved          string
+	attached          []attachedModel
+	state             map[string]attachedModel
+	remaining         time.Duration
+	withdrawalPending bool
+	report            modelStatusReporter
+}
+
 // reconcileHomeModel serves the model through its own tenant: the tenant
 // whose MaasTenantConfig is in the model namespace. This is the existing
 // tenant-local path; it publishes every model the tenant serves from its own
@@ -774,26 +788,35 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	return r.finishHomeModelPublication(ctx, homeModelPublication{
+		result: result, namespace: req.Namespace,
+		gateway: home.gateway, denied: denied[req.String()],
+		unserved: unserved[req.String()], attached: attached, state: state,
+		remaining: remaining, withdrawalPending: withdrawalPending, report: report,
+	})
+}
+
+func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication homeModelPublication) (reconcile.Result, error) {
 	var statusErr error
-	if denial := denied[req.String()]; denial != "" {
+	if publication.denied != "" {
 		// The model's permitted references are served; the others are reported.
-		statusErr = report(false, reasonRefNotPermitted, denial, nil)
-	} else if message := unserved[req.String()]; message != "" {
+		statusErr = publication.report(false, reasonRefNotPermitted, publication.denied, nil)
+	} else if publication.unserved != "" {
 		// Its references inherit a credential that is not ready; other models
 		// keep serving.
-		statusErr = report(false, reasonProviderNotReady, message, nil)
+		statusErr = publication.report(false, reasonProviderNotReady, publication.unserved, nil)
 	} else {
-		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
-		statusErr = report(true, reasonReconciled, message, &result.Envelope)
+		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", publication.result.Envelope.Revision.Value, publication.result.Envelope.Provenance.SourceGeneration)
+		statusErr = publication.report(true, reasonReconciled, message, &publication.result.Envelope)
 	}
-	if remaining > 0 {
+	if publication.remaining > 0 {
 		if statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
-		return reconcile.Result{RequeueAfter: remaining}, nil
+		return reconcile.Result{RequeueAfter: publication.remaining}, nil
 	}
-	if withdrawalPending {
-		if err := r.gcTenantState(ctx, req.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state)); err != nil {
+	if publication.withdrawalPending {
+		if err := r.gcTenantState(ctx, publication.namespace, excludedRoutes(publication.attached), stateAnnotations(publication.gateway, publication.state)); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
