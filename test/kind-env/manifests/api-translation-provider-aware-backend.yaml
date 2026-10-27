@@ -57,9 +57,15 @@ spec:
             - name: STREAM_EVENT_DELAY
               value: 400ms
             - name: OVERLAY_RELOAD_STREAM_EVENT_DELAY
-              # Keep the marked reload stream open through Kubernetes' projected
-              # ConfigMap refresh and ExtProc's overlay reload.
-              value: 18s
+              # Anthropic's translated stream has more events than the
+              # OpenAI-compatible Bedrock stream, so keep its reload probe
+              # bounded while leaving time for projected overlay refresh.
+              value: 15s
+            - name: BEDROCK_OVERLAY_RELOAD_STREAM_EVENT_DELAY
+              # The Bedrock reload probe has fewer events; a longer dedicated
+              # delay keeps it open while the overlay reloads without making
+              # the Anthropic stream exceed its bounded join timeout.
+              value: 50s
           ports:
             - name: https
               containerPort: 8443

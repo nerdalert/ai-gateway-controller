@@ -66,15 +66,13 @@ EXTERNAL_MODEL_CHANGED = False
 ANTHROPIC_PROVIDER_CREATED = False
 PROVIDER_AWARE_CREATED = False
 DIAGNOSTIC_ROUTE_AUTH_CREATED = False
-EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = None
-EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = None
 TEMP = pathlib.Path(tempfile.mkdtemp(prefix="ipp-api-translation-"))
 RESULT = {"status": "RUNNING", "assertions": [], "requests": [], "upstream_observations": []}
 
 
 def run(args, *, input_text=None, check=True, timeout=90, env=None):
-    proc = subprocess.run(args, input=input_text, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, timeout=timeout, env=env)
+    proc = subprocess.run(args, input=input_text, text=True, encoding="utf-8", errors="replace",
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
     if check and proc.returncode:
         detail = proc.stderr[-1200:].replace(KEY_VALUE or "\0", "[REDACTED]")
         raise RuntimeError(f"command failed rc={proc.returncode}: {' '.join(args)}: {detail}")
@@ -307,6 +305,26 @@ def start_port_forward(service, remote_port, namespace="maas-system"):
     return proc, port
 
 
+def refresh_gateway_port_forward(label):
+    """Rebind the run-owned Gateway tunnel after a Gateway pod rollout."""
+    global GATEWAY_FORWARD, GATEWAY_PORT
+    if GATEWAY_FORWARD and GATEWAY_FORWARD.poll() is None:
+        GATEWAY_FORWARD.terminate()
+        try:
+            GATEWAY_FORWARD.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            GATEWAY_FORWARD.kill()
+            GATEWAY_FORWARD.wait(timeout=5)
+    GATEWAY_FORWARD, GATEWAY_PORT = start_port_forward("maas-default-gateway-istio", 80)
+    save_json(EVIDENCE / f"gateway-port-forward-{label}.json", {
+        "service": "maas-system/maas-default-gateway-istio",
+        "remote_port": 80,
+        "local_port_allocated": True,
+        "label": label,
+    })
+    return GATEWAY_PORT
+
+
 def curl_request(name, url, body, *, auth_file=None, extra_headers=None, ca_file=None,
                  resolve_host=None, stream=False, correlation_id=None,
                  persist_response_payload=True):
@@ -491,6 +509,96 @@ def cancel_stream_request(url, body, *, extra_headers=None):
     status = str(response.status)
     connection.close()
     return status, b"".join(first_event)
+
+
+def wait_for_cancelled_stream_drain():
+    """Allow Envoy to finish draining the canceled upstream stream.
+
+    The provider-aware fixture deliberately emits delayed SSE chunks. Closing
+    the downstream connection after the first event does not synchronously
+    complete Envoy's upstream cancellation. A subsequent request issued in
+    that small window can be rejected by the buffered pre-auth processor with
+    no body bytes available. This is a bounded synchronization gate, not a
+    retry of the canceled or subsequent HTTP response.
+    """
+    drain_seconds = 3
+    time.sleep(drain_seconds)
+    return drain_seconds
+
+
+def wait_for_externalmodel_route(stable_id, path, label):
+    """Wait for Envoy to receive the selected ExternalModel route.
+
+    ExtProc's serving revision and Envoy's route snapshot converge through
+    separate control-plane updates.  A request is not safe to issue until the
+    route containing the selected-provider match is present in the current
+    Gateway proxy configuration as well.
+    """
+    last = ""
+    last_pod = None
+
+    def ready_gateway_pod():
+        pods = json.loads(kubectl(
+            "-n", "maas-system", "get", "pods", "-l",
+            "gateway.networking.k8s.io/gateway-name=maas-default-gateway", "-o", "json").stdout)
+        return next((pod["metadata"]["name"] for pod in pods.get("items", [])
+                     if not pod.get("metadata", {}).get("deletionTimestamp")
+                     and any(condition.get("type") == "Ready" and condition.get("status") == "True"
+                             for condition in pod.get("status", {}).get("conditions", []))), None)
+
+    for _ in range(90):
+        last_pod = ready_gateway_pod()
+        if last_pod:
+            result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", "routes",
+                          last_pod, "-n", "maas-system", "-o", "json"],
+                         check=False, timeout=90)
+            last = result.stdout or result.stderr
+            if result.returncode == 0:
+                try:
+                    route_config = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    route_config = None
+
+                def selected_route(node):
+                    if isinstance(node, dict):
+                        match = node.get("match", {})
+                        headers = match.get("headers", [])
+                        candidate_match = any(
+                            header.get("name", "").lower() == "x-ai-routing-candidate"
+                            and (header.get("string_match", header.get("stringMatch", {}))
+                                 .get("exact") == stable_id)
+                            for header in headers
+                        )
+                        path_match = (
+                            match.get("path") == path
+                            or match.get("path_separated_prefix") == path
+                            or match.get("pathSeparatedPrefix") == path
+                        )
+                        if candidate_match and path_match:
+                            return True
+                        return any(selected_route(value) for value in node.values())
+                    if isinstance(node, list):
+                        return any(selected_route(value) for value in node)
+                    return False
+
+                if selected_route(route_config):
+                    save_json(EVIDENCE / f"envoy-externalmodel-route-ready-{label}.json", {
+                        "gateway_pod": last_pod,
+                        "selected_candidate": stable_id,
+                        "path": path,
+                        "route_present": True,
+                    })
+                    return
+        time.sleep(1)
+
+    (EVIDENCE / f"envoy-externalmodel-route-{label}-not-ready.json").write_text(last)
+    save_json(EVIDENCE / f"envoy-externalmodel-route-ready-{label}.json", {
+        "gateway_pod": last_pod,
+        "selected_candidate": stable_id,
+        "path": path,
+        "route_present": False,
+    })
+    raise RuntimeError(f"Envoy did not receive selected ExternalModel route: {label}")
 
 
 def wait_route(name):
@@ -1138,7 +1246,13 @@ def externalmodel_runtime_snapshot(label):
     pods = []
     for pod in pod_list.get("items", []):
         name = pod.get("metadata", {}).get("name", "")
-        if not name:
+        # A rollout can leave the old pod selected briefly while its
+        # replacement is becoming Ready.  Do not exec into a terminating
+        # or non-running pod: the API server may keep the connection open
+        # until the pod disappears, turning a snapshot into a timeout.
+        if (not name
+                or pod.get("metadata", {}).get("deletionTimestamp")
+                or pod.get("status", {}).get("phase") != "Running"):
             continue
         mounted = kubectl("-n", NAMESPACE, "exec", f"pod/{name}", "-c", "payload-processing",
                           "--", "cat", "/etc/praxis/routing/routing-overlay.json", check=False, timeout=20)
@@ -1450,6 +1564,8 @@ def wait_shared_runtime_convergence(label):
     last_extproc = ""
     last_pods = []
     last_deployment = {}
+    previous_signature = None
+    stable_observations = 0
     for _ in range(120):
         last_extproc, last_pods = capture_shared_runtime(label)
         snapshot = json.loads((EVIDENCE / f"shared-runtime-{label}.json").read_text())
@@ -1463,19 +1579,56 @@ def wait_shared_runtime_convergence(label):
             and status.get("availableReplicas", 0) == spec_replicas
             and (status.get("terminatingReplicas") or 0) == 0
         )
-        pods_converged = bool(last_pods) and all(
-            pod["ready"] and not pod["deletion_timestamp"] and pod["mounted_config"] == last_extproc
-            for pod in last_pods
+        deployment_revision = last_deployment.get("metadata", {}).get("annotations", {}).get(
+            "deployment.kubernetes.io/revision")
+        current_replica_sets = {
+            replica_set.get("metadata", {}).get("name")
+            for replica_set in snapshot.get("deployment_replica_sets", [])
+            if replica_set.get("metadata", {}).get("annotations", {}).get(
+                "deployment.kubernetes.io/revision") == deployment_revision
+        }
+        serving_pods = [pod for pod in last_pods
+                        if pod.get("owner_replica_set") in current_replica_sets]
+        pods_converged = (
+            len(serving_pods) == spec_replicas
+            and all(pod["ready"] and not pod["deletion_timestamp"]
+                    and pod["mounted_config"] == last_extproc for pod in serving_pods)
         )
-        pod_names = {pod["name"] for pod in last_pods if pod["ready"] and not pod["deletion_timestamp"]
-                     and pod["mounted_config"] == last_extproc}
-        endpoints_converged = all(
-            endpoint.get("target_ref", {}).get("name") in pod_names
+        pod_names = {pod["name"] for pod in serving_pods}
+        all_endpoint_targets = {
+            endpoint.get("target_ref", {}).get("name")
+            for endpoint_slice in snapshot.get("service_endpoint_slices", [])
+            for endpoint in endpoint_slice.get("endpoints", [])
+        }
+        ready_endpoint_targets = {
+            endpoint.get("target_ref", {}).get("name")
             for endpoint_slice in snapshot.get("service_endpoint_slices", [])
             for endpoint in endpoint_slice.get("endpoints", [])
             if endpoint.get("conditions", {}).get("ready") is True
+        }
+        endpoints_converged = (
+            bool(pod_names)
+            and all_endpoint_targets == pod_names
+            and ready_endpoint_targets == pod_names
+            and all(
+                endpoint.get("conditions", {}).get("ready") is True
+                for endpoint_slice in snapshot.get("service_endpoint_slices", [])
+                for endpoint in endpoint_slice.get("endpoints", [])
+            )
         )
-        if rollout_converged and pods_converged and endpoints_converged:
+        signature = (
+            last_extproc,
+            tuple(sorted((pod["name"], pod["uid"]) for pod in serving_pods)),
+            tuple(sorted(all_endpoint_targets)),
+            last_deployment.get("metadata", {}).get("generation"),
+        )
+        if signature == previous_signature:
+            stable_observations += 1
+        else:
+            stable_observations = 1
+            previous_signature = signature
+        if (rollout_converged and pods_converged and endpoints_converged
+                and stable_observations >= 2):
             return last_extproc, last_pods
         time.sleep(1)
     raise RuntimeError(f"shared ExtProc rollout did not converge to its mounted and serving configuration: {label}")
@@ -1485,12 +1638,14 @@ def capture_envoy(label):
     pods = json.loads(kubectl("-n", "maas-system", "get", "pods", "-l",
                               "gateway.networking.k8s.io/gateway-name=maas-default-gateway", "-o", "json").stdout)
     pod = next((p["metadata"]["name"] for p in pods.get("items", [])
-                if any(c.get("type") == "Ready" and c.get("status") == "True"
-                       for c in p.get("status", {}).get("conditions", []))), None)
+                if not p.get("metadata", {}).get("deletionTimestamp")
+                and any(c.get("type") == "Ready" and c.get("status") == "True"
+                        for c in p.get("status", {}).get("conditions", []))), None)
     if not pod:
         raise RuntimeError("no Ready maas-default-gateway Envoy pod")
     for resource in ("all", "listeners", "routes", "clusters", "endpoints"):
-        result = run([ISTIOCTL, "proxy-config", resource, pod, "-n", "maas-system", "-o", "json"],
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", resource, pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         if result.returncode != 0:
             (EVIDENCE / f"envoy-{label}-{resource}.json").write_text(result.stdout or result.stderr)
@@ -1508,6 +1663,53 @@ def capture_envoy(label):
                 raise RuntimeError("Envoy ExtProc endpoint snapshot was not valid JSON")
         else:
             (EVIDENCE / f"envoy-{label}-{resource}.json").write_text(result.stdout or result.stderr)
+
+
+def wait_gateway_ready_stable(label):
+    """Wait for one non-terminating Gateway pod to be Ready without restarts."""
+    previous = None
+    stable_samples = 0
+    history = []
+    for _ in range(90):
+        pods = json.loads(kubectl(
+            "-n", "maas-system", "get", "pods", "-l",
+            "gateway.networking.k8s.io/gateway-name=maas-default-gateway", "-o", "json").stdout)
+        ready = []
+        for pod in pods.get("items", []):
+            if pod.get("metadata", {}).get("deletionTimestamp"):
+                continue
+            conditions = pod.get("status", {}).get("conditions", [])
+            if not any(condition.get("type") == "Ready" and condition.get("status") == "True"
+                       for condition in conditions):
+                continue
+            restarts = sum(status.get("restartCount", 0)
+                           for status in pod.get("status", {}).get("containerStatuses", []))
+            ready.append({
+                "name": pod.get("metadata", {}).get("name"),
+                "uid": pod.get("metadata", {}).get("uid"),
+                "restarts": restarts,
+            })
+        sample = ready[0] if len(ready) == 1 else None
+        history.append({"ready_pods": ready, "selected": sample})
+        current = (sample or {}).get("uid"), (sample or {}).get("restarts")
+        if sample and current == previous:
+            stable_samples += 1
+        else:
+            stable_samples = 1 if sample else 0
+        previous = current if sample else None
+        if stable_samples >= 2:
+            save_json(EVIDENCE / f"gateway-serving-readiness-{label}.json", {
+                "stable_samples": stable_samples,
+                "selected_pod": sample,
+                "history": history[-10:],
+            })
+            return sample["name"]
+        time.sleep(1)
+    save_json(EVIDENCE / f"gateway-serving-readiness-{label}-failure.json", {
+        "stable_samples": stable_samples,
+        "history": history[-20:],
+    })
+    raise RuntimeError(f"Gateway did not remain Ready with stable restarts: {label}")
 
 
 def externalmodel_send_body_before_header_flags(label):
@@ -1700,18 +1902,27 @@ end'''
     save_json(EVIDENCE / "envoy-runtime-route-trace-filter.json", envoy_filter)
     kubectl("-n", "maas-system", "apply", "-f", "-", input_text=json.dumps(envoy_filter))
 
-    gateway_pods = json.loads(kubectl(
-        "-n", "maas-system", "get", "pods", "-l",
-        "gateway.networking.k8s.io/gateway-name=maas-default-gateway", "-o", "json").stdout)
-    gateway_pod = next((pod["metadata"]["name"] for pod in gateway_pods.get("items", [])
-                        if any(condition.get("type") == "Ready" and condition.get("status") == "True"
-                               for condition in pod.get("status", {}).get("conditions", []))), None)
+    def ready_gateway_pod():
+        gateway_pods = json.loads(kubectl(
+            "-n", "maas-system", "get", "pods", "-l",
+            "gateway.networking.k8s.io/gateway-name=maas-default-gateway", "-o", "json").stdout)
+        return next((pod["metadata"]["name"] for pod in gateway_pods.get("items", [])
+                     if not pod.get("metadata", {}).get("deletionTimestamp")
+                     and any(condition.get("type") == "Ready" and condition.get("status") == "True"
+                             for condition in pod.get("status", {}).get("conditions", []))), None)
+
+    gateway_pod = ready_gateway_pod()
     if not gateway_pod:
-        raise RuntimeError("no Ready maas-default-gateway Envoy pod for runtime route trace")
+        raise RuntimeError("no Ready, non-terminating maas-default-gateway Envoy pod for runtime route trace")
 
     last = ""
     for _ in range(60):
-        result = run([ISTIOCTL, "proxy-config", "listeners", gateway_pod, "-n", "maas-system", "-o", "json"],
+        gateway_pod = ready_gateway_pod()
+        if not gateway_pod:
+            time.sleep(1)
+            continue
+        result = run([ISTIOCTL, "--context", f"kind-{CLUSTER}", "proxy-config", "listeners", gateway_pod,
+                      "-n", "maas-system", "-o", "json"],
                      check=False, timeout=90)
         last = result.stdout or result.stderr
         input_filter_order = auth_policy_input_filter_order(last)
@@ -2552,9 +2763,9 @@ def selected_provider_route_precedence(label, profiles):
                 })
 
     # The initial model-path request has no trusted selected-candidate header,
-    # so Envoy first matches a fail-closed sink route. Route cache clearing
-    # after intelligent_route cannot renegotiate the active ExtProc stream's
-    # response mode; sinks must therefore stream response bodies too.
+    # so Envoy first matches a fail-closed sink route. Selected-provider
+    # translation rewrites the complete request body and therefore requires
+    # BUFFERED request processing; responses remain streamed for SSE.
     fallback_routes = [row for row in rows
                        if (row.get("name") or "").startswith("models-as-a-service.external-model-demo-model.")
                        and "provider-selection-required-demo-model" in (row.get("cluster") or "")]
@@ -2684,61 +2895,6 @@ def wait_model_phase(expected):
                 return obj
         time.sleep(1)
     raise RuntimeError(f"ExternalModel demo-model did not reach phase {expected}")
-
-
-def enable_externalmodel_diagnostic_bypass_auth():
-    global EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256
-    policy = kubectl("-n", NAMESPACE, "get", "authpolicy", "external-model-auth", "-o", "json")
-    obj = json.loads(policy.stdout)
-    original_spec = obj.get("spec", {})
-    target = original_spec.get("targetRef", {})
-    if target.get("kind") != "HTTPRoute" or target.get("name") != "external-model-demo-model":
-        raise RuntimeError("refusing diagnostic bypass: external-model-auth target differs from expected ExternalModel route")
-    original_hash = hashlib.sha256(json.dumps(
-        original_spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    save_json(EVIDENCE / "external-model-auth-before-diagnostic-bypass.json", {
-        "name": obj.get("metadata", {}).get("name"),
-        "namespace": obj.get("metadata", {}).get("namespace"),
-        "generation": obj.get("metadata", {}).get("generation"),
-        "spec": original_spec,
-        "spec_sha256": original_hash,
-        "status_conditions": [{k: c.get(k) for k in ("type", "status", "reason")}
-                              for c in obj.get("status", {}).get("conditions", [])],
-    })
-    bypass_spec = {
-        "rules": {"authorization": {"diagnostic-allow": {
-            "patternMatching": {"patterns": [{"predicate": "true"}]},
-        }}},
-        "targetRef": target,
-    }
-    patch = json.dumps([{"op": "replace", "path": "/spec", "value": bypass_spec}])
-    applied = kubectl("-n", NAMESPACE, "patch", "authpolicy", "external-model-auth",
-                      "--type=json", "-p", patch, check=False)
-    if applied.returncode:
-        raise RuntimeError("could not apply the run-scoped diagnostic AuthPolicy bypass")
-    EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = original_spec
-    current = json.loads(kubectl("-n", NAMESPACE, "get", "authpolicy",
-                                 "external-model-auth", "-o", "json").stdout)
-    EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = hashlib.sha256(json.dumps(
-        current.get("spec"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    accepted = wait_auth_policy("external-model-auth", namespace=NAMESPACE)
-    save_json(EVIDENCE / "external-model-auth-diagnostic-bypass-ready.json", {
-        "resource": f"{NAMESPACE}/external-model-auth",
-        "target": target,
-        "authorization_rule": "diagnostic-allow predicate true",
-        "authentication_rules_present": bool(current.get("spec", {}).get("rules", {}).get("authentication")),
-        "production_maas_gateway_authpolicy_changed": False,
-        "route_policy_conditions": [{k: c.get(k) for k in ("type", "status", "reason")}
-                                     for c in accepted.get("status", {}).get("conditions", [])],
-        "original_spec_sha256": original_hash,
-        "diagnostic_spec_sha256": EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256,
-        "credential_values_saved": False,
-    })
-    record("externalmodel_diagnostic_auth_bypass_ready", True, {
-        "target_route": target.get("name"),
-        "production_gateway_policy_changed": False,
-        "diagnostic_only": True,
-    })
 
 
 def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_context):
@@ -2921,7 +3077,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
             "authconfig_scopes": initial_auth_scopes})
     route_precedence = selected_provider_route_precedence("externalmodel-pre-traffic", profiles)
     send_body_before_header = externalmodel_send_body_before_header_flags("externalmodel-pre-traffic")
-    buffered_request_contract = (
+    translation_body_contract = (
         len(route_precedence) == 2
         and all(check["body_modes_match_provider_contract"] for check in route_precedence)
         and all(check["fallback_routes_stream_response_bodies"] for check in route_precedence)
@@ -2929,7 +3085,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
         and all(flag is not True for flag in send_body_before_header)
     )
     record("externalmodel_pre_auth_model_extraction_and_post_auth_body_modes",
-           buffered_request_contract,
+           translation_body_contract,
            {"route_request_modes": [
                {"route": check.get("selected_provider_route", {}).get("name"),
                 "pre_request_body_mode": check.get("selected_provider_route", {}).get("external_model_pre_request_body_mode"),
@@ -2939,7 +3095,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
                for check in route_precedence],
             "pre_auth_body_is_buffered_for_model_extraction": (
                 len(route_precedence) == 2 and all(check["pre_auth_model_body_buffered"] for check in route_precedence)),
-            "post_auth_bodies_streamed_for_late_provider_selection": (
+            "post_auth_bodies_buffered_for_selected_provider_translation": (
                 len(route_precedence) == 2
                 and all(check["body_modes_match_provider_contract"]
                         and check["fallback_routes_stream_response_bodies"] for check in route_precedence)),
@@ -2961,6 +3117,9 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
             "request_path_before_provider_rewrite": "/models-as-a-service/demo/v1/chat/completions",
             "selected_paths_after_translation": {"messages": "/v1/messages", "openai-chat": "/v1/chat/completions"}})
     route_trace_gateway_pod = install_runtime_route_trace()
+    route_trace_gateway_pod = wait_gateway_ready_stable("externalmodel-before-traffic")
+    refresh_gateway_port_forward("externalmodel-before-traffic")
+    externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
     no_key_marker = "externalmodel-no-maas-client-key-bedrock-route"
     no_key_request_id = f"{ROUTE_TRACE_PREFIX}no-maas-client-key"
     no_key_callbacks_before = callback_log_snapshot()
@@ -3002,6 +3161,9 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
     ]
     routing_diagnostic_clusters = sorted(set(provider_route_clusters + fallback_clusters))
     capture_provider_cluster_endpoints("before-mixed-provider-samples", routing_diagnostic_clusters)
+    route_trace_gateway_pod = wait_gateway_ready_stable("externalmodel-before-valid-request")
+    refresh_gateway_port_forward("externalmodel-before-valid-request")
+    externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
     base_pod_uids = sorted(pod["uid"] for pod in both["pods"] if pod["ready"] and not pod["deleting"])
 
     mixed_counts = {"openai-chat": 0, "messages": 0}
@@ -4025,6 +4187,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
         {"model": "demo", "max_tokens": 32, "stream": True,
          "messages": [{"role": "user", "content": cancel_marker}]},
         extra_headers=["x-provider-format: openai-chat"])
+    cancel_drain_seconds = wait_for_cancelled_stream_drain()
     cancel_observation = wait_provider_observation(
         lambda item: cancel_marker in item.get("message_text", []), "canceled Anthropic SSE")
     anthro_again_served = wait_externalmodel_revision({"provider-api-translation-anthropic"},
@@ -4033,6 +4196,8 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
             json.dumps({"spec": {"externalProviderRefs": openai_active}}))
     after_cancel = wait_externalmodel_revision({"provider-api-translation-openai"}, "after-cancel-openai",
         changed_from=anthro_again["published_digest"])
+    wait_for_externalmodel_route("demo-model/provider-api-translation-openai", "/v1/chat/completions",
+                                "after-cancel-openai")
     record("externalmodel_cancellation_is_request_scoped",
            cancel_status == "200" and b"data:" in first_event and cancel_observation.get("path") == "/v1/messages"
            and after_cancel["published_digest"] != anthro_again["published_digest"]
@@ -4041,6 +4206,7 @@ def test_externalmodel_provider_aware_translation(auth_file, gateway_auth_contex
                    for pod in anthro_again_served["pods"] if pod["ready"] and not pod["deleting"]),
            {"canceled_stream_status": cancel_status, "first_event_received": bool(first_event),
             "canceled_stream_provider_path": cancel_observation.get("path"),
+            "canceled_stream_drain_wait_seconds": cancel_drain_seconds,
             "canceled_stream_revision": anthro_again["published_digest"],
             "next_published_revision": after_cancel["published_digest"]})
     next_marker = "externalmodel-after-cancel-openai"
@@ -4458,7 +4624,6 @@ def capture_auth_diagnostics_on_failure():
 def cleanup():
     global KEY_ID, MTC_ORIGINAL, MTC_CAPTURED, EXTERNAL_MODEL_CHANGED, PROVIDER_AWARE_CREATED
     global DIAGNOSTIC_ROUTE_AUTH_CREATED
-    global EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256
     if KEY_ID and API_PORT and (TEMP / "admin.cfg").exists():
         ca_file = TEMP / "maas-api-ca.crt"
         host = f"maas-api.maas-system.svc.cluster.local:{API_PORT}:127.0.0.1"
@@ -4524,57 +4689,6 @@ def cleanup():
     else:
         (EVIDENCE / "externalmodel-fixture-cleanup.txt").write_text(
             "ExternalModel fixture was not changed; no provider fixture resources were created.\n")
-    if EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC is not None:
-        current = kubectl("-n", NAMESPACE, "get", "authpolicy", "external-model-auth", "-o", "json",
-                          check=False)
-        current_spec = json.loads(current.stdout).get("spec") if current.returncode == 0 else None
-        current_hash = hashlib.sha256(json.dumps(
-            current_spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if current_spec else None
-        original_spec_hash = hashlib.sha256(json.dumps(
-            EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        diagnostic_rule_present = bool(
-            current_spec and current_spec.get("rules", {}).get("authorization", {}).get("diagnostic-allow"))
-        if current_hash == original_spec_hash:
-            policy_restored = True
-            after_hash = current_hash
-        elif current_hash == EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 or diagnostic_rule_present:
-            patch = json.dumps([{"op": "replace", "path": "/spec",
-                                 "value": EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC}])
-            restored = kubectl("-n", NAMESPACE, "patch", "authpolicy", "external-model-auth",
-                               "--type=json", "-p", patch, check=False)
-            if restored.returncode == 0:
-                try:
-                    wait_auth_policy("external-model-auth", namespace=NAMESPACE)
-                    after = json.loads(kubectl("-n", NAMESPACE, "get", "authpolicy",
-                                               "external-model-auth", "-o", "json").stdout)
-                    after_hash = hashlib.sha256(json.dumps(
-                        after.get("spec"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                    original_hash = hashlib.sha256(json.dumps(
-                        EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, sort_keys=True,
-                        separators=(",", ":")).encode()).hexdigest()
-                    policy_restored = after_hash == original_hash
-                except (RuntimeError, json.JSONDecodeError):
-                    policy_restored = False
-                    after_hash = None
-            else:
-                policy_restored = False
-                after_hash = None
-            if not policy_restored:
-                CLEANUP_FAILURES.append("ExternalModel AuthPolicy did not restore to its saved spec")
-        else:
-            policy_restored = False
-            after_hash = current_hash
-            CLEANUP_FAILURES.append("ExternalModel AuthPolicy changed unexpectedly; cleanup left it untouched")
-        save_json(EVIDENCE / "external-model-auth-policy-restore.json", {
-            "resource": f"{NAMESPACE}/external-model-auth",
-            "original_spec_sha256": original_spec_hash,
-            "diagnostic_spec_sha256": EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256,
-            "restored_spec_sha256": after_hash,
-            "restored": policy_restored,
-            "resource_version_saved": False,
-        })
-        EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = None
-        EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = None
     if DIAGNOSTIC_ROUTE_AUTH_CREATED:
         removed = kubectl(
             "-n", NAMESPACE, "delete", "authpolicy", "api-translation-messages-auth",
@@ -4621,19 +4735,12 @@ def main():
                         help="optionally qualify one live provider or all through the deployed Gateway; Bedrock reads the local Bedrock key entry and accepts BEDROCK_MANTLE_REGION/MODEL overrides")
     parser.add_argument("--diagnostic-route-auth", action="store_true",
                         help="use run-owned route AuthPolicies that validate the MaaS key directly; diagnostic only, not final Gateway auth qualification")
-    parser.add_argument("--diagnostic-bypass-auth", action="store_true",
-                        help="temporarily allow only the existing ExternalModel test route to isolate translation; restores its AuthPolicy and is not final Gateway qualification")
     args = parser.parse_args()
-    if args.diagnostic_route_auth and args.diagnostic_bypass_auth:
-        parser.error("choose one diagnostic auth mode")
-    if args.diagnostic_bypass_auth and args.scope != "externalmodel":
-        parser.error("--diagnostic-bypass-auth is limited to --scope externalmodel")
     LIVE_PROVIDER_SELECTION = args.live_provider
     if LIVE_PROVIDER_SELECTION and args.scope == "shared":
         parser.error("--live-provider requires --scope externalmodel or --scope all")
     RESULT["scope"] = args.scope
     RESULT["authentication_mode"] = (
-        "diagnostic_externalmodel_route_allow_only" if args.diagnostic_bypass_auth else
         "diagnostic_route_targeted_maas_key_validation" if args.diagnostic_route_auth else
         "installed_maas_gateway_authpolicy"
     )
@@ -4784,15 +4891,12 @@ def main():
     route_openai = wait_route("api-translation-openai")
     externalmodel_auth_policy = None
     gateway_auth_context = {}
-    if args.scope == "externalmodel":
+    gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
+    maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
+    if args.scope != "shared":
         # ExternalModel routes inherit MaaS's controller-owned Gateway
         # AuthPolicy. A fixture route policy would shadow this contract.
-        gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
-        maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
         externalmodel_auth_policy = route_target_auth_policies("external-model-demo-model")
-    else:
-        gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
-        maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
     rate_limit_messages = wait_rate_limit_policy("api-translation-messages-rate-limit")
     rate_limit_openai = wait_rate_limit_policy("api-translation-openai-rate-limit")
     gateway_policy_conditions = gateway_auth_policy.get("status", {}).get("conditions", [])
@@ -4800,7 +4904,7 @@ def main():
                                   for condition in gateway_policy_conditions)
     gateway_policy_enforced = any(condition.get("type") == "Enforced" and condition.get("status") == "True"
                                   for condition in gateway_policy_conditions)
-    route_auth_policies_absent = (args.scope != "externalmodel"
+    route_auth_policies_absent = (args.scope == "shared"
                                   or (externalmodel_auth_policy.get("exit_status") == 0
                                       and not externalmodel_auth_policy.get("policies")))
     gateway_policy_config = safe_authpolicy_config_snapshot("before-externalmodel-traffic")
@@ -4831,7 +4935,7 @@ def main():
     }
     record("routes_and_auth_policies",
            gateway_policy_accepted and gateway_policy_enforced
-           and (args.scope != "externalmodel" or (
+           and (args.scope == "shared" or (
                gateway_auth_context["maas_auth_policy_ready"]
                and gateway_auth_context["maas_auth_policy_no_conflict"]
                and route_auth_policies_absent)), {
@@ -5026,8 +5130,6 @@ def main():
         record("externalmodel_translation_permission_projected", external_config_ready,
                {"authoritative_setting": "MaasTenantConfig.spec.apiTranslation.enabled",
                 "enabled": external_config_ready})
-        if args.diagnostic_bypass_auth:
-            enable_externalmodel_diagnostic_bypass_auth()
         test_externalmodel_provider_aware_translation(auth_cfg, gateway_auth_context)
         if LIVE_PROVIDER_SELECTION:
             selected = (("anthropic", "openai", "bedrock") if LIVE_PROVIDER_SELECTION == "all"
@@ -5054,13 +5156,13 @@ def main():
             "PASS" if live_complete else "PARTIAL" if LIVE_PROVIDER_SELECTION else "NOT_RUN"
         )
         RESULT["status"] = (
-            "PARTIAL" if args.diagnostic_bypass_auth or (LIVE_PROVIDER_SELECTION and not live_complete)
+            "PARTIAL" if LIVE_PROVIDER_SELECTION and not live_complete
             else "PASS"
         )
         RESULT["other_scope_status"] = "NOT_RUN"
         RESULT["authentication_mode"] = (
-            "diagnostic_externalmodel_route_bypass; not final Gateway authorization qualification"
-            if args.diagnostic_bypass_auth else "production AuthPolicy"
+            "diagnostic route-targeted MaaS-key validation"
+            if args.diagnostic_route_auth else "production AuthPolicy"
         )
         save_json(RESULTS, RESULT)
         return
