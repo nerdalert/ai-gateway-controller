@@ -974,10 +974,22 @@ PY
       # the later ownership check for any surviving deployment.
       "${KCTL[@]}" -n maas-system delete "$resource" --ignore-not-found --wait=true >/dev/null || true
     done
-    if "${KCTL[@]}" -n maas-system get deployment "$deployment_name" -o json 2>/dev/null \
-      | jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller"' >/dev/null; then
-      :
-    elif "${KCTL[@]}" -n maas-system get deployment "$deployment_name" >/dev/null 2>&1; then
+    handoff_ready=false
+    for _ in $(seq 1 60); do
+      deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$deployment_name" -o json 2>/dev/null || true)
+      if [[ -z "$deployment_json" ]]; then
+        handoff_ready=true
+        break
+      fi
+      if jq -e '.metadata.labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller"' \
+        <<<"$deployment_json" >/dev/null; then
+        handoff_ready=true
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$handoff_ready" != true ]]; then
+      printf '%s\n' "$deployment_json" >"$EVIDENCE/${deployment_name}-handoff-timeout.json"
       fail "$deployment_name survived handoff without controller ownership"
       exit 2
     fi

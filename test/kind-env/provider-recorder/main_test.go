@@ -108,6 +108,19 @@ func TestAnthropicOverlayReloadStreamUsesDedicatedDelay(t *testing.T) {
 	}
 }
 
+func TestBedrockOverlayReloadStreamUsesDedicatedDelay(t *testing.T) {
+	t.Setenv("BEDROCK_OVERLAY_RELOAD_STREAM_EVENT_DELAY", "40s")
+
+	requestBody := map[string]any{
+		"messages": []any{map[string]any{
+			"role": "user", "content": "externalmodel-overlay-reload-active-bedrock-stream",
+		}},
+	}
+	if got := bedrockOverlayReloadDelay(requestBody); got != 40*time.Second {
+		t.Errorf("Bedrock overlay reload stream delay = %s, want 40s", got)
+	}
+}
+
 func TestOpenAILargeJSONFixtureExceedsTranslationResponseLimit(t *testing.T) {
 	t.Parallel()
 

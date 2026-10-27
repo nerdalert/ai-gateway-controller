@@ -317,7 +317,7 @@ func (config recorderConfig) writeProviderAwareResponse(w http.ResponseWriter, r
 
 func (config recorderConfig) anthropicStreamDelay(requestBody map[string]any) time.Duration {
 	if config.overlayReloadDelay > 0 && hasMessageMarker(requestBody,
-		"externalmodel-overlay-reload-active-anthropic-stream", "externalmodel-overlay-reload-active-bedrock-stream") {
+		"externalmodel-overlay-reload-active-anthropic-stream") {
 		return config.overlayReloadDelay
 	}
 	return config.streamEventDelay
@@ -333,6 +333,17 @@ func durationFromEnv(name string) time.Duration {
 		log.Fatalf("%s must be a non-negative Go duration", name)
 	}
 	return duration
+}
+
+func bedrockOverlayReloadDelay(requestBody map[string]any) time.Duration {
+	if !hasMessageMarker(requestBody, "externalmodel-overlay-reload-active-bedrock-stream") {
+		return 0
+	}
+	delay, err := time.ParseDuration(os.Getenv("BEDROCK_OVERLAY_RELOAD_STREAM_EVENT_DELAY"))
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return delay
 }
 
 func readCredential(envName string) string {
@@ -685,10 +696,8 @@ func writeOpenAIResponse(w http.ResponseWriter, requestBody map[string]any) {
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
 		streamEventDelay, _ := time.ParseDuration(os.Getenv("STREAM_EVENT_DELAY"))
-		if hasMessageMarker(requestBody, "externalmodel-overlay-reload-active-bedrock-stream") {
-			if overlayDelay, err := time.ParseDuration(os.Getenv("OVERLAY_RELOAD_STREAM_EVENT_DELAY")); err == nil && overlayDelay > 0 {
-				streamEventDelay = overlayDelay
-			}
+		if overlayDelay := bedrockOverlayReloadDelay(requestBody); overlayDelay > 0 {
+			streamEventDelay = overlayDelay
 		}
 		stop := "stop"
 		events := []openAIStreamEvent{
