@@ -9,6 +9,20 @@ spec:
     labels:
       gateway.networking.k8s.io/gateway-name: maas-default-gateway
   configPatches:
+    # Envoy's default per-connection buffering limit is 1 MiB. The ExternalModel
+    # pre-auth ExtProc uses BUFFERED to extract the model before authorization,
+    # so the listener allows a 2 MiB body plus bounded header/protocol overhead.
+    # This listener-level soft buffer limit applies to both downstream request
+    # and response buffering/flow control on the selected Gateway. The
+    # Anthropic JSON translator's explicit 1 MiB response limit remains
+    # separate, but other traffic can also use this bounded listener budget.
+    - applyTo: LISTENER
+      match:
+        context: GATEWAY
+      patch:
+        operation: MERGE
+        value:
+          per_connection_buffer_limit_bytes: 2162688
     # ExternalModel pre-auth is fail-closed. It is disabled at the virtual-host
     # level and enabled only on controller-owned ExternalModel routes so an
     # unavailable model-extraction processor cannot trust caller headers.
