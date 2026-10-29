@@ -212,6 +212,15 @@ rg -q 'set image "deployment/\$api_deployment" "maas-api=\$\{MAAS_API_RUNTIME_IM
   echo "tenant API Deployments do not select the run-owned source image" >&2
   exit 1
 }
+rg -q 'shared-translation-auth-diagnostic\.yaml.*continue' <<<"$run_source" || {
+  echo "default manifest provisioning does not exclude the opt-in translation diagnostic AuthPolicies" >&2
+  exit 1
+}
+if ! rg -q 'if args\.diagnostic_route_auth:' "$ROOT/test/kind-env/e2e-api-translation.py" ||
+  ! rg -q 'shared-translation-auth-diagnostic\.yaml' "$ROOT/test/kind-env/e2e-api-translation.py"; then
+    echo "translation diagnostic AuthPolicies are not applied only through their explicit opt-in" >&2
+    exit 1
+fi
 if rg -q 'patch deployment maas-api|patch deployment "\$api_deployment"' <<<"$run_source"; then
   echo "the harness overrides MaaS API imagePullPolicy instead of satisfying its Always pull" >&2
   exit 1
@@ -264,6 +273,23 @@ rg -q 'extproc_head.*EXPECTED_EXTPROC_SOURCE_SHA' <<<"$run_source" || {
   echo "ExtProc provenance gate does not require the configured exact source SHA" >&2
   exit 1
 }
+
+for policy_fixture in \
+  "$ROOT/test/kind-env/manifests/50-route-policies.yaml" \
+  "$ROOT/test/kind-env/manifests/51-route-policies-tenant-b.yaml"; do
+  if rg -n '^[[:space:]]*kind:[[:space:]]*AuthPolicy[[:space:]]*$' "$policy_fixture" >/dev/null; then
+    echo "ExternalModel fixture $policy_fixture must not add a route AuthPolicy over the MaaSAuthPolicy" >&2
+    exit 1
+  fi
+done
+if ! rg -q 'wait_normal_auth_policy' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'ConflictingAuthPolicy' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'invalid_key_no_provider_contact' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'timeout 5s kubectl --context "kind-\$CLUSTER" -n "\$API_NS" logs deploy/maas-api' "$ROOT/test/kind-env/e2e-extproc.sh" ||
+  ! rg -q 'maas_validation_and_subscription_callbacks' "$ROOT/test/kind-env/e2e-extproc.sh"; then
+  echo "base E2E does not gate on MaaS policy ownership and credential denial before provider contact" >&2
+  exit 1
+fi
 
 ready_pods=$(jq -r -f "$ROOT/test/kind-env/controller-ready-manager-pods.jq" <<'JSON'
 {"items":[
@@ -359,3 +385,20 @@ if rg -q '^kind: AuthPolicy$' "$ROOT/test/kind-env/manifests/51-route-policies-t
   echo "tenant B must inherit the MaaS Gateway policy, as tenant A does" >&2
   exit 1
 fi
+
+(
+  eval "$(sed -n '/^provider_request_count() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  CLUSTER=contract-test
+  API_NS=maas-system
+  timeout() { printf '%s\n' 'GET /health' 'POST /v1/chat/completions'; }
+  [[ "$(provider_request_count katan-a)" == 1 ]] || { echo 'provider request count must reflect successful log reads' >&2; exit 1; }
+  timeout() { printf '%s\n' 'GET /health'; }
+  [[ "$(provider_request_count katan-a)" == 0 ]] || { echo 'successful logs with no requests must count as zero' >&2; exit 1; }
+  timeout() { return 124; }
+  if provider_request_count katan-a; then
+    echo 'failed provider log reads must not be treated as zero provider contact' >&2
+    exit 1
+  fi
+)
+
+echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, and provider-log failure handling)."
