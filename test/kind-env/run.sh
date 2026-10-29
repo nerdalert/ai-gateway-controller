@@ -976,7 +976,10 @@ PY
     done
     handoff_ready=false
     for _ in $(seq 1 60); do
-      deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$deployment_name" -o json 2>/dev/null || true)
+      if ! deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$deployment_name" --ignore-not-found -o json 2>/dev/null); then
+        sleep 1
+        continue
+      fi
       if [[ -z "$deployment_json" ]]; then
         handoff_ready=true
         break
@@ -990,7 +993,7 @@ PY
     done
     if [[ "$handoff_ready" != true ]]; then
       printf '%s\n' "$deployment_json" >"$EVIDENCE/${deployment_name}-handoff-timeout.json"
-      fail "$deployment_name survived handoff without controller ownership"
+      fail "$deployment_name handoff could not be verified: Deployment reads failed or controller ownership is absent"
       exit 2
     fi
   done
