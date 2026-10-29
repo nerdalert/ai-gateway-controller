@@ -399,12 +399,31 @@ wait_normal_auth_policy() {
 
 maas_callback_counts() {
   local logs
-  logs=$(timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deploy/maas-api --all-containers=true --since=1h 2>/dev/null || true)
+  logs=$(timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs deploy/maas-api --all-containers=true --since=1h 2>/dev/null) || return 1
   awk '
     index($0,"/internal/v1/api-keys/validate") { validation++ }
     index($0,"/internal/v1/subscriptions/select") { selection++ }
     END { printf "%d %d\n", validation, selection }
   ' <<<"$logs"
+}
+
+record_maas_callback_assertion() {
+  local before=$1 after=$2 request_id=$3
+  local validation_before subscription_before validation_after subscription_after
+  local validation_delta subscription_delta
+  if [[ "$before" == unavailable || "$after" == unavailable ]]; then
+    record 44 maas_validation_and_subscription_callbacks FAIL "callback_logs_unavailable=true request_id=$request_id"
+    return 0
+  fi
+  read -r validation_before subscription_before <<<"$before"
+  read -r validation_after subscription_after <<<"$after"
+  validation_delta=$((validation_after-validation_before))
+  subscription_delta=$((subscription_after-subscription_before))
+  if (( validation_delta >= 1 && subscription_delta >= 1 )); then
+    record 44 maas_validation_and_subscription_callbacks PASS "validation_delta=$validation_delta subscription_selection_delta=$subscription_delta request_id=$request_id"
+  else
+    record 44 maas_validation_and_subscription_callbacks FAIL "validation_delta=$validation_delta subscription_selection_delta=$subscription_delta request_id=$request_id"
+  fi
 }
 
 write_model_override_secret() {
@@ -519,22 +538,14 @@ if [[ "$invalid_after" == "$invalid_before" ]]; then record 42 invalid_key_no_pr
 normal_auth_request_id="aigc-kind-$CLUSTER-provider-a-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 normal_auth_request_cfg="$TMP_DIR/normal-auth-request-id.cfg"; printf 'header = "x-request-id: %s"\n' "$normal_auth_request_id" >"$normal_auth_request_cfg"
 printf 'request_id=%s\n' "$normal_auth_request_id" >"$EVIDENCE/normal-auth-request-id.txt"
-callbacks_before=$(maas_callback_counts)
-read -r validation_callbacks_before subscription_callbacks_before <<<"$callbacks_before"
+callbacks_before=$(maas_callback_counts) || callbacks_before=unavailable
 provider_a_before=$(provider_request_count katan-a)
 a=$(gateway provider_a "$AUTH_CFG" "$normal_auth_request_cfg"); status_assert 11 provider_a_request 200 "$a"; write_result request provider_a "$a" "A"
 provider_a_after=$(provider_request_count katan-a)
-callbacks_after=$(maas_callback_counts)
-read -r validation_callbacks_after subscription_callbacks_after <<<"$callbacks_after"
-validation_callback_delta=$((validation_callbacks_after-validation_callbacks_before))
-subscription_callback_delta=$((subscription_callbacks_after-subscription_callbacks_before))
+callbacks_after=$(maas_callback_counts) || callbacks_after=unavailable
 printf 'request_id=%s\ncallback_counts_before=%s\ncallback_counts_after=%s\nprovider_receipts_before=%s\nprovider_receipts_after=%s\n' \
   "$normal_auth_request_id" "$callbacks_before" "$callbacks_after" "$provider_a_before" "$provider_a_after" >"$EVIDENCE/normal-auth-request-outcome.txt"
-if (( validation_callback_delta >= 1 && subscription_callback_delta >= 1 )); then
-  record 44 maas_validation_and_subscription_callbacks PASS "validation_delta=$validation_callback_delta subscription_selection_delta=$subscription_callback_delta request_id=$normal_auth_request_id"
-else
-  record 44 maas_validation_and_subscription_callbacks FAIL "validation_delta=$validation_callback_delta subscription_selection_delta=$subscription_callback_delta request_id=$normal_auth_request_id"
-fi
+record_maas_callback_assertion "$callbacks_before" "$callbacks_after" "$normal_auth_request_id"
 if (( provider_a_after-provider_a_before == 1 )); then record 43 valid_key_exactly_one_provider_receipt PASS "provider_receipt_delta=1 request_id=$normal_auth_request_id"; else record 43 valid_key_exactly_one_provider_receipt FAIL "provider_receipt_delta=$((provider_a_after-provider_a_before)) request_id=$normal_auth_request_id"; fi
 provider_a_body=$(cat "$EVIDENCE/provider_a-response.json")
 if [[ "$a" == 200 && "$provider_a_body" == *katan-a-* && "$provider_a_body" != *katan-b-* ]]; then

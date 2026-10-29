@@ -172,4 +172,28 @@ JSON
   fi
 )
 
-echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, and provider-log failure handling)."
+(
+  eval "$(sed -n '/^maas_callback_counts() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  eval "$(sed -n '/^record_maas_callback_assertion() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  CLUSTER=contract-test
+  API_NS=maas-system
+  timeout() { printf '%s\n' '/internal/v1/api-keys/validate' '/internal/v1/subscriptions/select'; }
+  [[ "$(maas_callback_counts)" == '1 1' ]] || { echo 'MaaS callbacks must reflect successful log reads' >&2; exit 1; }
+  timeout() { printf '%s\n' 'GET /health'; }
+  [[ "$(maas_callback_counts)" == '0 0' ]] || { echo 'successful logs without callbacks must count as zero' >&2; exit 1; }
+  timeout() { printf '%s\n' '/internal/v1/api-keys/validate'; return 124; }
+  if maas_callback_counts; then
+    echo 'failed or partial MaaS log reads must not produce callback counts' >&2
+    exit 1
+  fi
+  record() { [[ "$1" == 44 && "$2" == maas_validation_and_subscription_callbacks && "$3" == "$expected" ]]; }
+  expected=FAIL
+  record_maas_callback_assertion unavailable '10 10' request-test
+  record_maas_callback_assertion '10 10' unavailable request-test
+  record_maas_callback_assertion unavailable unavailable request-test
+  record_maas_callback_assertion '10 10' '10 11' request-test
+  expected=PASS
+  record_maas_callback_assertion '10 10' '11 11' request-test
+)
+
+echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, provider-log failure handling, and MaaS callback-log failure handling)."
