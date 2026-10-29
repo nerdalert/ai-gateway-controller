@@ -65,27 +65,54 @@ maas_selector=$(maas_api_deployment_pod_selector "$maas_deployment")
   echo "MaaS API pod selector omitted the unique tenant-instance label: $maas_selector" >&2
   exit 1
 }
-maas_image_digest='127.0.0.1:32768/maas-api@sha256:run'
+maas_image_digest='127.0.0.1:32768/maas-api@sha256:index'
+maas_node_repo_digests='127.0.0.1:32768/maas-api@sha256:platform,127.0.0.1:32768/maas-api@sha256:index'
 maas_pods='{"items":[{"metadata":{"name":"old","deletionTimestamp":null},"spec":{"containers":[{"name":"maas-api","image":"maas-api:old"}]},"status":{"phase":"Running","containerStatuses":[{"name":"maas-api","ready":true,"image":"maas-api:old","imageID":"127.0.0.1:32768/maas-api@sha256:old"}]}},{"metadata":{"name":"terminating-new","deletionTimestamp":"2026-10-19T00:00:00Z"},"spec":{"containers":[{"name":"maas-api","image":"maas-api:run"}]},"status":{"phase":"Running","containerStatuses":[{"name":"maas-api","ready":true,"image":"maas-api:alias","imageID":"127.0.0.1:32768/maas-api@sha256:run"}]}}]}'
-if maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest"; then
+if maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest" "$maas_node_repo_digests"; then
   echo "MaaS API runtime check accepted only stale or terminating pods" >&2
   exit 1
 fi
 maas_pods=$(jq -c --arg digest "$maas_image_digest" '.items += [{"metadata":{"name":"current","deletionTimestamp":null},"spec":{"containers":[{"name":"maas-api","image":"maas-api:run"}]},"status":{"phase":"Running","containerStatuses":[{"name":"maas-api","ready":true,"image":"maas-api:alias","imageID":$digest}]}}]' <<<"$maas_pods")
-maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest" || {
-  echo "MaaS API runtime check rejected the requested run tag and exact digest when status.image reported an older alias" >&2
+maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest" "$maas_node_repo_digests" || {
+  echo "MaaS API runtime check rejected a requested run tag and node-verified digest alias" >&2
   exit 1
 }
-if maas_api_pods_have_exact_ready_image "$(jq -c '.items[2].status.containerStatuses[0].imageID = "127.0.0.1:32768/maas-api@sha256:wrong"' <<<"$maas_pods")" "maas-api:run" "$maas_image_digest"; then
+maas_pods=$(jq -c '.items[2].status.containerStatuses[0].imageID = "127.0.0.1:32768/maas-api@sha256:platform"' <<<"$maas_pods")
+maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest" "$maas_node_repo_digests" || {
+  echo "MaaS API runtime check rejected a platform-manifest alias from the verified node image" >&2
+  exit 1
+}
+if maas_api_pods_have_exact_ready_image "$(jq -c '.items[2].status.containerStatuses[0].imageID = "127.0.0.1:32768/maas-api@sha256:wrong"' <<<"$maas_pods")" "maas-api:run" "$maas_image_digest" "$maas_node_repo_digests"; then
   echo "MaaS API runtime check accepted a pod with a different runtime digest" >&2
   exit 1
 fi
-if maas_api_pods_have_exact_ready_image "$(jq -c '.items[2].spec.containers[0].image = "maas-api:old"' <<<"$maas_pods")" "maas-api:run" "$maas_image_digest"; then
+if maas_api_pods_have_exact_ready_image "$(jq -c '.items[2].spec.containers[0].image = "maas-api:old"' <<<"$maas_pods")" "maas-api:run" "$maas_image_digest" "$maas_node_repo_digests"; then
   echo "MaaS API runtime check accepted a pod that did not request the run tag" >&2
+  exit 1
+fi
+if maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image_digest" "127.0.0.1:32768/maas-api@sha256:platform"; then
+  echo "MaaS API runtime check accepted node digests without the expected pushed digest" >&2
   exit 1
 fi
 
 run_source=$(<"$ROOT/test/kind-env/run.sh")
+authorino_gate=$(sed -n '/authorino_deployment_ready=false/,/set env deployment\/authorino/p' "$ROOT/test/kind-env/run.sh")
+rg -q 'authorino_deployment_deadline=\$\(\(SECONDS \+ 180\)\)' <<<"$authorino_gate" || {
+  echo "Authorino Deployment readiness wait is not bounded to 180 seconds" >&2
+  exit 1
+}
+rg -q 'maas-api-serving-ca.*authorino-maas-api-ca' <<<"$authorino_gate" || {
+  echo "Authorino readiness does not require the run-owned MaaS CA projection" >&2
+  exit 1
+}
+rg -q 'rollout status deployment/authorino --timeout=8s' <<<"$authorino_gate" || {
+  echo "Authorino readiness does not wait for its projected-CA Deployment rollout" >&2
+  exit 1
+}
+rg -q 'authorino-readiness-timeout-events.txt' <<<"$authorino_gate" || {
+  echo "Authorino readiness timeout does not preserve workload/event diagnostics" >&2
+  exit 1
+}
 rg -q 'KIND_EXPERIMENTAL_DOCKER_NETWORK="\$REGISTRY_NETWORK" kind create cluster' <<<"$run_source" || {
   echo "Kind cluster creation does not use the run-owned registry network" >&2
   exit 1
@@ -119,6 +146,54 @@ if rg -q 'patch deployment maas-api|patch deployment "\$api_deployment"' <<<"$ru
   exit 1
 fi
 
+route_policy_manifest=$(<"$ROOT/test/kind-env/manifests/50-route-policies.yaml")
+if rg -q '^kind: AuthPolicy$' <<<"$route_policy_manifest"; then
+  echo "ExternalModel route fixture must inherit MaaS Gateway AuthPolicy instead of adding a conflicting AuthPolicy" >&2
+  exit 1
+fi
+rg -q '^kind: TokenRateLimitPolicy$' <<<"$route_policy_manifest" || {
+  echo "ExternalModel route fixture lost its token-rate-limit policy" >&2
+  exit 1
+}
+translation_source=$(<"$ROOT/test/kind-env/e2e-api-translation.py")
+rg -q 'remove_stale_externalmodel_auth_fixture' <<<"$translation_source" || {
+  echo "translation E2E does not safely remove the exact known legacy AuthPolicy fixture" >&2
+  exit 1
+}
+rg -q 'metadata.get\("uid"\) == DIAGNOSTIC_BYPASS_AUTH_UID' <<<"$translation_source" || {
+  echo "diagnostic AuthPolicy cleanup does not verify its recorded UID" >&2
+  exit 1
+}
+rg -q 'ConflictingAuthPolicy' <<<"$translation_source" || {
+  echo "MaaS AuthPolicy readiness does not reject conflicting route policies" >&2
+  exit 1
+}
+rg -q 'praxis_extproc_body_size_rejections_total' <<<"$translation_source" || {
+  echo "request-size qualification does not attribute ExtProc's selected-upstream limit" >&2
+  exit 1
+}
+rg -q 'selected-upstream input guard before body translation' <<<"$translation_source" || {
+  echo "request-size evidence does not identify the ExtProc guard accurately" >&2
+  exit 1
+}
+if rg -q 'rejected_by_translation_filter|Praxis AI OpenAI-to-Anthropic request-size check' <<<"$translation_source"; then
+  echo "request-limit assertion still attributes ExtProc rejection to the AI translator" >&2
+  exit 1
+fi
+rg -q 'translator_max_request_body_bytes' "$ROOT/test/kind-env/api_translation_contract.py" || {
+  echo "mounted configuration parser does not distinguish request and response limits" >&2
+  exit 1
+}
+
+if rg -q '\[\[ "\$extproc_branch" == main' <<<"$run_source"; then
+  echo "ExtProc provenance gate incorrectly requires a branch name instead of matching source revision" >&2
+  exit 1
+fi
+rg -q 'extproc_head.*EXPECTED_EXTPROC_MAIN_SHA' <<<"$run_source" || {
+  echo "ExtProc provenance gate does not require the configured exact source SHA" >&2
+  exit 1
+}
+
 ready_pods=$(jq -r -f "$ROOT/test/kind-env/controller-ready-manager-pods.jq" <<'JSON'
 {"items":[
   {"metadata":{"name":"current","deletionTimestamp":null},"spec":{"nodeName":"kind-node"},"status":{"phase":"Running","containerStatuses":[{"name":"manager","ready":true,"imageID":"containerd://sha256:current","image":"controller:tag"}]}},
@@ -131,4 +206,4 @@ JSON
   exit 1
 }
 
-echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, and exact MaaS runtime image identity)."
+echo "Kind run harness contracts passed (image identity, terminating-pod exclusion, and bounded Authorino CA-mount readiness)."

@@ -172,6 +172,12 @@ the real API emits it and TLS fingerprints. Direct API key creation is only
 fixture setup and is not counted as callback proof. No key or Authorization
 value is written to evidence.
 
+After applying the run-owned CA to the Authorino resource, provisioning waits
+for the operator-generated Authorino Deployment to mount that ConfigMap and
+finish its rollout before configuring the process trust environment. This is a
+bounded readiness gate; timeout evidence includes the Authorino resource,
+workloads, and namespace events.
+
 The current route-scoped Kind fixture observes API-key validation and the full
 authorized ExtProc request. The generated AuthPolicy is inspected before
 classifying subscription-selection callback evidence: if the policy requires
@@ -179,6 +185,18 @@ classifying subscription-selection callback evidence: if the policy requires
 qualification; if it does not, the behavior is recorded separately as
 `NOT_DEMONSTRATED` and is excluded from the functional routing total. No
 canned response or synthetic MaaS service is used.
+
+The ExternalModel HTTPRoute inherits authentication from MaaS's Gateway
+AuthPolicy. The Kind fixture attaches only its token-rate-limit policy to that
+route; it must not add a second route-targeted AuthPolicy. MaaS reports
+`ConflictingAuthPolicy=True` when another AuthPolicy targets a MaaS-managed
+route, and that conflict can change the normal Gateway authorization result.
+Before qualification, the harness removes only the exact old `local-env`
+`external-model-auth` fixture after verifying its UID, ownership label, and
+HTTPRoute target. It fails if any other route AuthPolicy remains or MaaS still
+reports the conflict. Diagnostic bypass mode, when explicitly requested,
+creates a separately named run-owned policy and deletes it only after UID and
+ownership checks; it is never counted as normal-auth qualification.
 
 This proves single-tenant MaaS authorization callback compatibility. It does
 not prove tenant-aware dispatch for multiple tenant-qualified MaaS APIs; that
@@ -289,18 +307,85 @@ the selected provider is OpenAI-compatible. The setting therefore opts into
 both API conversion and this provider-specific target-model mapping; there is
 not currently a separate switch for target-model rewriting.
 
+For Anthropic candidates, the translator chooses `max_completion_tokens`
+before `max_tokens` and defaults to 4096 when both are omitted. It accepts and
+discards `user`, `n`, `seed`, and `parallel_tool_calls` after validating their
+types; this does not provide multiple completions or deterministic generation.
+Text and supported `image_url` blocks are converted in order. Base64 data URLs
+become Anthropic base64 image sources, while HTTPS image URLs are passed to the
+provider without the Gateway fetching them. Other unknown request fields and
+unsupported content remain rejected.
+
 When translation is enabled, the selected-provider request filter applies a
-1 MiB limit before model validation and target-model rewriting, including for
-OpenAI-compatible candidates; larger requests are rejected before the upstream
-provider. The dedicated ExtProc process uses a 10 MiB accumulation ceiling for
-that translation configuration. The Kind request-limit probe currently observes
-Envoy's preselection 413 before the request reaches Praxis, so it does not
-qualify the filter's 1 MiB limit. With translation disabled, the translation
-filter and its bounds are absent and the main `allow_unbounded_body` setting is
-retained. For Anthropic JSON responses, the translator buffers chunks in
-request-local filter state and enforces its 1 MiB limit. SSE remains
-incremental, and OpenAI-compatible responses pass through without this response
-buffer or limit.
+2 MiB request limit before model validation, provider-format branching, and
+target-model rewriting. This is a limit on the incoming client body and also
+applies to OpenAI-compatible providers while the translation profile is
+enabled. After translation or target-model rewriting, ExtProc separately caps
+the provider-bound body at its configured 10 MiB accumulation ceiling. This
+allows bounded conversion overhead without charging it against the client's
+input allowance twice. The Anthropic JSON response limit remains 1 MiB;
+response SSE remains incremental. The ExtProc gRPC transport's default 4 MiB
+message limit has room for a 2 MiB body plus protocol overhead.
+
+Envoy buffers the request before pre-auth model extraction. The harness raises
+the selected Gateway listeners' connection buffer cap from Envoy's 1 MiB
+default to 2 MiB plus 64 KiB of bounded headroom. This is Gateway-wide because
+the pinned Envoy version has no route-scoped ExtProc buffer limit. Envoy's
+listener connection-buffer setting also affects response buffering and flow
+control; it is not a request-only knob. The explicit 1 MiB response limit is
+separate and applies to buffered Anthropic Messages JSON conversion. The E2E
+checks that an OpenAI-compatible JSON response above 1 MiB passes through
+intact, including its complete-content hash, terminal sentinel, model, usage,
+and finish reason, while remaining under the listener limit. This does not
+claim the listener-buffer change is response-neutral for other traffic.
+
+The harness inspects the mounted ExtProc configuration and requires a 2 MiB
+translator request limit, an independent 1 MiB response limit, and a 10 MiB
+server accumulation ceiling. It sends valid 1.5 MiB Anthropic and
+OpenAI-compatible requests, then exact serialized requests just below and at
+2 MiB for both formats; each must reach the expected provider with one
+independent receipt, even when target-model rewriting makes the provider-bound
+body larger than the client-input limit. Rewritten output remains bounded by
+the 10 MiB ExtProc accumulation ceiling. A request 1 byte over the client-input
+limit returns 413 without provider contact. The ExtProc
+`praxis_extproc_body_size_rejections_total` counter must increase. The mounted
+2 MiB filter limit and ExtProc input-guard control flow establish that this
+request is rejected before body translation; the metric is not used alone to
+distinguish the input guard from the separate rewritten-output guard. The
+fail-closed sink trace by itself is not used to assign the rejection layer.
+With translation disabled, translation filter limits are absent; the harness
+also sends a 1.5 MiB OpenAI-compatible pass-through request.
+Large prompt text and image bytes are excluded from evidence and provider
+receipts. The current Kind setup installs KServe CRDs but does not deploy a
+serving runtime or internal model, so an internal-model large-request control
+is not claimed by this qualification.
+
+Run the translation qualification after `./run.sh --provision` and the base
+`./e2e.sh` suite. The translation command covers both shared-route controls and
+the ExternalModel provider-aware path; it restores its temporary provider and
+tenant settings on exit:
+
+```console
+LOCAL_ENV_CLUSTER="$CLUSTER" \
+LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/api-translation" \
+PROVIDER_RECORDER_IMAGE="$PROVIDER_RECORDER_IMAGE" \
+PRAXIS_EXTPROC_IMAGE="$EXTPROC_IMAGE" \
+  python3 test/kind-env/e2e-api-translation.py --scope all
+
+./demo.sh --context "kind-$CLUSTER" --evidence-dir "$RUN_EVIDENCE/demo" --non-interactive
+```
+
+The mounted-limit parser and harness policy contracts can be checked without
+a cluster:
+
+```sh
+python3 -m unittest discover -s test/kind-env -p 'test_api_translation_contract.py' -v
+bash test/kind-env/test_run_contracts.sh
+```
+
+Use a distinct `RUN_EVIDENCE` directory for every cold run. The translation
+test uses synthetic request bodies and records body sizes and structural
+provider receipts only; large prompt contents and image bytes are not retained.
 
 The transition fixture uses a real `MaasTenantConfig` explicitly set to
 `ipp` and MaaS model
@@ -340,12 +425,12 @@ records only CA/certificate fingerprints and paths, never keys or credentials.
 Required source checkouts are supplied through environment variables:
 
 * `LLM_KATAN_REPO`
-* `PRAXIS_REPO`
+* `PRAXIS_AI_REPO`
 * `MAAS_CONTROLLER_REPO`
 * `KUADRANT_OPERATOR_REPO`
 * `PRAXIS_EXTPROC_REPO`
 
-Source selection and provenance are explicit. `PRAXIS_REPO` and
+Source selection and provenance are explicit. `PRAXIS_AI_REPO` and
 `PRAXIS_EXTPROC_REPO` point at the checked-out integration sources; the
 expected revisions are recorded before each build. `MAAS_CONTROLLER_REPO`
 must point at the merged `main` branch for new runs (the harness verifies that
@@ -354,6 +439,11 @@ is the pinned dependency checkout used for platform fixtures. `LLM_KATAN_REPO`
 is optional in the normal workflow because the default provider image is the
 public digest-pinned artifact; a source checkout is used only for explicit
 development builds.
+
+For source-built ExtProc qualification, the build helper replaces ExtProc's
+Praxis AI `v0.8.0` Git dependencies with the supplied `PRAXIS_AI_REPO` checkout.
+The runtime image therefore contains the exact recorded Praxis AI source, not
+the published tag artifact.
 
 When the selected MaaS controller revision predates the `MaasTenantConfig`
 `spec.apiTranslation` field, the translation qualification must supply

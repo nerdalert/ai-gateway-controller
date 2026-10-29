@@ -286,9 +286,9 @@ copy_source(ai_source, context / "praxis-ai")
 cargo_toml = context / "praxis-extproc" / "Cargo.toml"
 cargo = cargo_toml.read_text()
 replacements = {
-    'praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.7.0", default-features = false, optional = true }':
+    'praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false, optional = true }':
         'praxis-ai-apis = { path = "../praxis-ai/apis", default-features = false, optional = true }',
-    'praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.7.0", default-features = false }':
+    'praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false }':
         'praxis-ai-filters = { path = "../praxis-ai/filters", default-features = false }',
 }
 for old, new in replacements.items():
@@ -429,10 +429,10 @@ check_repo KUADRANT_OPERATOR_REPO
 check_repo PRAXIS_EXTPROC_REPO
 if [[ -n "$PRAXIS_AI_REPO" ]]; then check_repo PRAXIS_AI_REPO; fi
 if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
-  extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
   extproc_head=$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)
-  [[ "$extproc_branch" == main && "$extproc_head" == "$EXPECTED_EXTPROC_MAIN_SHA" ]] || fail "ExtProc source must be clean main at $EXPECTED_EXTPROC_MAIN_SHA; got $extproc_branch@$extproc_head"
-  [[ -z "$(git -C "$PRAXIS_EXTPROC_REPO" status --porcelain)" ]] || fail "ExtProc main checkout is dirty"
+  extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
+  [[ "$extproc_head" == "$EXPECTED_EXTPROC_MAIN_SHA" ]] || fail "ExtProc source SHA must be $EXPECTED_EXTPROC_MAIN_SHA; got $extproc_head on branch ${extproc_branch:-detached}"
+  [[ -z "$(git -C "$PRAXIS_EXTPROC_REPO" status --porcelain)" ]] || fail "ExtProc source checkout is dirty"
 fi
 
 if rg -q 'For\(.*ExternalModel|ExternalModel.*Reconciler|SetupWithManager' "$ROOT/cmd" "$ROOT/pkg" 2>/dev/null; then
@@ -723,6 +723,29 @@ EOF
   done
   [[ "$authorino_found" == true ]] || { fail "Kuadrant did not create the run-owned Authorino resource"; exit 2; }
   "${KCTL[@]}" -n kuadrant-system patch authorino authorino --type=merge -p='{"spec":{"volumes":{"defaultMode":420,"items":[{"name":"maas-api-serving-ca","mountPath":"/etc/ssl/certs","configMaps":["authorino-maas-api-ca"],"items":[{"key":"ca.crt","path":"maas-api-serving-ca.crt"}]}]}}}'
+  # The Authorino operator may recreate its Deployment while applying the CR's
+  # CA volume. Wait for that exact projected mount and a completed rollout
+  # before changing the Deployment environment.
+  authorino_deployment_ready=false
+  authorino_deployment_deadline=$((SECONDS + 180))
+  while ((SECONDS < authorino_deployment_deadline)); do
+    authorino_deployment_json=$(timeout 5s "${KCTL[@]}" -n kuadrant-system get deployment authorino -o json 2>/dev/null || true)
+    if [[ -n "$authorino_deployment_json" ]] && \
+      jq -e 'any(.spec.template.spec.volumes[]?; .name == "maas-api-serving-ca" and any(.projected.sources[]?; .configMap.name == "authorino-maas-api-ca"))' <<<"$authorino_deployment_json" >/dev/null && \
+      jq -e 'any(.spec.template.spec.containers[].volumeMounts[]?; .name == "maas-api-serving-ca" and .mountPath == "/etc/ssl/certs")' <<<"$authorino_deployment_json" >/dev/null && \
+      timeout 10s "${KCTL[@]}" -n kuadrant-system rollout status deployment/authorino --timeout=8s >/dev/null 2>&1; then
+      authorino_deployment_ready=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$authorino_deployment_ready" != true ]]; then
+    "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-readiness-timeout-resource.yaml" 2>&1 || true
+    "${KCTL[@]}" -n kuadrant-system get deployment,replicaset,pod -o wide >"$EVIDENCE/authorino-readiness-timeout-workloads.txt" 2>&1 || true
+    "${KCTL[@]}" -n kuadrant-system get events --sort-by=.lastTimestamp >"$EVIDENCE/authorino-readiness-timeout-events.txt" 2>&1 || true
+    fail "Authorino Deployment did not become Ready with the run-owned MaaS CA mount within 180 seconds"
+    exit 2
+  fi
   "${KCTL[@]}" -n kuadrant-system set env deployment/authorino \
     SSL_CERT_FILE=/etc/ssl/certs/maas-api-serving-ca.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/maas-api-serving-ca.crt
@@ -1210,8 +1233,12 @@ EOF
   done
   api_runtime_ready=false
   expected_maas_api_repo_digest=$(sed -n 's/^expected_registry_repo_digest=//p' "$EVIDENCE/maas-api-registry-node-image-identity.txt")
+  node_maas_api_repo_digests=$(sed -n 's/^node_registry_repo_digests=//p' "$EVIDENCE/maas-api-registry-node-image-identity.txt")
   [[ -n "$expected_maas_api_repo_digest" ]] || {
     fail "source-built MaaS API registry digest is missing from image identity evidence"; exit 2;
+  }
+  [[ -n "$node_maas_api_repo_digests" ]] || {
+    fail "Kind node repository digests are missing from MaaS API image identity evidence"; exit 2;
   }
   for _ in $(seq 1 90); do
     all_api_runtime_ready=true
@@ -1222,7 +1249,8 @@ EOF
         all_api_runtime_ready=false
         break
       fi
-      if ! maas_api_pods_have_exact_ready_image "$api_pods_json" "$MAAS_API_RUNTIME_IMAGE" "$expected_maas_api_repo_digest"; then
+      if ! maas_api_pods_have_exact_ready_image "$api_pods_json" "$MAAS_API_RUNTIME_IMAGE" \
+        "$expected_maas_api_repo_digest" "$node_maas_api_repo_digests"; then
         all_api_runtime_ready=false
         break
       fi

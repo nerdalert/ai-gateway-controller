@@ -96,6 +96,44 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 	}
 }
 
+func TestRenderedExternalModelGatewayHasBoundedTwoMiBRequestBuffer(t *testing.T) {
+	const manifestPath = "../../config/manifests/external-model/overlays/odh"
+	resources, err := Build(manifestPath)
+	if err != nil {
+		t.Skipf("vendored manifests not present at %s: %v", manifestPath, err)
+	}
+
+	var found bool
+	for i := range resources {
+		if resources[i].GetKind() != "EnvoyFilter" || resources[i].GetName() != "payload-processing-external-model-filters" {
+			continue
+		}
+		patches, ok, err := unstructured.NestedSlice(resources[i].Object, "spec", "configPatches")
+		if err != nil || !ok {
+			t.Fatalf("ExternalModel EnvoyFilter patches missing: found=%t err=%v", ok, err)
+		}
+		for _, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			if !ok || patch["applyTo"] != "LISTENER" {
+				continue
+			}
+			context, _, _ := unstructured.NestedString(patch, "match", "context")
+			operation, _, _ := unstructured.NestedString(patch, "patch", "operation")
+			limit, _, _ := unstructured.NestedInt64(patch, "patch", "value", "per_connection_buffer_limit_bytes")
+			if context != "GATEWAY" || operation != "MERGE" || limit != 2*1024*1024+64*1024 {
+				t.Fatalf("listener buffer patch = context %q operation %q limit %d; want GATEWAY/MERGE/2162688", context, operation, limit)
+			}
+			if found {
+				t.Fatal("multiple Gateway-wide request buffer patches found")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("bounded Gateway listener buffer patch missing")
+	}
+}
+
 func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string {
 	t.Helper()
 	name, ok := resource["name"].(string)

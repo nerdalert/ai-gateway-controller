@@ -14,6 +14,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import threading
 import tempfile
@@ -21,6 +22,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from api_translation_contract import (
+    authorino_authconfig_readiness,
+    authorino_event_context,
+    authorino_logged_header_facts,
+    authorino_scopes_for_path,
+    classify_body_rejection,
+    chat_request_json_with_exact_size,
+    chat_request_with_exact_json_size,
+    compact_translation_diagnostic_id,
+    extproc_counter_delta,
+    extproc_translation_limits,
+    is_owned_translation_diagnostic_authpolicy,
+    prometheus_counter_total_or_zero,
+    route_authconfigs_ready,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CLUSTER = os.environ.get("LOCAL_ENV_CLUSTER", "external-model-two-plane")
@@ -42,6 +59,11 @@ RECORDER_FORWARD = None
 RECORDER_PORT = None
 PROVIDER_RECORDER_FORWARD = None
 PROVIDER_RECORDER_PORT = None
+EXTPROC_METRICS_FORWARD = None
+EXTPROC_METRICS_PORT = None
+EXTPROC_METRICS_FORWARD_TARGET = None
+EXTPROC_METRICS_FORWARD_GENERATION = 0
+MOUNTED_TRANSLATION_LIMITS = None
 KEY_ID = None
 KEY_VALUE = None
 PROVIDER_TEST_KEYS = []
@@ -62,12 +84,13 @@ MTC_HAD_TRANSLATION = False
 MTC_CAPTURED = False
 EXTERNAL_MODEL_ORIGINAL_REFS = None
 EXTERNAL_MODEL_ORIGINAL_OVERLAY = None
+BASELINE_EXTERNALMODEL_RUNTIME = None
 EXTERNAL_MODEL_CHANGED = False
 ANTHROPIC_PROVIDER_CREATED = False
 PROVIDER_AWARE_CREATED = False
 DIAGNOSTIC_ROUTE_AUTH_CREATED = False
-EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = None
-EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = None
+DIAGNOSTIC_BYPASS_AUTH_NAME = None
+DIAGNOSTIC_BYPASS_AUTH_UID = None
 TEMP = pathlib.Path(tempfile.mkdtemp(prefix="ipp-api-translation-"))
 RESULT = {"status": "RUNNING", "assertions": [], "requests": [], "upstream_observations": []}
 
@@ -97,13 +120,87 @@ def redact_text(value):
     return re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~-]{12,}", r"\1[REDACTED]", redacted)
 
 
-def record(name, passed, details):
+def record(name, passed, details, *, abort_on_failure=True):
     item = {"name": name, "result": "PASS" if passed else "FAIL", "details": details}
     RESULT["assertions"].append(item)
     save_json(RESULTS, RESULT)
     print(f"{item['result']} {name}: {details}")
-    if not passed:
+    if not passed and abort_on_failure:
         raise RuntimeError(f"assertion failed: {name}")
+
+
+def remove_interrupted_translation_auth_diagnostics():
+    """Remove only exact run-owned route AuthPolicies left by an interrupted diagnostic run."""
+    expected = {
+        "api-translation-messages-auth": "api-translation-messages",
+        "api-translation-openai-auth": "api-translation-openai",
+    }
+    policies = json.loads(kubectl("get", "authpolicy", "-A", "-o", "json").stdout).get("items", [])
+    relevant = []
+    for policy in policies:
+        metadata = policy.get("metadata", {})
+        target = policy.get("spec", {}).get("targetRef", {})
+        route_name = target.get("name")
+        if (target.get("kind") == "HTTPRoute" and route_name in expected
+                and target.get("group") == "gateway.networking.k8s.io"):
+            relevant.append(policy)
+
+    removed = []
+    conflicts = []
+    for policy in relevant:
+        metadata = policy.get("metadata", {})
+        name = metadata.get("name", "")
+        namespace = metadata.get("namespace", "")
+        route_name = expected.get(name)
+        owned = bool(route_name) and is_owned_translation_diagnostic_authpolicy(
+            policy, NAMESPACE, name, route_name)
+        if not owned:
+            conflicts.append({"namespace": namespace, "name": name,
+                              "target": policy.get("spec", {}).get("targetRef", {}).get("name"),
+                              "left_untouched": True})
+            continue
+        save_json(EVIDENCE / f"stale-diagnostic-{name}-before-removal.json", policy)
+        deleted = kubectl("-n", namespace, "delete", "authpolicy", name,
+                          "--wait=true", "--timeout=60s", check=False)
+        if deleted.returncode:
+            conflicts.append({"namespace": namespace, "name": name,
+                              "delete_failed": True, "left_untouched": False})
+        else:
+            removed.append({"namespace": namespace, "name": name,
+                            "uid": metadata.get("uid"), "target": route_name})
+
+    deadline = time.monotonic() + 45
+    remaining = relevant
+    while time.monotonic() < deadline:
+        current = json.loads(kubectl("get", "authpolicy", "-A", "-o", "json").stdout).get("items", [])
+        remaining = []
+        for policy in current:
+            target = policy.get("spec", {}).get("targetRef", {})
+            if (target.get("group") == "gateway.networking.k8s.io"
+                    and target.get("kind") == "HTTPRoute" and target.get("name") in expected):
+                remaining.append(policy)
+        if not remaining:
+            break
+        time.sleep(1)
+    clean = not conflicts and not remaining
+    save_json(EVIDENCE / "normal-auth-route-policy-isolation.json", {
+        "status": "PASS" if clean else "FAIL",
+        "removed_exact_owned_diagnostics": removed,
+        "conflicts_left_untouched": conflicts,
+        "remaining_route_authpolicies": [
+            {"namespace": item.get("metadata", {}).get("namespace"),
+             "name": item.get("metadata", {}).get("name"),
+             "target": item.get("spec", {}).get("targetRef", {}).get("name")}
+            for item in remaining
+        ],
+        "normal_auth_uses_route_authpolicy_substitution": False,
+    })
+    record("normal_auth_translation_routes_have_no_route_auth_overrides", clean, {
+        "removed_exact_owned_diagnostics": [item["name"] for item in removed],
+        "conflicts_left_untouched": conflicts,
+        "remaining_route_authpolicy_count": len(remaining),
+        "normal_auth_uses_route_authpolicy_substitution": False,
+    })
 
 
 def openai_message_content(payload):
@@ -272,12 +369,12 @@ def free_port():
     return port
 
 
-def start_port_forward(service, remote_port, namespace="maas-system"):
-    log_path = EVIDENCE / f"port-forward-{namespace}-{service}.log"
+def start_resource_port_forward(resource, remote_port, namespace, label):
+    log_path = EVIDENCE / f"port-forward-{namespace}-{label}.log"
     log_stream = log_path.open("w")
     proc = subprocess.Popen(
         ["kubectl", "--context", f"kind-{CLUSTER}", "-n", namespace, "port-forward",
-         f"svc/{service}", f"0:{remote_port}"],
+         resource, f"0:{remote_port}"],
         stdout=log_stream,
         stderr=subprocess.STDOUT,
         text=True,
@@ -286,7 +383,7 @@ def start_port_forward(service, remote_port, namespace="maas-system"):
     port = None
     for _ in range(90):
         if proc.poll() is not None:
-            raise RuntimeError(f"port-forward for {service} exited early; see {log_path.name}")
+            raise RuntimeError(f"port-forward for {resource} exited early; see {log_path.name}")
         match = re.search(r"Forwarding from 127\.0\.0\.1:(\d+) ->", log_path.read_text())
         if match:
             port = int(match.group(1))
@@ -294,7 +391,7 @@ def start_port_forward(service, remote_port, namespace="maas-system"):
         time.sleep(0.1)
     if port is None:
         proc.terminate()
-        raise RuntimeError(f"port-forward for {service} did not report a bound local port; see {log_path.name}")
+        raise RuntimeError(f"port-forward for {resource} did not report a bound local port; see {log_path.name}")
     sock = socket.socket()
     try:
         sock.settimeout(0.25)
@@ -307,7 +404,162 @@ def start_port_forward(service, remote_port, namespace="maas-system"):
     return proc, port
 
 
-def curl_request(name, url, body, *, auth_file=None, extra_headers=None, ca_file=None,
+def start_port_forward(service, remote_port, namespace="maas-system"):
+    return start_resource_port_forward(f"svc/{service}", remote_port, namespace, service)
+
+
+def extproc_body_rejection_count():
+    sample = extproc_body_rejection_snapshot()
+    if sample.get("count") is None:
+        raise RuntimeError(
+            f"ExtProc body rejection metric unavailable: {sample.get('error_type', 'unknown error')}"
+        )
+    return sample["count"]
+
+
+def extproc_body_rejection_snapshot():
+    """Read the ExtProc counter from a currently Ready pod, reconnecting after rollouts."""
+    global EXTPROC_METRICS_FORWARD, EXTPROC_METRICS_PORT
+    global EXTPROC_METRICS_FORWARD_TARGET, EXTPROC_METRICS_FORWARD_GENERATION
+    last_error_type = None
+    for _ in range(3):
+        deployment = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "deployment", "payload-processing-external-model", "-o", "json"
+        ).stdout)
+        selector = deployment.get("spec", {}).get("selector", {}).get("matchLabels", {})
+        label_selector = ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
+        pod_list = json.loads(kubectl(
+            "-n", NAMESPACE, "get", "pods", "-l", label_selector, "-o", "json"
+        ).stdout)
+        ready_pods = []
+        for pod in pod_list.get("items", []):
+            metadata = pod.get("metadata", {})
+            ready = any(condition.get("type") == "Ready" and condition.get("status") == "True"
+                        for condition in pod.get("status", {}).get("conditions", []))
+            if ready and not metadata.get("deletionTimestamp"):
+                container = next((status for status in pod.get("status", {}).get("containerStatuses", [])
+                                  if status.get("name") == "payload-processing"), {})
+                ready_pods.append({
+                    "name": metadata.get("name"),
+                    "uid": metadata.get("uid"),
+                    "container_id": container.get("containerID"),
+                    "container_restart_count": container.get("restartCount"),
+                })
+        ready_pods = [pod for pod in ready_pods if pod.get("name") and pod.get("uid")
+                      and pod.get("container_id") and pod.get("container_restart_count") is not None]
+        if len(ready_pods) != 1:
+            return {"count": None, "pod_name": None, "pod_uid": None,
+                    "error_type": "ExpectedExactlyOneReadyExtProcPod"}
+        target = ready_pods[0]
+        if (EXTPROC_METRICS_FORWARD is None or EXTPROC_METRICS_FORWARD.poll() is not None
+                or EXTPROC_METRICS_FORWARD_TARGET != target):
+            if EXTPROC_METRICS_FORWARD and EXTPROC_METRICS_FORWARD.poll() is None:
+                EXTPROC_METRICS_FORWARD.terminate()
+                try:
+                    EXTPROC_METRICS_FORWARD.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    EXTPROC_METRICS_FORWARD.kill()
+            EXTPROC_METRICS_FORWARD = None
+            EXTPROC_METRICS_PORT = None
+            EXTPROC_METRICS_FORWARD_TARGET = None
+            EXTPROC_METRICS_FORWARD_GENERATION += 1
+            label = f"external-model-extproc-metrics-{EXTPROC_METRICS_FORWARD_GENERATION}"
+            try:
+                EXTPROC_METRICS_FORWARD, EXTPROC_METRICS_PORT = start_resource_port_forward(
+                    f"pod/{target['name']}", 9090, NAMESPACE, label
+                )
+                EXTPROC_METRICS_FORWARD_TARGET = target
+            except Exception as exc:  # Keep the failed request evidence even if this probe is unavailable.
+                last_error_type = type(exc).__name__
+                continue
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{EXTPROC_METRICS_PORT}/metrics", timeout=5
+            ) as response:
+                body = response.read().decode("utf-8", errors="strict")
+            # A missing sample is a zero baseline; attribution still requires
+            # a one-count delta from the same pod UID before and after a request.
+            count = prometheus_counter_total_or_zero(
+                body, "praxis_extproc_body_size_rejections_total"
+            )
+            return {
+                "count": count,
+                "pod_name": target["name"],
+                "pod_uid": target["uid"],
+                "container_id_sha256": hashlib.sha256(target["container_id"].encode()).hexdigest(),
+                "container_restart_count": target["container_restart_count"],
+                "error_type": None,
+            }
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError) as exc:
+            last_error_type = type(exc).__name__
+            if EXTPROC_METRICS_FORWARD and EXTPROC_METRICS_FORWARD.poll() is None:
+                EXTPROC_METRICS_FORWARD.terminate()
+                try:
+                    EXTPROC_METRICS_FORWARD.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    EXTPROC_METRICS_FORWARD.kill()
+            EXTPROC_METRICS_FORWARD = None
+            EXTPROC_METRICS_PORT = None
+            EXTPROC_METRICS_FORWARD_TARGET = None
+    return {"count": None, "pod_name": None, "pod_uid": None,
+            "error_type": last_error_type or "MetricsProbeUnavailable"}
+
+
+def mounted_extproc_translation_limits():
+    result = kubectl("-n", NAMESPACE, "exec", "deployment/payload-processing-external-model",
+                     "-c", "payload-processing", "--", "cat", "/etc/praxis/extproc.yaml")
+    return extproc_translation_limits(result.stdout)
+
+
+def record_runtime_translation_limits():
+    global MOUNTED_TRANSLATION_LIMITS
+    expected = {
+        "server_max_body_bytes": 10 * 1024 * 1024,
+        "translator_max_request_body_bytes": 2 * 1024 * 1024,
+        "translator_max_response_body_bytes": 1 * 1024 * 1024,
+        "translator_filter_present": True,
+    }
+    last = None
+    for _ in range(90):
+        try:
+            last = mounted_extproc_translation_limits()
+        except (RuntimeError, json.JSONDecodeError):
+            last = None
+        if last == expected:
+            break
+        time.sleep(1)
+    MOUNTED_TRANSLATION_LIMITS = last
+    limits = last or {}
+    record("externalmodel_mounted_translation_limits_match_contract", limits == expected, {
+        "config_source": "mounted /etc/praxis/extproc.yaml in payload-processing-external-model",
+        "observed_limits": limits,
+        "expected_limits": expected,
+        "full_configuration_saved": False,
+    })
+    if limits != expected:
+        raise RuntimeError(f"mounted ExtProc translation limits did not converge: {limits}")
+    return limits
+
+
+def prepare_extproc_body_limit_metrics():
+    limits = record_runtime_translation_limits()
+    initial_sample = extproc_body_rejection_snapshot()
+    record("externalmodel_extproc_body_rejection_metric_available",
+           initial_sample.get("count") is not None and initial_sample.get("count") >= 0, {
+        "metric": "praxis_extproc_body_size_rejections_total",
+        "initial_count": initial_sample.get("count"),
+        "pod_name": initial_sample.get("pod_name"),
+        "pod_uid": initial_sample.get("pod_uid"),
+        "container_id_sha256": initial_sample.get("container_id_sha256"),
+        "container_restart_count": initial_sample.get("container_restart_count"),
+        "probe_error_type": initial_sample.get("error_type"),
+        "runtime_translation_limits": limits,
+        "metric_source": "tenant-local ExternalModel ExtProc /metrics",
+    })
+    return limits
+
+
+def curl_request(name, url, body, *, raw_payload=None, auth_file=None, extra_headers=None, ca_file=None,
                  resolve_host=None, stream=False, correlation_id=None,
                  persist_response_payload=True):
     raw = TEMP / f"{name}.body"
@@ -336,7 +588,9 @@ def curl_request(name, url, body, *, auth_file=None, extra_headers=None, ca_file
         request_headers.append(f"x-request-id: {correlation_id}")
     for header in request_headers:
         args.extend(["-H", header])
-    payload = json.dumps(body, separators=(",", ":"))
+    payload = raw_payload if raw_payload is not None else json.dumps(body, separators=(",", ":"))
+    if not isinstance(payload, str):
+        raise TypeError("raw_payload must be a string when provided")
     if len(payload) > 64 * 1024:
         payload_file = TEMP / f"{name}.request.json"
         payload_file.write_text(payload)
@@ -547,6 +801,169 @@ def wait_auth_policy(name, namespace=NAMESPACE):
     raise RuntimeError(f"AuthPolicy {namespace}/{name} did not report Accepted=True and Enforced=True")
 
 
+def wait_externalmodel_authorino_authconfigs_ready(route_name="external-model-demo-model",
+                                                   path_prefix="/models-as-a-service/demo",
+                                                   timeout_seconds=180):
+    """Wait for every Authorino scope selected by the live MaaS route config."""
+    route_annotation = (
+        f"httproute.gateway.networking.k8s.io:{NAMESPACE}/{route_name}#"
+    )
+    deadline = time.monotonic() + timeout_seconds
+    history = []
+    stable_ready_polls = 0
+    expected_scopes = []
+    latest = []
+    plugin_name = "kuadrant-maas-default-gateway"
+
+    while time.monotonic() < deadline:
+        plugin_result = kubectl("-n", "maas-system", "get", "wasmplugin", plugin_name,
+                                "-o", "json", check=False)
+        plugin_config = None
+        if plugin_result.returncode == 0:
+            plugin_obj = json.loads(plugin_result.stdout)
+            plugin_config = plugin_obj.get("spec", {}).get("pluginConfig")
+        scopes = authorino_scopes_for_path(plugin_config, path_prefix)
+        if scopes:
+            expected_scopes = scopes
+            latest = []
+            for scope in expected_scopes:
+                config_result = kubectl("-n", "kuadrant-system", "get",
+                                        "authconfigs.authorino.kuadrant.io", scope,
+                                        "-o", "json", check=False)
+                if config_result.returncode:
+                    latest.append({"name": scope, "exists": False})
+                    continue
+                summary = authorino_authconfig_readiness(
+                    json.loads(config_result.stdout), route_annotation)
+                summary["exists"] = True
+                latest.append(summary)
+
+        all_ready = bool(expected_scopes) and len(latest) == len(expected_scopes) and all(
+            item.get("exists") and item.get("ready") for item in latest
+        )
+        stable_ready_polls = stable_ready_polls + 1 if all_ready else 0
+        history.append({
+            "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "plugin_config_available": plugin_config is not None,
+            "expected_scope_names": expected_scopes,
+            "authconfigs": latest,
+            "all_ready": all_ready,
+            "stable_ready_polls": stable_ready_polls,
+        })
+        if stable_ready_polls >= 2:
+            evidence = {
+                "result": "PASS",
+                "plugin": "maas-system/wasmplugin/" + plugin_name,
+                "route": f"{NAMESPACE}/{route_name}",
+                "path_prefix": path_prefix,
+                "expected_route_annotation_prefix": route_annotation,
+                "authconfig_scopes_selected_from_live_action_sets": expected_scopes,
+                "authconfigs": latest,
+                "stable_ready_polls": stable_ready_polls,
+                "poll_history": history,
+                "policy_specs_or_credentials_saved": False,
+            }
+            save_json(EVIDENCE / "externalmodel-authorino-authconfig-readiness.json", evidence)
+            record("externalmodel_authorino_route_authconfigs_ready", True, {
+                "route": f"{NAMESPACE}/{route_name}",
+                "path_prefix": path_prefix,
+                "authconfig_count": len(latest),
+                "all_route_owned_ready_available": True,
+                "stable_ready_polls": stable_ready_polls,
+                "policy_specs_or_credentials_saved": False,
+            })
+            return evidence
+        time.sleep(1)
+
+    evidence = {
+        "result": "FAIL",
+        "plugin": "maas-system/wasmplugin/" + plugin_name,
+        "route": f"{NAMESPACE}/{route_name}",
+        "path_prefix": path_prefix,
+        "expected_route_annotation_prefix": route_annotation,
+        "authconfig_scopes_selected_from_live_action_sets": expected_scopes,
+        "authconfigs": latest,
+        "poll_history": history,
+        "policy_specs_or_credentials_saved": False,
+    }
+    save_json(EVIDENCE / "externalmodel-authorino-authconfig-readiness-timeout.json", evidence)
+    raise RuntimeError(
+        "route-scoped Authorino AuthConfigs did not reach current Ready/Available for "
+        f"{NAMESPACE}/{route_name}; scopes={expected_scopes}, latest={latest}"
+    )
+
+
+def externalmodel_route_auth_policies(route_name="external-model-demo-model"):
+    result = kubectl("-n", NAMESPACE, "get", "authpolicies", "-o", "json", check=False)
+    if result.returncode:
+        raise RuntimeError("could not list route AuthPolicies before normal-auth qualification")
+    policies = json.loads(result.stdout).get("items", [])
+    return [policy for policy in policies
+            if policy.get("spec", {}).get("targetRef", {}).get("group") == "gateway.networking.k8s.io"
+            and policy.get("spec", {}).get("targetRef", {}).get("kind") == "HTTPRoute"
+            and policy.get("spec", {}).get("targetRef", {}).get("name") == route_name]
+
+
+def remove_stale_externalmodel_auth_fixture():
+    """Remove only the exact legacy local-env fixture known to conflict with MaaS auth."""
+    legacy_name = "external-model-auth"
+    result = kubectl("-n", NAMESPACE, "get", "authpolicy", legacy_name, "-o", "json", check=False)
+    removed = False
+    if result.returncode == 0:
+        obj = json.loads(result.stdout)
+        metadata = obj.get("metadata", {})
+        target = obj.get("spec", {}).get("targetRef", {})
+        labels = metadata.get("labels", {})
+        if (metadata.get("namespace") != NAMESPACE
+                or labels.get("app.kubernetes.io/managed-by") != "local-env"
+                or target.get("group") != "gateway.networking.k8s.io"
+                or target.get("kind") != "HTTPRoute"
+                or target.get("name") != "external-model-demo-model"):
+            raise RuntimeError("refusing to remove external-model-auth: ownership or target does not match the known test fixture")
+        spec_hash = hashlib.sha256(json.dumps(
+            obj.get("spec", {}), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        save_json(EVIDENCE / "legacy-externalmodel-auth-fixture-removed.json", {
+            "name": legacy_name,
+            "namespace": NAMESPACE,
+            "uid": metadata.get("uid"),
+            "generation": metadata.get("generation"),
+            "managed_by": labels.get("app.kubernetes.io/managed-by"),
+            "target_ref": target,
+            "spec_sha256": spec_hash,
+            "credential_values_saved": False,
+        })
+        delete = kubectl("-n", NAMESPACE, "delete", "authpolicy", legacy_name,
+                         "--wait=true", "--timeout=60s", check=False)
+        if delete.returncode:
+            raise RuntimeError("could not remove the verified legacy ExternalModel test AuthPolicy")
+        for _ in range(60):
+            current = kubectl("-n", NAMESPACE, "get", "authpolicy", legacy_name,
+                              "-o", "json", check=False)
+            if current.returncode:
+                removed = True
+                break
+            time.sleep(1)
+        if not removed:
+            raise RuntimeError("legacy ExternalModel AuthPolicy still exists after deletion")
+
+    remaining = externalmodel_route_auth_policies()
+    remaining_summary = [{
+        "name": policy.get("metadata", {}).get("name"),
+        "uid": policy.get("metadata", {}).get("uid"),
+        "managed_by": policy.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by"),
+        "target_ref": policy.get("spec", {}).get("targetRef", {}),
+    } for policy in remaining]
+    ok = not remaining
+    record("externalmodel_route_uses_inherited_maas_auth_without_conflicting_route_policy", ok, {
+        "known_legacy_fixture_removed": removed,
+        "remaining_route_authpolicies": remaining_summary,
+        "auth_provider": "MaaS Gateway AuthPolicy",
+        "route_authpolicy_conflict_is_failure": True,
+    })
+    if not ok:
+        raise RuntimeError(f"ExternalModel route has unexpected route AuthPolicies: {remaining_summary}")
+
+
 def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not_before=None):
     """Wait for current-generation Ready to remain stable after routes are installed.
 
@@ -568,6 +985,8 @@ def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not
             generation = last.get("metadata", {}).get("generation")
             ready_condition = next((condition for condition in conditions
                                     if condition.get("type") == "Ready"), None)
+            conflict_condition = next((condition for condition in conditions
+                                       if condition.get("type") == "ConflictingAuthPolicy"), None)
             transition_time = None
             if ready_condition and ready_condition.get("lastTransitionTime"):
                 try:
@@ -583,7 +1002,8 @@ def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not
             )
             ready_now = (ready_condition is not None
                          and ready_condition.get("status") == "True"
-                         and current_generation)
+                         and current_generation
+                         and not (conflict_condition and conflict_condition.get("status") == "True"))
             stable_ready_polls = stable_ready_polls + 1 if ready_now else 0
             poll_history.append({
                 "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -593,6 +1013,9 @@ def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not
                 "ready_message": ready_condition.get("message") if ready_condition else None,
                 "ready_observed_generation": ready_condition.get("observedGeneration") if ready_condition else None,
                 "ready_transition_time": ready_condition.get("lastTransitionTime") if ready_condition else None,
+                "conflict_status": conflict_condition.get("status") if conflict_condition else None,
+                "conflict_reason": conflict_condition.get("reason") if conflict_condition else None,
+                "conflict_message": conflict_condition.get("message") if conflict_condition else None,
                 "current_generation": current_generation,
                 "fresh_transition": fresh_transition,
                 "stable_ready_polls": stable_ready_polls,
@@ -607,6 +1030,8 @@ def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not
                     "ready_condition_transition_time": ready_condition.get("lastTransitionTime"),
                     "ready_transition_after_route_reconcile": fresh_transition,
                     "stable_ready_polls": stable_ready_polls,
+                    "conflicting_authpolicy_absent_or_false": not (
+                        conflict_condition and conflict_condition.get("status") == "True"),
                     "conditions": summary,
                 }
                 save_json(EVIDENCE / "maas-auth-policy-readiness-polls.json", poll_history)
@@ -621,7 +1046,7 @@ def wait_maas_auth_policy_ready(name="kind-e2e-access", namespace=NAMESPACE, not
         "conditions": conditions,
     })
     save_json(EVIDENCE / "maas-auth-policy-readiness-polls.json", poll_history)
-    raise RuntimeError(f"MaaSAuthPolicy {namespace}/{name} did not report stable current-generation Ready=True; conditions={conditions}")
+    raise RuntimeError(f"MaaSAuthPolicy {namespace}/{name} did not report stable current-generation Ready=True without ConflictingAuthPolicy=True; conditions={conditions}")
 
 
 def wait_rate_limit_policy(name):
@@ -1075,6 +1500,7 @@ def externalmodel_runtime_snapshot(label):
         "candidate_clusters": sorted({candidate.get("cluster") for candidate in wire.get("overlay", {}).get("candidates", [])}),
         "demo_model_candidate_clusters": sorted({candidate.get("cluster") for candidate in model_candidates}),
         "demo_model_candidates": model_candidates,
+        "overlay": wire.get("overlay", {}),
         "deployment_generation": deployment.get("metadata", {}).get("generation"),
         "deployment_observed_generation": deployment.get("status", {}).get("observedGeneration"),
         "deployment_replicas": deployment.get("status", {}).get("replicas"),
@@ -1156,13 +1582,13 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
             all(not any(field in candidate for field in provider_profile_fields)
                 for candidate in profile_candidates)
         )
-        # The translator's limit is the selected-upstream request limit; it
-        # matches the server limit so long-context requests are not rejected.
         body_limit_state_matches = "filter: stream_usage_inject" in snapshot["extproc_config"] and (
-            "api_translation_enabled: true\n        max_body_bytes: 10485760" in snapshot["extproc_config"]
+            "max_request_body_bytes: 2097152" in snapshot["extproc_config"]
+            and "max_response_body_bytes: 1048576" in snapshot["extproc_config"]
             and translation_stream_filter_present
             if api_translation_enabled else
-            "\n  max_body_bytes:" not in snapshot["extproc_config"]
+            "max_request_body_bytes" not in snapshot["extproc_config"]
+            and "max_response_body_bytes" not in snapshot["extproc_config"]
             and "allow_unbounded_body: true" in snapshot["extproc_config"]
             and not translation_stream_filter_present
         )
@@ -1413,7 +1839,8 @@ def install_runtime_route_trace():
   if diagnostic == "" then return end
   local path = headers:get(":path") or ""
   path = string.match(path, "^[^?]*") or path
-  if not (string.match(path, "/v1/messages$") or string.match(path, "/v1/chat/completions$")) then return end
+  if not (string.match(path, "/v1/messages$") or string.match(path, "/v1/chat/completions$")
+      or path == "/v1/models") then return end
   local authorization = headers:get("authorization")
   local authorization_present = authorization ~= nil and "true" or "false"
   local authorization_scheme = "absent"
@@ -1440,6 +1867,7 @@ def install_runtime_route_trace():
     credential_family,
     headers:get("x-api-key") ~= nil and "true" or "false",
     table.concat(identity_headers, ","),
+    headers:get("x-request-id") or "",
   }
   -- Warning is intentional: the run-owned proxy uses warning-level log output by default.
   handle:logWarn("IPP-AUTH-INPUT-TRACE|" .. table.concat(fields, "|"))
@@ -1452,9 +1880,10 @@ end'''
                 "typed_config": {
                     "@type": "type.googleapis.com/envoy.extensions.access_loggers.filters.cel.v3.ExpressionFilter",
                     "expression": (
-                        "request.method == 'POST' && "
+                        "(request.method == 'GET' && request.path == '/v1/models') || "
+                        "(request.method == 'POST' && "
                         "(request.path.endsWith('/v1/chat/completions') || "
-                        "request.path.endsWith('/v1/messages'))"
+                        "request.path.endsWith('/v1/messages')))"
                     ),
                 },
             },
@@ -1621,6 +2050,7 @@ def capture_auth_policy_input_trace(request_id, label, gateway_pod):
                     "credential_family": fields[6],
                     "x_api_key_present": fields[7] == "true",
                     "client_identity_header_names": sorted(identity_headers),
+                    "envoy_request_id": fields[9] if len(fields) >= 10 and fields[9] else None,
                 })
                 break
         if trace["captured"]:
@@ -1670,6 +2100,112 @@ def capture_runtime_route_trace(request_id, label, gateway_pod):
     RESULT.setdefault("runtime_route_traces", []).append(trace)
     save_json(RESULTS, RESULT)
     return trace
+
+
+def probe_provider_a_normal_auth_before_translation(auth_file, *, continue_on_failure=False):
+    """Separate baseline Gateway authorization from provider-aware routing."""
+    externalmodel_url = f"http://127.0.0.1:{GATEWAY_PORT}/{NAMESPACE}/demo/v1/chat/completions"
+    serving = wait_externalmodel_revision(
+        {"provider-provider-a"}, "provider-a-normal-auth-baseline",
+        api_translation_enabled=False,
+    )
+    authconfigs = wait_externalmodel_authorino_authconfigs_ready(
+        route_name="external-model-demo-model",
+        path_prefix=f"/{NAMESPACE}/demo",
+    )
+    authconfigs_are_ready = route_authconfigs_ready(authconfigs)
+    gateway_pod = install_runtime_route_trace()
+    request_id = f"{ROUTE_TRACE_PREFIX}provider-a-auth-baseline"
+    callbacks_before = callback_log_snapshot()
+    rc, status, _ = curl_request(
+        "externalmodel-provider-a-normal-auth-baseline",
+        externalmodel_url,
+        {"model": "demo", "messages": [{"role": "user", "content": "auth-baseline"}]},
+        auth_file=auth_file,
+        extra_headers=[f"x-ipp-diagnostic-id: {request_id}"],
+        correlation_id=request_id,
+        persist_response_payload=False,
+    )
+    route_trace = capture_runtime_route_trace(request_id, "provider-a-auth-baseline", gateway_pod)
+    auth_input = capture_auth_policy_input_trace(
+        request_id, "externalmodel-provider-a-normal-auth-baseline", gateway_pod)
+    authorino = authorino_request_trace(route_trace.get("envoy_request_id") or request_id)
+    callbacks_after = callback_log_snapshot()
+    previous = {
+        (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+        for event in callbacks_before.get("events", [])
+    }
+    callback_delta = [
+        {key: event.get(key) for key in (
+            "timestamp", "request_id", "method", "path", "status", "tenant_name",
+            "tenant_namespace", "gateway_name", "authorization_header_present",
+            "x_api_key_header_present",
+        ) if key in event}
+        for event in callbacks_after.get("events", [])
+        if (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+        not in previous
+    ]
+    authorino_response = next(({
+        "authorized": event.get("authorized"),
+        "response_status": event.get("response_status"),
+        "response_code": event.get("response_code"),
+    } for event in authorino.get("matched_events", [])
+        if event.get("message_class") == "authorization_response"), None)
+    authorino_request_context = [event.get("request") for event in authorino.get("matched_events", [])
+                                 if event.get("message_class") == "incoming_request"]
+    authorino_evaluation_context = [{key: event.get(key) for key in (
+        "level", "message_class", "error_class", "missing_key", "undeclared_reference",
+        "expression_sha256", "evaluator_context",
+    ) if key in event} for event in authorino.get("matched_events", [])
+        if event.get("message_class") in ("cel_evaluation_failure", "cel_parse_failure")]
+    passed = (
+        rc == 0 and status == "200"
+        and serving.get("demo_model_candidate_clusters") == ["provider-provider-a"]
+        and authconfigs_are_ready
+        and auth_input.get("captured") is True
+        and auth_input.get("authorization_present") is True
+        and auth_input.get("authorization_scheme", "").lower() == "bearer"
+        and auth_input.get("gateway_model") == "demo"
+        and route_trace.get("captured") is True
+        and route_trace.get("response_code") == "200"
+        and "provider-provider-a" in route_trace.get("upstream_cluster", "")
+        and "provider-selection-required" not in route_trace.get("upstream_cluster", "")
+        and authorino_response is not None and authorino_response.get("authorized") is True
+    )
+    save_json(EVIDENCE / "externalmodel-provider-a-normal-auth-baseline.json", {
+        "http_status": status,
+        "curl_exit_status": rc,
+        "authorization_mode": "inherited MaaS Gateway AuthPolicy; no route-level substitution",
+        "request_path": f"/{NAMESPACE}/demo/v1/chat/completions",
+        "model": "demo",
+        "provider_configuration": serving.get("demo_model_candidate_clusters"),
+        "authconfig_ready": authconfigs_are_ready,
+        "authorization_input": auth_input,
+        "authorino_response": authorino_response,
+        "authorino_request_context": authorino_request_context,
+        "authorino_evaluation_context": authorino_evaluation_context,
+        "maas_callback_events_since_baseline": callback_delta,
+        "route_trace": route_trace,
+        "response_body_saved": False,
+        "credential_values_saved": False,
+        "translation_enabled": False,
+    })
+    record("externalmodel_provider_a_normal_auth_before_translation", passed, {
+        "http_status": status,
+        "authconfigs_ready": authconfigs_are_ready,
+        "authorization_header_present_at_envoy_auth_input": auth_input.get("authorization_present"),
+        "model_header": auth_input.get("gateway_model"),
+        "authorino_response": authorino_response,
+        "authorino_request_context": authorino_request_context,
+        "authorino_evaluation_context": authorino_evaluation_context,
+        "maas_callback_paths_and_statuses": [
+            {"path": event.get("path"), "status": event.get("status")}
+            for event in callback_delta
+        ],
+        "upstream_cluster": route_trace.get("upstream_cluster"),
+        "response_code_details": route_trace.get("response_code_details"),
+        "provider_a_overlay_only": serving.get("demo_model_candidate_clusters") == ["provider-provider-a"],
+    }, abort_on_failure=not continue_on_failure)
 
 
 def selected_live_provider_route(label, profile, endpoint):
@@ -1824,33 +2360,18 @@ def authorino_request_trace(envoy_request_id):
             continue
         event = {"level": str(entry.get("level", "unknown")).lower(),
                  "message_class": "other"}
+        event.update(authorino_event_context(entry))
         message = str(entry.get("msg", "")).lower()
         if message == "incoming authorization request":
             event["message_class"] = "incoming_request"
             obj = entry.get("object", {})
             request = obj.get("request", {}) if isinstance(obj, dict) else {}
             http = request.get("http", {}) if isinstance(request, dict) else {}
-            headers = http.get("headers")
-            if not isinstance(headers, dict):
-                headers = {}
-            header_names = {str(key).lower() for key in headers}
-            authorization = headers.get("authorization", headers.get("Authorization", ""))
-            if isinstance(authorization, list):
-                authorization = authorization[0] if authorization else ""
-            authorization = authorization if isinstance(authorization, str) else ""
+            header_facts = authorino_logged_header_facts(http)
             event["request"] = {
                 **{key: http.get(key) for key in ("id", "method", "path", "host", "scheme") if key in http},
                 "http_fields": sorted(http.keys()),
-                "headers_field_present": isinstance(http.get("headers"), dict),
-                "header_names": sorted(header_names),
-                "authorization_present": "authorization" in header_names,
-                "authorization_scheme": authorization.split(" ", 1)[0] if " " in authorization else None,
-                "authorization_token_family": "sk-oai" if "sk-oai-" in authorization else (
-                    "other" if authorization else "absent"),
-                "x_api_key_present": "x-api-key" in header_names,
-                "client_identity_header_names": sorted(header_names & {
-                    "x-maas-username", "x-maas-group", "x-maas-identity", "x-maas-subscription",
-                }),
+                **header_facts,
                 "header_values_saved": False,
             }
         elif message == "outgoing authorization response":
@@ -2359,58 +2880,167 @@ def wait_model_phase(expected):
 
 
 def enable_externalmodel_diagnostic_bypass_auth():
-    global EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256
-    policy = kubectl("-n", NAMESPACE, "get", "authpolicy", "external-model-auth", "-o", "json")
-    obj = json.loads(policy.stdout)
-    original_spec = obj.get("spec", {})
-    target = original_spec.get("targetRef", {})
-    if target.get("kind") != "HTTPRoute" or target.get("name") != "external-model-demo-model":
-        raise RuntimeError("refusing diagnostic bypass: external-model-auth target differs from expected ExternalModel route")
-    original_hash = hashlib.sha256(json.dumps(
-        original_spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    save_json(EVIDENCE / "external-model-auth-before-diagnostic-bypass.json", {
-        "name": obj.get("metadata", {}).get("name"),
-        "namespace": obj.get("metadata", {}).get("namespace"),
-        "generation": obj.get("metadata", {}).get("generation"),
-        "spec": original_spec,
-        "spec_sha256": original_hash,
-        "status_conditions": [{k: c.get(k) for k in ("type", "status", "reason")}
-                              for c in obj.get("status", {}).get("conditions", [])],
-    })
-    bypass_spec = {
-        "rules": {"authorization": {"diagnostic-allow": {
-            "patternMatching": {"patterns": [{"predicate": "true"}]},
-        }}},
-        "targetRef": target,
+    global DIAGNOSTIC_BYPASS_AUTH_NAME, DIAGNOSTIC_BYPASS_AUTH_UID
+    existing = externalmodel_route_auth_policies()
+    if existing:
+        names = [item.get("metadata", {}).get("name") for item in existing]
+        raise RuntimeError("refusing diagnostic bypass while another route AuthPolicy exists: " + ", ".join(names))
+    name = "external-model-auth-diagnostic-" + secrets.token_hex(4)
+    manifest = {
+        "apiVersion": "kuadrant.io/v1",
+        "kind": "AuthPolicy",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/managed-by": "api-translation-kind-e2e",
+                "ai-gateway-controller.opendatahub.io/test-run": CLUSTER[:63],
+            },
+        },
+        "spec": {
+            "rules": {"authorization": {"diagnostic-allow": {
+                "patternMatching": {"patterns": [{"predicate": "true"}]},
+            }}},
+            "targetRef": {
+                "group": "gateway.networking.k8s.io",
+                "kind": "HTTPRoute",
+                "name": "external-model-demo-model",
+            },
+        },
     }
-    patch = json.dumps([{"op": "replace", "path": "/spec", "value": bypass_spec}])
-    applied = kubectl("-n", NAMESPACE, "patch", "authpolicy", "external-model-auth",
-                      "--type=json", "-p", patch, check=False)
+    applied = kubectl("-n", NAMESPACE, "create", "-f", "-", "-o", "json",
+                      input_text=json.dumps(manifest), check=False)
     if applied.returncode:
-        raise RuntimeError("could not apply the run-scoped diagnostic AuthPolicy bypass")
-    EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = original_spec
-    current = json.loads(kubectl("-n", NAMESPACE, "get", "authpolicy",
-                                 "external-model-auth", "-o", "json").stdout)
-    EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = hashlib.sha256(json.dumps(
-        current.get("spec"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    accepted = wait_auth_policy("external-model-auth", namespace=NAMESPACE)
+        raise RuntimeError("could not create a run-owned diagnostic ExternalModel AuthPolicy")
+    current = json.loads(applied.stdout)
+    metadata = current.get("metadata", {})
+    DIAGNOSTIC_BYPASS_AUTH_NAME = name
+    DIAGNOSTIC_BYPASS_AUTH_UID = metadata.get("uid")
+    if not DIAGNOSTIC_BYPASS_AUTH_UID:
+        raise RuntimeError("diagnostic AuthPolicy was created without a recorded UID")
+    accepted = wait_auth_policy(name, namespace=NAMESPACE)
     save_json(EVIDENCE / "external-model-auth-diagnostic-bypass-ready.json", {
-        "resource": f"{NAMESPACE}/external-model-auth",
-        "target": target,
+        "resource": f"{NAMESPACE}/{name}",
+        "uid": DIAGNOSTIC_BYPASS_AUTH_UID,
+        "target": manifest["spec"]["targetRef"],
         "authorization_rule": "diagnostic-allow predicate true",
         "authentication_rules_present": bool(current.get("spec", {}).get("rules", {}).get("authentication")),
         "production_maas_gateway_authpolicy_changed": False,
         "route_policy_conditions": [{k: c.get(k) for k in ("type", "status", "reason")}
                                      for c in accepted.get("status", {}).get("conditions", [])],
-        "original_spec_sha256": original_hash,
-        "diagnostic_spec_sha256": EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256,
         "credential_values_saved": False,
     })
     record("externalmodel_diagnostic_auth_bypass_ready", True, {
-        "target_route": target.get("name"),
+        "target_route": manifest["spec"]["targetRef"]["name"],
+        "policy": name,
         "production_gateway_policy_changed": False,
         "diagnostic_only": True,
     })
+
+
+def capture_externalmodel_auth_model_list_control(auth_file, gateway_pod, label):
+    """Compare ordinary MaaS API-key auth with ExternalModel model authorization."""
+    diagnostic_id = ROUTE_TRACE_PREFIX + f"externalmodel-model-list-{label}"
+    headers_path = TEMP / f"externalmodel-model-list-{label}.headers"
+    body_path = TEMP / f"externalmodel-model-list-{label}.body"
+    before = callback_log_snapshot()
+    request_args = [
+        "curl", "--noproxy", "*", "-sS", "--connect-timeout", "5", "--max-time", "20",
+    ]
+    if auth_file is not None:
+        request_args.extend(["--config", str(auth_file)])
+    request_args.extend([
+        "-D", str(headers_path), "-o", str(body_path),
+        "-H", f"Host: {GATEWAY_AUTHORITY}",
+        "-H", f"x-ipp-diagnostic-id: {diagnostic_id}",
+        "-H", f"x-request-id: {diagnostic_id}",
+        "-w", "%{http_code}", f"http://127.0.0.1:{GATEWAY_PORT}/v1/models",
+    ])
+    response = run(request_args, check=False, timeout=25)
+    response_headers = {}
+    for line in headers_path.read_text(errors="replace").splitlines() if headers_path.exists() else []:
+        header, separator, value = line.partition(":")
+        key = header.strip().lower()
+        if separator and key in {
+            "content-type", "server", "www-authenticate", "x-request-id",
+            "x-ext-auth-reason", "x-authz-reason", "x-envoy-response-code-details",
+        }:
+            response_headers[key] = value.strip()
+
+    input_trace = capture_auth_policy_input_trace(diagnostic_id, f"externalmodel-model-list-{label}", gateway_pod)
+    request_id = input_trace.get("envoy_request_id") or response_headers.get("x-request-id") or diagnostic_id
+    authorino_trace = authorino_request_trace(request_id)
+    route_trace = capture_runtime_route_trace(diagnostic_id, f"externalmodel-model-list-{label}", gateway_pod)
+    after = callback_log_snapshot()
+    before_events = {
+        (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+        for event in before.get("events", [])
+    }
+    callback_delta = [
+        {key: event.get(key) for key in (
+            "timestamp", "request_id", "method", "path", "status", "tenant_name",
+            "tenant_namespace", "gateway_name", "authorization_header_present",
+            "x_api_key_header_present",
+        ) if key in event}
+        for event in after.get("events", [])
+        if (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+        not in before_events
+    ]
+    authorino_response = [
+        {key: event.get(key) for key in ("authorized", "response_status", "response_code")}
+        for event in authorino_trace.get("matched_events", [])
+        if event.get("message_class") == "authorization_response"
+    ]
+    cel_errors = [event for event in authorino_trace.get("matched_events", [])
+                  if event.get("message_class") in {"cel_evaluation_failure", "cel_parse_failure"}]
+    cel_error_classes = {}
+    cel_expression_failures = {}
+    for event in cel_errors:
+        key = event.get("error_class", "parse_failure")
+        cel_error_classes[key] = cel_error_classes.get(key, 0) + 1
+        fingerprint = event.get("expression_sha256") or "unknown"
+        failure = cel_expression_failures.setdefault(fingerprint, {
+            "count": 0,
+            "expression_length": event.get("expression_length"),
+            "error_class": key,
+            "missing_keys": [],
+            "undeclared_references": [],
+        })
+        failure["count"] += 1
+        if event.get("missing_key") and event["missing_key"] not in failure["missing_keys"]:
+            failure["missing_keys"].append(event["missing_key"])
+        if event.get("undeclared_reference") and event["undeclared_reference"] not in failure["undeclared_references"]:
+            failure["undeclared_references"].append(event["undeclared_reference"])
+    evidence = {
+        "diagnostic_id": diagnostic_id,
+        "http_status": response.stdout.strip() or "unknown",
+        "curl_exit_status": response.returncode,
+        "response_body_bytes": body_path.stat().st_size if body_path.exists() else 0,
+        "allowlisted_response_headers": response_headers,
+        "auth_policy_input": input_trace,
+        "envoy_route_trace": route_trace,
+        "authorino_authorization_responses": authorino_response,
+        "authorino_cel_error_count": len(cel_errors),
+        "authorino_cel_error_classes": cel_error_classes,
+        "authorino_cel_expression_failures": cel_expression_failures,
+        "maas_callback_events_since_baseline": callback_delta,
+        "response_body_saved": False,
+        "authorization_values_saved": False,
+        "raw_callback_bodies_saved": False,
+    }
+    evidence_path = EVIDENCE / f"externalmodel-model-list-{label}.json"
+    save_json(evidence_path, evidence)
+    RESULT.setdefault("diagnostics", []).append({"name": f"externalmodel_model_list_{label}", **evidence})
+    save_json(RESULTS, RESULT)
+    print(f"DIAGNOSTIC externalmodel_model_list_{label}: " + json.dumps({
+        "http_status": evidence["http_status"],
+        "authorino_authorization_responses": authorino_response,
+        "cel_error_count": len(cel_errors),
+        "maas_callback_count": len(callback_delta),
+        "envoy_route": route_trace.get("route_name"),
+        "upstream_cluster": route_trace.get("upstream_cluster"),
+    }, sort_keys=True))
+    return evidence
 
 
 def test_externalmodel_provider_aware_translation(auth_file):
@@ -2517,6 +3147,10 @@ def test_externalmodel_provider_aware_translation(auth_file):
             json.dumps({"spec": {"externalProviderRefs": refs}}))
     both = wait_externalmodel_revision({"provider-api-translation-openai", "provider-api-translation-anthropic"},
                                        "mixed-equal-weight")
+    wait_externalmodel_authorino_authconfigs_ready(
+        route_name="external-model-demo-model",
+        path_prefix=f"/{NAMESPACE}/demo",
+    )
     verify_externalmodel_extproc_image()
     profiles = {candidate.get("api_format"): candidate for candidate in both["demo_model_candidates"]}
     record("externalmodel_publishes_trusted_provider_profiles",
@@ -2552,8 +3186,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
                         and check["fallback_routes_stream_response_bodies"] for check in route_precedence)),
             "send_body_without_waiting_for_header_response": send_body_before_header,
             "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
-            "configured_translation_filter_request_limit_bytes": 1024 * 1024,
-            "Praxis_request_limit_enforcement_proven": False,
+            "mounted_translation_limits": MOUNTED_TRANSLATION_LIMITS,
             "scope": "controller-owned ExternalModel routes"})
     record("externalmodel_selected_routes_respect_shared_route_contract",
            len(route_precedence) == 2 and all(
@@ -2585,6 +3218,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
     capture_provider_cluster_endpoints("before-mixed-provider-samples", routing_diagnostic_clusters)
     base_pod_uids = sorted(pod["uid"] for pod in both["pods"] if pod["ready"] and not pod["deleting"])
 
+    capture_externalmodel_auth_model_list_control(None, route_trace_gateway_pod, "unauthenticated")
+    capture_externalmodel_auth_model_list_control(auth_file, route_trace_gateway_pod, "authenticated")
+
     mixed_counts = {"openai-chat": 0, "messages": 0}
     mixed_samples = []
     for index in range(24):
@@ -2597,11 +3233,93 @@ def test_externalmodel_provider_aware_translation(auth_file):
         body = {"model": "demo", "max_tokens": 32,
                 "messages": [{"role": "user", "content": marker}]}
         spoof = "x-provider-format: messages" if index % 2 == 0 else "x-provider-format: openai-chat"
+        headers = [spoof, f"x-ipp-diagnostic-id: {request_id}"]
+        if index > 0:
+            headers.append("x-api-key: client-marker")
+        callbacks_before_sample = callback_log_snapshot() if index in (0, 1) else None
         rc, status, raw = curl_request(f"externalmodel-mixed-{index}", externalmodel_url, body,
                                        auth_file=auth_file,
-                                       extra_headers=[spoof, "x-api-key: client-marker",
-                                                      f"x-ipp-diagnostic-id: {request_id}"])
+                                       extra_headers=headers)
         route_trace = capture_runtime_route_trace(request_id, f"mixed-{index}", route_trace_gateway_pod)
+        if index in (0, 1):
+            probe_label = "externalmodel-first-normal-auth-no-x-api-key" if index == 0 else (
+                "externalmodel-x-api-key-override-normal-auth")
+            auth_input_trace = capture_auth_policy_input_trace(
+                request_id, probe_label, route_trace_gateway_pod)
+            authorino_trace = authorino_request_trace(
+                route_trace.get("envoy_request_id") or request_id)
+            callbacks_after = callback_log_snapshot()
+            callbacks_before_ids = {
+                (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+                for event in callbacks_before_sample.get("events", [])
+            }
+            callback_delta = [
+                {key: event.get(key) for key in (
+                    "timestamp", "request_id", "method", "path", "status", "tenant_name",
+                    "tenant_namespace", "gateway_name", "authorization_header_present",
+                    "x_api_key_header_present",
+                ) if key in event}
+                for event in callbacks_after.get("events", [])
+                if (event.get("request_id"), event.get("timestamp"), event.get("path"), event.get("status"))
+                not in callbacks_before_ids
+            ]
+            normal_auth_probe = {
+                "client_request_id": request_id,
+                "http_status": status,
+                "curl_exit_status": rc,
+                "auth_policy_input": auth_input_trace,
+                "envoy_route_trace": route_trace,
+                "authorino_decision": authorino_trace,
+                "maas_callback_events_since_baseline": callback_delta,
+                "raw_authorization_values_saved": False,
+                "raw_callback_bodies_saved": False,
+            }
+            trace_name = ("externalmodel-first-normal-auth-request.json" if index == 0
+                          else "externalmodel-x-api-key-override-auth-request.json")
+            save_json(EVIDENCE / trace_name, normal_auth_probe)
+            authorization_path_ok = (
+                rc == 0 and status == "200"
+                and auth_input_trace.get("captured") is True
+                and auth_input_trace.get("authorization_present") is True
+                and auth_input_trace.get("authorization_scheme", "").lower() == "bearer"
+                and auth_input_trace.get("x_api_key_present") == (index == 1)
+                and auth_input_trace.get("path") == f"/{NAMESPACE}/demo/v1/chat/completions"
+                and route_trace.get("captured") is True
+                and route_trace.get("response_code") == "200"
+                and route_trace.get("response_flags") == "-"
+                and "provider-selection-required" not in route_trace.get("upstream_cluster", "")
+            )
+            if DIAGNOSTIC_BYPASS_AUTH_NAME:
+                assertion_name = (
+                    "externalmodel_diagnostic_bypass_allows_authenticated_request" if index == 0
+                    else "externalmodel_diagnostic_bypass_x_api_key_override_preserves_provider_credential"
+                )
+            else:
+                assertion_name = (
+                    "externalmodel_normal_maas_auth_allows_authenticated_request" if index == 0
+                    else "externalmodel_x_api_key_override_request_survives_maas_auth"
+                )
+            record(assertion_name, authorization_path_ok, {
+                       "http_status": status,
+                       "authorization_header_present_at_authorino": auth_input_trace.get("authorization_present"),
+                       "authorization_scheme_at_authorino": auth_input_trace.get("authorization_scheme"),
+                       "client_x_api_key_present": auth_input_trace.get("x_api_key_present"),
+                       "model_header": auth_input_trace.get("gateway_model"),
+                       "envoy_route": route_trace.get("route_name"),
+                       "upstream_cluster": route_trace.get("upstream_cluster"),
+                       "response_code_details": route_trace.get("response_code_details"),
+                       "authorino_response": next(({
+                           "authorized": event.get("authorized"),
+                           "response_status": event.get("response_status"),
+                           "response_code": event.get("response_code"),
+                       } for event in authorino_trace.get("matched_events", [])
+                           if event.get("message_class") == "authorization_response"), None),
+                       "maas_callback_paths_and_statuses": [
+                           {"path": event.get("path"), "status": event.get("status")}
+                           for event in callback_delta
+                       ],
+                       "credential_values_saved": False,
+                   })
         route_trace_ok = bool(route_trace.get("captured") and route_trace.get("route_name")
                               and route_trace.get("upstream_cluster") and route_trace.get("response_flags") is not None)
         if status != "200" or not route_trace_ok:
@@ -2846,6 +3564,136 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "runtime_upstream_cluster": openai_error_route.get("upstream_cluster"),
             "runtime_response_flags": openai_error_route.get("response_flags")})
 
+    # The shared size check runs before provider-format branching. A large
+    # OpenAI-compatible request must therefore pass the same configured cap
+    # while still reaching the OpenAI path and preserving its target model.
+    openai_large_request_id = f"{ROUTE_TRACE_PREFIX}openai-15m-request"
+    openai_large_body = chat_request_with_exact_json_size(1536 * 1024)
+    rc, openai_large_request_status, openai_large_request_raw = curl_request(
+        "externalmodel-openai-15m-request", externalmodel_url, openai_large_body,
+        auth_file=auth_file,
+        extra_headers=[f"x-ipp-diagnostic-id: {openai_large_request_id}"],
+        persist_response_payload=False)
+    try:
+        openai_large_request_response = json.loads(openai_large_request_raw)
+    except json.JSONDecodeError:
+        openai_large_request_response = {}
+    openai_large_request_receipts = [item for item in provider_aware_observations()
+                                     if item.get("diagnostic_id") == openai_large_request_id]
+    openai_large_request_observation = openai_large_request_receipts[0] if len(openai_large_request_receipts) == 1 else {}
+    record("externalmodel_openai_provider_accepts_15m_with_translation_enabled",
+           rc == 0 and openai_large_request_status == "200"
+           and bool(openai_large_request_response.get("choices"))
+           and len(openai_large_request_receipts) == 1
+           and openai_large_request_observation.get("path") == "/v1/chat/completions"
+           and openai_large_request_observation.get("model") == "mock-openai-model"
+           and openai_large_request_observation.get("credential_ok") is True
+           and openai_large_request_observation.get("tls") is True
+           and openai_large_request_observation.get("sni_ok") is True
+           and openai_large_request_observation.get("authority_ok") is True
+           and 1500 * 1024 < openai_large_request_observation.get("request_body_bytes", 0) < 2 * 1024 * 1024
+           and openai_large_request_observation.get("message_text") in (None, []),
+           {"http_status": openai_large_request_status,
+            "serialized_client_request_bytes": 1536 * 1024,
+            "provider_receipt_count": len(openai_large_request_receipts),
+            "provider_request_bytes": openai_large_request_observation.get("request_body_bytes"),
+            "provider_path": openai_large_request_observation.get("path"),
+            "provider_model": openai_large_request_observation.get("model"),
+            "credential_tls_sni_authority_ok": bool(openai_large_request_observation.get("credential_ok")
+                and openai_large_request_observation.get("tls")
+                and openai_large_request_observation.get("sni_ok")
+                and openai_large_request_observation.get("authority_ok")),
+            "large_prompt_saved_in_receipt": bool(openai_large_request_observation.get("message_text"))})
+
+    # Measure both sides of the configured OpenAI-compatible request boundary.
+    # The client byte count is measured before target-model rewriting.
+    for label, request_size in (("below", 2 * 1024 * 1024 - 1), ("at", 2 * 1024 * 1024)):
+        diagnostic_id = f"{ROUTE_TRACE_PREFIX}openai-limit-{label}"
+        # The request limit applies to the client body before target-model
+        # rewriting. The provider body is expected to grow by the model-name
+        # delta, while remaining under ExtProc's separate 10 MiB accumulator.
+        body, raw_payload = chat_request_json_with_exact_size(request_size)
+        serialized_request_bytes = len(raw_payload.encode())
+        rejection_counter_before = extproc_body_rejection_snapshot()
+        rc, status, raw = curl_request(
+            f"externalmodel-openai-limit-{label}", externalmodel_url, body,
+            raw_payload=raw_payload,
+            auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {diagnostic_id}"],
+            persist_response_payload=False)
+        # Scrape the counter immediately after the response. Route-log polling
+        # is deliberately later so it cannot obscure a short-lived pod or
+        # contaminate the before/after counter window.
+        rejection_counter_after = extproc_body_rejection_snapshot()
+        rejection_counter_delta = extproc_counter_delta(
+            rejection_counter_before, rejection_counter_after
+        )
+        route_trace = capture_runtime_route_trace(
+            diagnostic_id, f"openai-limit-{label}", route_trace_gateway_pod)
+        rejection_layer = classify_body_rejection(status, rejection_counter_delta)
+        try:
+            response = json.loads(raw)
+        except json.JSONDecodeError:
+            response = {}
+        receipts = [item for item in provider_aware_observations()
+                    if item.get("diagnostic_id") == diagnostic_id]
+        observation = receipts[0] if len(receipts) == 1 else {}
+        accepted = (
+            rc == 0 and status == "200" and bool(response.get("choices"))
+            and len(receipts) == 1
+            and observation.get("path") == "/v1/chat/completions"
+            and observation.get("model") == "mock-openai-model"
+            and observation.get("request_body_bytes") == request_size + 13
+            and rejection_counter_delta == 0
+            and observation.get("credential_ok") is True
+            and observation.get("tls") is True and observation.get("sni_ok") is True
+            and observation.get("authority_ok") is True
+        )
+        boundary_evidence = {
+            "diagnostic_id": diagnostic_id,
+            "http_status": status,
+            "curl_exit_status": rc,
+            "serialized_client_request_bytes": serialized_request_bytes,
+            "expected_client_request_bytes": request_size,
+            "provider_receipt_count": len(receipts),
+            "provider_path": observation.get("path"),
+            "provider_model": observation.get("model"),
+            "provider_request_bytes_after_model_mapping": observation.get("request_body_bytes"),
+            "provider_model_rewrite_overhead_bytes": (
+                observation.get("request_body_bytes") - request_size
+                if isinstance(observation.get("request_body_bytes"), int) else None
+            ),
+            "provider_body_within_server_accumulation_limit": (
+                isinstance(observation.get("request_body_bytes"), int)
+                and observation.get("request_body_bytes") <= 10 * 1024 * 1024
+            ),
+            "credential_tls_sni_authority_ok": bool(observation.get("credential_ok")
+                and observation.get("tls") and observation.get("sni_ok") and observation.get("authority_ok")),
+            "response_payload_saved": False,
+            "extproc_body_rejection_counter_before": rejection_counter_before.get("count"),
+            "extproc_body_rejection_counter_after": rejection_counter_after.get("count"),
+            "extproc_body_rejection_counter_delta": rejection_counter_delta,
+            "extproc_metric_before_error_type": rejection_counter_before.get("error_type"),
+            "extproc_metric_after_error_type": rejection_counter_after.get("error_type"),
+            "extproc_metric_before_pod_uid": rejection_counter_before.get("pod_uid"),
+            "extproc_metric_after_pod_uid": rejection_counter_after.get("pod_uid"),
+            "extproc_metric_before_container_id_sha256": rejection_counter_before.get("container_id_sha256"),
+            "extproc_metric_after_container_id_sha256": rejection_counter_after.get("container_id_sha256"),
+            "extproc_metric_before_restart_count": rejection_counter_before.get("container_restart_count"),
+            "extproc_metric_after_restart_count": rejection_counter_after.get("container_restart_count"),
+            "rejection_layer_attribution": rejection_layer,
+            "translator_error_attribution_claimed": False,
+            "runtime_route_name": route_trace.get("route_name"),
+            "runtime_upstream_cluster": route_trace.get("upstream_cluster"),
+            "runtime_response_code_details": route_trace.get("response_code_details"),
+            "runtime_response_flags": route_trace.get("response_flags"),
+            "runtime_upstream_host": route_trace.get("upstream_host"),
+            "route_trace_captured": route_trace.get("captured"),
+            "route_trace_request_id": route_trace.get("envoy_request_id"),
+        }
+        save_json(EVIDENCE / f"openai-request-boundary-{label}-diagnosis.json", boundary_evidence)
+        record(f"externalmodel_openai_request_{label}_2mib_boundary_succeeds", accepted,
+               boundary_evidence)
+
     # A large-but-under-limit OpenAI JSON response must pass through the
     # selected provider unchanged. The separate over-limit probe below records
     # the MaaS Envoy usage JSON parser's existing response buffer ceiling.
@@ -2918,9 +3766,9 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "shared_recorder_request_delta": (
                 shared_observations_after_under_limit - shared_observations_before_under_limit)})
 
-    # Existing Envoy response-buffer control. Keep this separate from the
-    # translation review; it does not establish behavior at the translator's
-    # 1 MiB response limit.
+    # OpenAI-compatible responses pass through the Anthropic translator. This
+    # response is above the former 1 MiB listener buffer but below the updated
+    # 2 MiB + 64 KiB listener limit, so it should remain an upstream success.
     openai_large_response_marker = "externalmodel-openai-large-json-response"
     openai_large_response_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-response"
     shared_observations_before_large_response = len(observations())
@@ -2946,6 +3794,15 @@ def test_externalmodel_provider_aware_translation(auth_file):
     openai_large_response_observation = wait_provider_observation(
         lambda item: openai_large_response_marker in item.get("message_text", []),
         "large OpenAI-compatible JSON response")
+    openai_large_response_receipts = [item for item in provider_aware_observations()
+                                      if item.get("diagnostic_id") == openai_large_response_request_id]
+    openai_expected_response_content = (
+        "openai large response:" + "x" * ((1 << 20) + 128) + "::OPENAI_RESPONSE_COMPLETE::")
+    openai_expected_response_sha256 = hashlib.sha256(
+        openai_expected_response_content.encode()).hexdigest()
+    openai_actual_response_sha256 = hashlib.sha256(
+        openai_large_response_content.encode()).hexdigest() if openai_large_response_content else None
+    openai_large_response_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     openai_large_response_route = capture_runtime_route_trace(
         openai_large_response_request_id, "openai-large-response", route_trace_gateway_pod)
     time.sleep(0.5)
@@ -2969,17 +3826,35 @@ def test_externalmodel_provider_aware_translation(auth_file):
         and openai_large_response_observation.get("sni_ok") is True
         and openai_large_response_observation.get("authority_ok") is True
     )
-    record("externalmodel_over_limit_openai_json_is_rejected_by_envoy_response_path",
-           rc == 0 and openai_large_response_status == "500"
-           and openai_large_response_route.get("response_code_details") == "response_payload_too_large"
+    record("externalmodel_openai_compatible_large_json_response_passes_through",
+           rc == 0 and openai_large_response_status == "200"
+           and openai_large_response_route.get("response_code_details") == "via_upstream"
+           and (1 << 20) < len(openai_large_response_raw) < (2 * 1024 * 1024 + 64 * 1024)
+           and len(openai_large_response_receipts) == 1
+           and len(openai_large_response_content.encode()) == len(openai_expected_response_content.encode())
+           and openai_large_response_content.endswith("::OPENAI_RESPONSE_COMPLETE::")
+           and openai_actual_response_sha256 == openai_expected_response_sha256
+           and openai_large_response.get("id") == "chatcmpl-kind"
+           and openai_large_response.get("model") == "mock-openai-model"
+           and openai_large_response.get("usage") == {
+               "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+           and openai_large_response_choice.get("finish_reason") == "stop"
            and openai_large_response_provider_ok and openai_large_response_route_ok
            and shared_observations_after_large_response == shared_observations_before_large_response,
            {"http_status": openai_large_response_status,
             "downstream_json_bytes": len(openai_large_response_raw),
             "downstream_content_bytes": len(openai_large_response_content.encode()),
+            "provider_receipt_count": len(openai_large_response_receipts),
+            "response_model": openai_large_response.get("model"),
+            "response_id": openai_large_response.get("id"),
+            "usage": openai_large_response.get("usage"),
+            "finish_reason": openai_large_response_choice.get("finish_reason"),
+            "terminal_sentinel_present": openai_large_response_content.endswith("::OPENAI_RESPONSE_COMPLETE::"),
+            "content_sha256": openai_actual_response_sha256,
+            "expected_content_sha256": openai_expected_response_sha256,
             "response_payload_saved": False,
             "response_code_details": openai_large_response_route.get("response_code_details"),
-            "rejection_layer": "Envoy response path; the filter responsible for the size rejection was not isolated",
+            "response_handling": "OpenAI-compatible response passed through; translator response cap applies to Anthropic JSON conversion",
             "provider_recorder_label": openai_large_response_observation.get("provider"),
             "upstream_path": openai_large_response_observation.get("path"),
             "upstream_model": openai_large_response_observation.get("model"),
@@ -2995,17 +3870,20 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "shared_recorder_request_delta": (
                 shared_observations_after_large_response - shared_observations_before_large_response)})
 
-    # Existing Envoy preselection control: this proves the request was rejected
-    # before provider contact, not that the Praxis selected-provider filter
-    # enforced its own 1 MiB request limit. Keep the synthetic body out of
-    # retained evidence.
-    openai_large_marker = "externalmodel-openai-body-limit"
+    # The same-pod ExtProc counter distinguishes its selected-upstream guard
+    # from an earlier Envoy/pre-auth 413. Do not attribute a response unless
+    # the counter samples bracket the request on the same container instance.
     openai_large_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-request"
     openai_upstream_count = len(provider_aware_observations())
-    large_content = openai_large_marker + ("x" * (1024 * 1024 + 128))
+    large_content_size = 2 * 1024 * 1024 + 1
+    openai_over_limit_body = chat_request_with_exact_json_size(large_content_size)
+    openai_over_limit_serialized_bytes = len(
+        json.dumps(openai_over_limit_body, separators=(",", ":")).encode()
+    )
+    openai_rejections_before = extproc_body_rejection_snapshot()
     rc, openai_large_status, openai_large_raw = curl_request(
         "externalmodel-openai-request-body-limit", externalmodel_url,
-        {"model": "demo", "messages": [{"role": "user", "content": large_content}]},
+        openai_over_limit_body,
         auth_file=auth_file,
         extra_headers=[f"x-ipp-diagnostic-id: {openai_large_request_id}"],
         persist_response_payload=False,
@@ -3014,27 +3892,57 @@ def test_externalmodel_provider_aware_translation(auth_file):
         openai_large_request_id, "openai-large-request", route_trace_gateway_pod)
     time.sleep(0.5)
     openai_upstream_after_limit = len(provider_aware_observations())
-    openai_envoy_preselection_limit = (
-        openai_large_route.get("response_code_details") == "request_payload_too_large"
-        and openai_large_route.get("model_header") in (None, "-")
-        and openai_large_route.get("selected_candidate_header") in (None, "-")
-        and "provider-selection-required-demo-model" in openai_large_route.get("upstream_cluster", "")
-        and openai_large_route.get("upstream_host") in (None, "-")
+    openai_rejections_after = extproc_body_rejection_snapshot()
+    openai_rejection_delta = extproc_counter_delta(openai_rejections_before, openai_rejections_after)
+    openai_large_receipts = [item for item in provider_aware_observations()
+                             if item.get("diagnostic_id") == openai_large_request_id]
+    openai_selected_limit_rejection = (
+        openai_rejection_delta == 1
+        and MOUNTED_TRANSLATION_LIMITS == {
+            "server_max_body_bytes": 10 * 1024 * 1024,
+            "translator_max_request_body_bytes": 2 * 1024 * 1024,
+            "translator_max_response_body_bytes": 1 * 1024 * 1024,
+            "translator_filter_present": True,
+        }
     )
     openai_large_route_captured = openai_large_route.get("captured") is True
-    record("externalmodel_openai_request_rejected_by_envoy_before_provider_selection",
+    record("externalmodel_openai_request_over_2mib_rejected_by_extproc_input_limit",
            rc == 0 and openai_large_status == "413"
-           and openai_envoy_preselection_limit
+           and openai_over_limit_serialized_bytes == large_content_size
+           and openai_selected_limit_rejection
            and len(openai_large_raw) < 4096
-           and openai_upstream_after_limit == openai_upstream_count,
+           and len(openai_large_receipts) == 0,
            {"http_status": openai_large_status,
-            "request_bytes_exceed_configured_limit": True,
+            "serialized_client_request_bytes": openai_over_limit_serialized_bytes,
+            "expected_client_request_bytes": large_content_size,
             "downstream_response_bytes": len(openai_large_raw),
-            "praxis_selected_provider_filter_reached": False,
-            "envoy_preselection_limit_observed": openai_envoy_preselection_limit,
-            "rejection_layer": "Envoy buffered pre-auth ExternalModel processor",
+            "response_body_saved": False,
+            "extproc_body_rejection_counter_before": openai_rejections_before.get("count"),
+            "extproc_body_rejection_counter_after": openai_rejections_after.get("count"),
+            "extproc_body_rejection_counter_delta": openai_rejection_delta,
+            "extproc_metric_before_pod_uid": openai_rejections_before.get("pod_uid"),
+            "extproc_metric_after_pod_uid": openai_rejections_after.get("pod_uid"),
+            "extproc_metric_before_container_id_sha256": openai_rejections_before.get("container_id_sha256"),
+            "extproc_metric_after_container_id_sha256": openai_rejections_after.get("container_id_sha256"),
+            "extproc_metric_before_restart_count": openai_rejections_before.get("container_restart_count"),
+            "extproc_metric_after_restart_count": openai_rejections_after.get("container_restart_count"),
+            "extproc_metric_error_types": [openai_rejections_before.get("error_type"),
+                                            openai_rejections_after.get("error_type")],
+            "extproc_input_limit_rejection_proven": openai_selected_limit_rejection,
+            "rejection_stage": "selected-upstream input guard before body translation",
+            "translator_error_attribution_claimed": False,
+            "provider_contacted": bool(openai_large_receipts),
+            "provider_receipt_count": len(openai_large_receipts),
+            "unrelated_provider_receipt_count_before": openai_upstream_count,
+            "unrelated_provider_receipt_count_after": openai_upstream_after_limit,
+            "rejection_layer": (
+                "Praxis ExtProc selected-upstream input guard"
+                if openai_selected_limit_rejection else "unattributed"
+            ),
+            "guard_runs_before_request_body_translation": True,
             "route_trace_captured": openai_large_route_captured,
-            "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
+            "selected_upstream_request_limit_bytes": MOUNTED_TRANSLATION_LIMITS.get("translator_max_request_body_bytes") if MOUNTED_TRANSLATION_LIMITS else None,
+            "extproc_server_accumulation_limit_bytes": MOUNTED_TRANSLATION_LIMITS.get("server_max_body_bytes") if MOUNTED_TRANSLATION_LIMITS else None,
             "runtime_route_name": openai_large_route.get("route_name"),
             "runtime_response_code_details": openai_large_route.get("response_code_details"),
             "runtime_upstream_cluster": openai_large_route.get("upstream_cluster"),
@@ -3075,6 +3983,8 @@ def test_externalmodel_provider_aware_translation(auth_file):
            and "filter: openai_chat_completions_to_anthropic\n" not in openai_off_runtime["extproc_config"]
            and "openai_chat_completions_to_anthropic_stream" not in openai_off_runtime["extproc_config"]
            and "max_body_bytes" not in openai_off_runtime["extproc_config"]
+           and "max_request_body_bytes" not in openai_off_runtime["extproc_config"]
+           and "max_response_body_bytes" not in openai_off_runtime["extproc_config"]
            and "allow_unbounded_body: true" in openai_off_runtime["extproc_config"]
            and all(not any(field in candidate for field in ("api_format", "path", "target_model"))
                    for candidate in openai_off_runtime["demo_model_candidates"]),
@@ -3087,6 +3997,36 @@ def test_externalmodel_provider_aware_translation(auth_file):
                 for candidate in openai_off_runtime["demo_model_candidates"]),
             "translation_permission": False,
             "selected_provider_clusters": openai_off_runtime["demo_model_candidate_clusters"]})
+
+    openai_off_large_id = f"{ROUTE_TRACE_PREFIX}openai-15m-translation-off"
+    openai_off_large_body = chat_request_with_exact_json_size(1536 * 1024)
+    rc, openai_off_large_status, openai_off_large_raw = curl_request(
+        "externalmodel-openai-15m-translation-off", externalmodel_url, openai_off_large_body,
+        auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {openai_off_large_id}"],
+        persist_response_payload=False)
+    try:
+        openai_off_large_response = json.loads(openai_off_large_raw)
+    except json.JSONDecodeError:
+        openai_off_large_response = {}
+    openai_off_large_receipts = [item for item in provider_aware_observations()
+                                 if item.get("diagnostic_id") == openai_off_large_id]
+    openai_off_large_observation = openai_off_large_receipts[0] if len(openai_off_large_receipts) == 1 else {}
+    record("externalmodel_openai_15m_translation_disabled_control",
+           rc == 0 and openai_off_large_status == "200"
+           and bool(openai_off_large_response.get("choices"))
+           and len(openai_off_large_receipts) == 1
+           and openai_off_large_observation.get("path") == "/v1/chat/completions"
+           and openai_off_large_observation.get("model") == "demo"
+           and openai_off_large_observation.get("credential_ok") is True
+           and openai_off_large_observation.get("request_body_bytes") == 1536 * 1024
+           and openai_off_large_observation.get("message_text") in (None, []),
+           {"http_status": openai_off_large_status,
+            "serialized_client_request_bytes": 1536 * 1024,
+            "provider_receipt_count": len(openai_off_large_receipts),
+            "provider_request_bytes": openai_off_large_observation.get("request_body_bytes"),
+            "provider_model": openai_off_large_observation.get("model"),
+            "translation_filters_absent": "openai_chat_completions_to_anthropic" not in openai_off_runtime["extproc_config"],
+            "large_prompt_saved_in_receipt": bool(openai_off_large_observation.get("message_text"))})
 
     kubectl("-n", NAMESPACE, "patch", "maastenantconfig", "default-tenant", "--type=merge",
             "-p", '{"spec":{"apiTranslation":{"enabled":true}}}')
@@ -3240,7 +4180,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "credential_ok": oversized_observation.get("credential_ok"),
             "tls": oversized_observation.get("tls"), "sni_ok": oversized_observation.get("sni_ok"),
             "authority_ok": oversized_observation.get("authority_ok"),
-            "rejection_layer": "Praxis AI OpenAI-to-Anthropic response filter",
+            "rejection_layer": "Praxis AI Anthropic JSON response conversion filter",
             "runtime_route_name": oversized_route.get("route_name"),
             "runtime_upstream_cluster": oversized_route.get("upstream_cluster"),
             "runtime_response_flags": oversized_route.get("response_flags")})
@@ -3296,48 +4236,258 @@ def test_externalmodel_provider_aware_translation(auth_file):
            {"http_status": invalid_status, "upstream_contact_count_before": upstream_count,
             "upstream_contact_count_after": len(provider_aware_observations())})
 
-    # This large request is an Envoy preselection control, not a Praxis limit
-    # test: the pre-auth processor rejects it before the selected-provider
-    # filter receives a body.
-    large_content = "x" * (1024 * 1024 + 128)
-    upstream_count = len(provider_aware_observations())
-    anthropic_large_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-large-request"
-    rc, large_status, large_raw = curl_request("externalmodel-anthropic-body-limit", externalmodel_url,
-        {"model": "demo", "max_tokens": 32,
-         "messages": [{"role": "user", "content": large_content}]}, auth_file=auth_file,
-        extra_headers=[f"x-ipp-diagnostic-id: {anthropic_large_request_id}"],
+    # A 1.5 MiB OpenAI-compatible request must survive both Envoy's buffered
+    # pre-auth phase and the selected-provider Anthropic translator. The
+    # recorder stores only structural metadata for this large request.
+    large_compatibility_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-15m-compat"
+    large_compatibility_body = chat_request_with_exact_json_size(
+        1536 * 1024, compatibility_fields=True)
+    rc, large_compatibility_status, large_compatibility_raw = curl_request(
+        "externalmodel-anthropic-15m-compatibility", externalmodel_url,
+        large_compatibility_body, auth_file=auth_file,
+        extra_headers=[f"x-ipp-diagnostic-id: {large_compatibility_request_id}"],
         persist_response_payload=False)
-    anthropic_large_route = capture_runtime_route_trace(
-        anthropic_large_request_id, "anthropic-large-request", route_trace_gateway_pod)
-    time.sleep(0.5)
-    anthropic_upstream_after_limit = len(provider_aware_observations())
-    anthropic_envoy_preselection_limit = (
-        anthropic_large_route.get("response_code_details") == "request_payload_too_large"
-        and anthropic_large_route.get("model_header") in (None, "-")
-        and anthropic_large_route.get("selected_candidate_header") in (None, "-")
-        and "provider-selection-required-demo-model" in anthropic_large_route.get("upstream_cluster", "")
-        and anthropic_large_route.get("upstream_host") in (None, "-")
+    try:
+        large_compatibility_response = json.loads(large_compatibility_raw)
+    except json.JSONDecodeError:
+        large_compatibility_response = {}
+    large_compatibility_receipts = [item for item in provider_aware_observations()
+                                    if item.get("diagnostic_id") == large_compatibility_request_id]
+    large_compatibility_observation = large_compatibility_receipts[0] if len(large_compatibility_receipts) == 1 else {}
+    large_compatibility_success = (
+        rc == 0 and large_compatibility_status == "200"
+        and bool(large_compatibility_response.get("choices"))
+        and len(large_compatibility_receipts) == 1
+        and large_compatibility_observation.get("path") == "/v1/messages"
+        and large_compatibility_observation.get("anthropic_request_ok") is True
+        and large_compatibility_observation.get("message_text") in (None, [])
     )
-    record("externalmodel_anthropic_request_rejected_by_envoy_before_provider_selection",
-           rc == 0 and large_status == "413"
-           and anthropic_envoy_preselection_limit
-           and len(large_raw) < 4096 and anthropic_upstream_after_limit == upstream_count,
-           {"http_status": large_status, "request_bytes_exceed_configured_limit": True,
-            "downstream_response_bytes": len(large_raw),
-            "praxis_selected_provider_filter_reached": False,
-            "envoy_preselection_limit_observed": anthropic_envoy_preselection_limit,
-            "rejection_layer": "Envoy buffered pre-auth ExternalModel processor",
-            "route_trace_captured": anthropic_large_route.get("captured") is True,
-            "dedicated_extproc_accumulation_limit_bytes": 10 * 1024 * 1024,
-            "upstream_contact_count_before": upstream_count,
-            "upstream_contact_count_after": anthropic_upstream_after_limit,
-            "runtime_route_name": anthropic_large_route.get("route_name"),
-            "runtime_response_code_details": anthropic_large_route.get("response_code_details"),
-            "runtime_upstream_cluster": anthropic_large_route.get("upstream_cluster"),
-            "runtime_response_flags": anthropic_large_route.get("response_flags"),
-            "runtime_upstream_host": anthropic_large_route.get("upstream_host"),
-            "runtime_model_header": anthropic_large_route.get("model_header"),
-            "runtime_selected_candidate_header": anthropic_large_route.get("selected_candidate_header")})
+    large_compatibility_details = {
+        "http_status": large_compatibility_status,
+        "serialized_client_request_bytes": 1536 * 1024,
+        "provider_receipt_count": len(large_compatibility_receipts),
+        "provider_request_bytes": large_compatibility_observation.get("request_body_bytes"),
+        "upstream_path": large_compatibility_observation.get("path"),
+        "translated_request_valid": large_compatibility_observation.get("anthropic_request_ok"),
+        "translated_max_tokens": large_compatibility_observation.get("anthropic_max_tokens"),
+        "legacy_options_absent": large_compatibility_observation.get("legacy_options_absent"),
+        "large_prompt_saved_in_receipt": bool(large_compatibility_observation.get("message_text")),
+    }
+    record("externalmodel_anthropic_missing_token_limit_defaults_to_4096",
+           large_compatibility_success
+           and large_compatibility_observation.get("anthropic_max_tokens") == 4096,
+           large_compatibility_details)
+    record("externalmodel_anthropic_legacy_options_are_accepted_and_dropped",
+           large_compatibility_success
+           and large_compatibility_observation.get("legacy_options_absent") is True,
+           large_compatibility_details)
+    record("externalmodel_anthropic_15m_compatibility_request_succeeds",
+           large_compatibility_success
+           and 1500 * 1024 < large_compatibility_observation.get("request_body_bytes", 0) < 2 * 1024 * 1024,
+           large_compatibility_details)
+
+    # Exercise each legacy OpenAI-only option independently. Every request
+    # omits token limits so the same receipt also proves the 4096 default.
+    legacy_option_cases = (
+        ("user", "compatibility-test-user"),
+        ("n", 2),
+        ("seed", 17),
+        ("parallel_tool_calls", True),
+    )
+    for field, value in legacy_option_cases:
+        marker = f"externalmodel-anthropic-legacy-option-{field}"
+        diagnostic_id = compact_translation_diagnostic_id(
+            ROUTE_TRACE_PREFIX, f"anthropic-legacy-{field}"
+        )
+        request_body = {
+            "model": "demo",
+            "messages": [{"role": "user", "content": marker}],
+            field: value,
+        }
+        rc, status, raw = curl_request(
+            f"externalmodel-anthropic-legacy-option-{field}", externalmodel_url, request_body,
+            auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {diagnostic_id}"],
+            persist_response_payload=False)
+        try:
+            response = json.loads(raw)
+        except json.JSONDecodeError:
+            response = {}
+        receipts = [item for item in provider_aware_observations()
+                    if item.get("diagnostic_id") == diagnostic_id]
+        observation = receipts[0] if len(receipts) == 1 else {}
+        record(f"externalmodel_anthropic_legacy_option_{field}_accepted_and_omitted",
+               rc == 0 and status == "200" and bool(response.get("choices"))
+               and len(receipts) == 1
+               and observation.get("path") == "/v1/messages"
+               and observation.get("model") == "mock-anthropic-model"
+               and observation.get("message_text") == [marker]
+               and observation.get("anthropic_request_ok") is True
+               and observation.get("anthropic_max_tokens") == 4096
+               and observation.get("legacy_options_absent") is True
+               and observation.get("credential_ok") is True
+               and observation.get("tls") is True
+               and observation.get("sni_ok") is True
+               and observation.get("authority_ok") is True,
+               {"http_status": status, "provider_receipt_count": len(receipts),
+                "provider_path": observation.get("path"),
+                "provider_model": observation.get("model"),
+                "translated_request_valid": observation.get("anthropic_request_ok"),
+                "translated_max_tokens": observation.get("anthropic_max_tokens"),
+                "legacy_options_absent_upstream": observation.get("legacy_options_absent"),
+                "provider_credential_ok": observation.get("credential_ok"),
+                "provider_tls_sni_authority_ok": all(
+                    observation.get(key) is True for key in ("tls", "sni_ok", "authority_ok")),
+                "legacy_option_name": field,
+                "legacy_option_value_saved": False})
+
+    # Data URLs become Anthropic base64 sources; HTTPS URLs are passed through
+    # without Praxis fetching them. The recording backend sees only block and
+    # source types, never image bytes.
+    image_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-image-compat"
+    png_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    image_body = {"model": "demo", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "before-image"},
+        {"type": "image_url", "image_url": {"url": png_data_url, "detail": "high"}},
+        {"type": "text", "text": "after-image"},
+        {"type": "image_url", "image_url": {"url": "https://images.example.test/photo.png"}},
+    ]}]}
+    rc, image_status, _ = curl_request(
+        "externalmodel-anthropic-image-compatibility", externalmodel_url, image_body,
+        auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {image_request_id}"],
+        persist_response_payload=False)
+    image_receipts = [item for item in provider_aware_observations()
+                      if item.get("diagnostic_id") == image_request_id]
+    image_observation = image_receipts[0] if len(image_receipts) == 1 else {}
+    record("externalmodel_anthropic_image_content_translates_in_order",
+           rc == 0 and image_status == "200" and len(image_receipts) == 1
+           and image_observation.get("anthropic_request_ok") is True
+           and image_observation.get("anthropic_block_types") == ["text", "image", "text", "image"]
+           and image_observation.get("anthropic_image_source_types") == ["base64", "url"]
+           and image_observation.get("message_text") == ["before-image", "after-image"],
+           {"http_status": image_status, "provider_receipt_count": len(image_receipts),
+            "translated_request_valid": image_observation.get("anthropic_request_ok"),
+            "content_block_types": image_observation.get("anthropic_block_types"),
+            "image_source_types": image_observation.get("anthropic_image_source_types"),
+            "text_order": image_observation.get("message_text"), "image_bytes_saved": False})
+
+    # Exercise the configured 2 MiB client-input boundary with exact serialized
+    # JSON sizes. At and below the limit reaches the provider. One byte over is
+    # rejected by ExtProc's selected-upstream input guard before translation.
+    for label, request_size in (("below", 2 * 1024 * 1024 - 1), ("at", 2 * 1024 * 1024)):
+        diagnostic_id = f"{ROUTE_TRACE_PREFIX}anthropic-limit-{label}"
+        # Include supported compatibility fields so this also verifies they
+        # remain accepted and omitted while the client-input boundary is tested.
+        body = chat_request_with_exact_json_size(
+            request_size,
+            model="demo",
+            compatibility_fields=True,
+            compatibility_user_value="x" * 128,
+        )
+        serialized_request_bytes = len(json.dumps(body, separators=(",", ":")).encode())
+        rejections_before = extproc_body_rejection_snapshot()
+        rc, status, raw = curl_request(
+            f"externalmodel-anthropic-limit-{label}", externalmodel_url, body,
+            auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {diagnostic_id}"],
+            persist_response_payload=False)
+        rejections_after = extproc_body_rejection_snapshot()
+        rejection_delta = extproc_counter_delta(rejections_before, rejections_after)
+        try:
+            response = json.loads(raw)
+        except json.JSONDecodeError:
+            response = {}
+        receipts = [item for item in provider_aware_observations()
+                    if item.get("diagnostic_id") == diagnostic_id]
+        observation = receipts[0] if len(receipts) == 1 else {}
+        record(f"externalmodel_anthropic_request_{label}_2mib_boundary_succeeds",
+               rc == 0 and status == "200" and response.get("choices")
+               and len(receipts) == 1 and observation.get("anthropic_request_ok") is True
+               and observation.get("model") == "mock-anthropic-model"
+               and observation.get("request_body_bytes", 0) <= 10 * 1024 * 1024
+               and observation.get("anthropic_max_tokens") == 4096
+               and observation.get("legacy_options_absent") is True
+               and observation.get("credential_ok") is True
+               and observation.get("tls") is True and observation.get("sni_ok") is True
+               and observation.get("authority_ok") is True
+               and rejection_delta == 0,
+               {"http_status": status,
+                "serialized_client_request_bytes": serialized_request_bytes,
+                "expected_client_request_bytes": request_size,
+                "provider_receipt_count": len(receipts),
+                "provider_request_bytes": observation.get("request_body_bytes"),
+                "provider_body_within_server_accumulation_limit": (
+                    isinstance(observation.get("request_body_bytes"), int)
+                    and observation.get("request_body_bytes") <= 10 * 1024 * 1024
+                ),
+                "translated_request_valid": observation.get("anthropic_request_ok"),
+                "translated_max_tokens": observation.get("anthropic_max_tokens"),
+                "ignored_compatibility_options_absent": observation.get("legacy_options_absent"),
+                "extproc_body_rejection_counter_delta": rejection_delta,
+                "provider_credential_tls_sni_authority_ok": all(
+                    observation.get(key) is True for key in ("credential_ok", "tls", "sni_ok", "authority_ok")),
+                "response_payload_saved": False})
+
+    over_limit_size = 2 * 1024 * 1024 + 1
+    over_limit_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-limit-over"
+    over_limit_body = chat_request_with_exact_json_size(over_limit_size)
+    over_limit_serialized_bytes = len(json.dumps(over_limit_body, separators=(",", ":")).encode())
+    over_limit_rejections_before = extproc_body_rejection_snapshot()
+    rc, over_limit_status, over_limit_raw = curl_request(
+        "externalmodel-anthropic-limit-over", externalmodel_url, over_limit_body,
+        auth_file=auth_file, extra_headers=[f"x-ipp-diagnostic-id: {over_limit_request_id}"],
+        persist_response_payload=False)
+    over_limit_rejections_after = extproc_body_rejection_snapshot()
+    over_limit_rejection_delta = extproc_counter_delta(
+        over_limit_rejections_before, over_limit_rejections_after
+    )
+    over_limit_route = capture_runtime_route_trace(
+        over_limit_request_id, "anthropic-limit-over", route_trace_gateway_pod)
+    over_limit_receipts = [item for item in provider_aware_observations()
+                           if item.get("diagnostic_id") == over_limit_request_id]
+    extproc_rejected_over_limit = (
+        over_limit_rejection_delta == 1
+        and MOUNTED_TRANSLATION_LIMITS == {
+            "server_max_body_bytes": 10 * 1024 * 1024,
+            "translator_max_request_body_bytes": 2 * 1024 * 1024,
+            "translator_max_response_body_bytes": 1 * 1024 * 1024,
+            "translator_filter_present": True,
+        }
+    )
+    record("externalmodel_anthropic_request_over_2mib_rejected_by_extproc_input_limit",
+           rc == 0 and over_limit_status == "413" and len(over_limit_raw) < 4096
+           and over_limit_serialized_bytes == over_limit_size
+           and extproc_rejected_over_limit and not over_limit_receipts,
+           {"http_status": over_limit_status,
+            "serialized_client_request_bytes": over_limit_serialized_bytes,
+            "expected_client_request_bytes": over_limit_size,
+            "provider_receipt_count": len(over_limit_receipts),
+            "response_body_saved": False,
+            "extproc_body_rejection_counter_before": over_limit_rejections_before.get("count"),
+            "extproc_body_rejection_counter_after": over_limit_rejections_after.get("count"),
+            "extproc_body_rejection_counter_delta": over_limit_rejection_delta,
+            "extproc_metric_before_pod_uid": over_limit_rejections_before.get("pod_uid"),
+            "extproc_metric_after_pod_uid": over_limit_rejections_after.get("pod_uid"),
+            "extproc_metric_before_container_id_sha256": over_limit_rejections_before.get("container_id_sha256"),
+            "extproc_metric_after_container_id_sha256": over_limit_rejections_after.get("container_id_sha256"),
+            "extproc_metric_before_restart_count": over_limit_rejections_before.get("container_restart_count"),
+            "extproc_metric_after_restart_count": over_limit_rejections_after.get("container_restart_count"),
+            "extproc_metric_error_types": [over_limit_rejections_before.get("error_type"),
+                                            over_limit_rejections_after.get("error_type")],
+            "extproc_input_limit_rejection_proven": extproc_rejected_over_limit,
+            "rejection_stage": "selected-upstream input guard before body translation",
+            "translator_error_attribution_claimed": False,
+            "provider_contacted": bool(over_limit_receipts),
+            "rejection_layer": (
+                "Praxis ExtProc selected-upstream input guard"
+                if extproc_rejected_over_limit else "unattributed"
+            ),
+            "guard_runs_before_request_body_translation": True,
+            "selected_upstream_request_limit_bytes": MOUNTED_TRANSLATION_LIMITS.get("translator_max_request_body_bytes") if MOUNTED_TRANSLATION_LIMITS else None,
+            "extproc_server_accumulation_limit_bytes": MOUNTED_TRANSLATION_LIMITS.get("server_max_body_bytes") if MOUNTED_TRANSLATION_LIMITS else None,
+            "envoy_route_trace_diagnostic_only": over_limit_route.get("captured") is True,
+            "runtime_response_code_details": over_limit_route.get("response_code_details"),
+            "runtime_upstream_cluster": over_limit_route.get("upstream_cluster"),
+            "runtime_model_header": over_limit_route.get("model_header"),
+            "runtime_selected_candidate_header": over_limit_route.get("selected_candidate_header")})
 
     stream_request = {
         "model": "demo", "max_tokens": 32, "stream": True,
@@ -3677,7 +4827,7 @@ def capture_auth_diagnostics_on_failure():
 def cleanup():
     global KEY_ID, MTC_ORIGINAL, MTC_CAPTURED, EXTERNAL_MODEL_CHANGED, PROVIDER_AWARE_CREATED
     global DIAGNOSTIC_ROUTE_AUTH_CREATED
-    global EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256
+    global DIAGNOSTIC_BYPASS_AUTH_NAME, DIAGNOSTIC_BYPASS_AUTH_UID
     if KEY_ID and API_PORT and (TEMP / "admin.cfg").exists():
         ca_file = TEMP / "maas-api-ca.crt"
         host = f"maas-api.maas-system.svc.cluster.local:{API_PORT}:127.0.0.1"
@@ -3699,19 +4849,58 @@ def cleanup():
             kubectl("-n", NAMESPACE, "patch", "maastenantconfig", "default-tenant", "--type=merge",
                     "-p", json.dumps({"spec": {"apiTranslation": MTC_ORIGINAL}}), check=False)
     restored = not EXTERNAL_MODEL_CHANGED
-    if EXTERNAL_MODEL_CHANGED and EXTERNAL_MODEL_ORIGINAL_OVERLAY is not None:
+    restoration_target = BASELINE_EXTERNALMODEL_RUNTIME or EXTERNAL_MODEL_ORIGINAL_OVERLAY
+    if EXTERNAL_MODEL_CHANGED and restoration_target is not None:
         for _ in range(120):
             current_model = kubectl("-n", NAMESPACE, "get", "externalmodel", "demo-model", "-o", "json", check=False)
             current_overlay = kubectl("-n", NAMESPACE, "get", "configmap", "routing-overlay", "-o", "json", check=False)
-            if current_model.returncode == 0 and current_overlay.returncode == 0:
+            current_plugins = kubectl("-n", NAMESPACE, "get", "configmap",
+                                      "payload-processing-external-model-plugins", "-o", "json", check=False)
+            current_deployment = kubectl("-n", NAMESPACE, "get", "deployment",
+                                         "payload-processing-external-model", "-o", "json", check=False)
+            if (current_model.returncode == 0 and current_overlay.returncode == 0
+                    and current_plugins.returncode == 0 and current_deployment.returncode == 0):
                 model_obj = json.loads(current_model.stdout)
                 overlay_obj = json.loads(current_overlay.stdout)
+                overlay_content = json.loads(overlay_obj.get("data", {}).get("routing-overlay.json", "{}"))
+                plugins_obj = json.loads(current_plugins.stdout)
+                extproc_config = plugins_obj.get("data", {}).get("extproc.yaml", "")
+                deployment_obj = json.loads(current_deployment.stdout)
                 phase = model_obj.get("status", {}).get("phase")
-                digest = overlay_obj.get("metadata", {}).get("annotations", {}).get(
-                    "inference.opendatahub.io/routing-overlay-content-digest", "")
-                if phase == "Ready" and digest == EXTERNAL_MODEL_ORIGINAL_OVERLAY.get("content_digest"):
-                    restored = True
-                    break
+                deployment_ready = (
+                    deployment_obj.get("status", {}).get("observedGeneration")
+                    == deployment_obj.get("metadata", {}).get("generation")
+                    and deployment_obj.get("status", {}).get("readyReplicas", 0)
+                    == deployment_obj.get("spec", {}).get("replicas", 1)
+                )
+                semantic_overlay_restored = overlay_content.get("overlay", {}) == restoration_target.get("overlay", {})
+                filter_config_restored = extproc_config == restoration_target.get("extproc_config", "")
+                if phase == "Ready" and deployment_ready and semantic_overlay_restored and filter_config_restored:
+                    snapshot = externalmodel_runtime_snapshot("restored-baseline")
+                    published_digest = snapshot.get("published_digest")
+                    serving_revision_converged = bool(snapshot.get("pods")) and all(
+                        pod.get("ready") and not pod.get("deleting")
+                        and pod.get("mounted_overlay_matches_published")
+                        and pod.get("accepted_revision") == published_digest
+                        and pod.get("serving_revision") == published_digest
+                        for pod in snapshot["pods"]
+                    ) and bool(snapshot.get("endpoints")) and all(
+                        endpoint.get("ready") for endpoint in snapshot["endpoints"]
+                    )
+                    if serving_revision_converged:
+                        restored = True
+                        save_json(EVIDENCE / "externalmodel-restored-runtime.json", {
+                            "model_uid": model_obj.get("metadata", {}).get("uid"),
+                            "model_generation": model_obj.get("metadata", {}).get("generation"),
+                            "model_phase": phase,
+                            "semantic_overlay_restored": True,
+                            "filter_config_restored": True,
+                            "published_and_serving_revision_match": True,
+                            "deployment_observed_generation": deployment_obj.get("status", {}).get("observedGeneration"),
+                            "deployment_ready_replicas": deployment_obj.get("status", {}).get("readyReplicas"),
+                            "deployment_desired_replicas": deployment_obj.get("spec", {}).get("replicas", 1),
+                        })
+                        break
             time.sleep(1)
     if restored:
         EXTERNAL_MODEL_CHANGED = False
@@ -3739,57 +4928,44 @@ def cleanup():
     else:
         (EVIDENCE / "externalmodel-fixture-cleanup.txt").write_text(
             "ExternalModel fixture was not changed; no provider fixture resources were created.\n")
-    if EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC is not None:
-        current = kubectl("-n", NAMESPACE, "get", "authpolicy", "external-model-auth", "-o", "json",
-                          check=False)
-        current_spec = json.loads(current.stdout).get("spec") if current.returncode == 0 else None
-        current_hash = hashlib.sha256(json.dumps(
-            current_spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if current_spec else None
-        original_spec_hash = hashlib.sha256(json.dumps(
-            EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        diagnostic_rule_present = bool(
-            current_spec and current_spec.get("rules", {}).get("authorization", {}).get("diagnostic-allow"))
-        if current_hash == original_spec_hash:
-            policy_restored = True
-            after_hash = current_hash
-        elif current_hash == EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 or diagnostic_rule_present:
-            patch = json.dumps([{"op": "replace", "path": "/spec",
-                                 "value": EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC}])
-            restored = kubectl("-n", NAMESPACE, "patch", "authpolicy", "external-model-auth",
-                               "--type=json", "-p", patch, check=False)
-            if restored.returncode == 0:
-                try:
-                    wait_auth_policy("external-model-auth", namespace=NAMESPACE)
-                    after = json.loads(kubectl("-n", NAMESPACE, "get", "authpolicy",
-                                               "external-model-auth", "-o", "json").stdout)
-                    after_hash = hashlib.sha256(json.dumps(
-                        after.get("spec"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                    original_hash = hashlib.sha256(json.dumps(
-                        EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC, sort_keys=True,
-                        separators=(",", ":")).encode()).hexdigest()
-                    policy_restored = after_hash == original_hash
-                except (RuntimeError, json.JSONDecodeError):
-                    policy_restored = False
-                    after_hash = None
-            else:
-                policy_restored = False
-                after_hash = None
-            if not policy_restored:
-                CLEANUP_FAILURES.append("ExternalModel AuthPolicy did not restore to its saved spec")
+    if DIAGNOSTIC_BYPASS_AUTH_NAME:
+        current = kubectl("-n", NAMESPACE, "get", "authpolicy", DIAGNOSTIC_BYPASS_AUTH_NAME,
+                          "-o", "json", check=False)
+        if current.returncode:
+            removed = True
+            outcome = "already_absent"
         else:
-            policy_restored = False
-            after_hash = current_hash
-            CLEANUP_FAILURES.append("ExternalModel AuthPolicy changed unexpectedly; cleanup left it untouched")
-        save_json(EVIDENCE / "external-model-auth-policy-restore.json", {
-            "resource": f"{NAMESPACE}/external-model-auth",
-            "original_spec_sha256": original_spec_hash,
-            "diagnostic_spec_sha256": EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256,
-            "restored_spec_sha256": after_hash,
-            "restored": policy_restored,
-            "resource_version_saved": False,
+            obj = json.loads(current.stdout)
+            metadata = obj.get("metadata", {})
+            labels = metadata.get("labels", {})
+            target = obj.get("spec", {}).get("targetRef", {})
+            owned = (
+                metadata.get("uid") == DIAGNOSTIC_BYPASS_AUTH_UID
+                and labels.get("app.kubernetes.io/managed-by") == "api-translation-kind-e2e"
+                and labels.get("ai-gateway-controller.opendatahub.io/test-run") == CLUSTER[:63]
+                and target.get("group") == "gateway.networking.k8s.io"
+                and target.get("kind") == "HTTPRoute"
+                and target.get("name") == "external-model-demo-model"
+            )
+            if owned:
+                deleted = kubectl("-n", NAMESPACE, "delete", "authpolicy", DIAGNOSTIC_BYPASS_AUTH_NAME,
+                                  "--wait=true", "--timeout=60s", check=False)
+                removed = deleted.returncode == 0
+                outcome = "deleted" if removed else "delete_failed"
+            else:
+                removed = False
+                outcome = "ownership_changed_left_untouched"
+        save_json(EVIDENCE / "external-model-auth-diagnostic-bypass-cleanup.json", {
+            "resource": f"{NAMESPACE}/{DIAGNOSTIC_BYPASS_AUTH_NAME}",
+            "uid": DIAGNOSTIC_BYPASS_AUTH_UID,
+            "outcome": outcome,
+            "removed": removed,
+            "credential_values_saved": False,
         })
-        EXTERNAL_AUTH_POLICY_ORIGINAL_SPEC = None
-        EXTERNAL_AUTH_POLICY_PATCHED_SPEC_SHA256 = None
+        if not removed:
+            CLEANUP_FAILURES.append("run-owned diagnostic ExternalModel AuthPolicy was not safely removed")
+        DIAGNOSTIC_BYPASS_AUTH_NAME = None
+        DIAGNOSTIC_BYPASS_AUTH_UID = None
     if DIAGNOSTIC_ROUTE_AUTH_CREATED:
         removed = kubectl(
             "-n", NAMESPACE, "delete", "authpolicy", "api-translation-messages-auth",
@@ -3813,7 +4989,8 @@ def cleanup():
         "present_after_cleanup": trace_filter.returncode == 0,
         "filter_get_exit_status": trace_filter.returncode,
     })
-    for proc in (API_FORWARD, GATEWAY_FORWARD, RECORDER_FORWARD, PROVIDER_RECORDER_FORWARD):
+    for proc in (API_FORWARD, GATEWAY_FORWARD, RECORDER_FORWARD, PROVIDER_RECORDER_FORWARD,
+                 EXTPROC_METRICS_FORWARD):
         if proc and proc.poll() is None:
             proc.terminate()
             try:
@@ -3828,7 +5005,9 @@ def main():
     global DIAGNOSTIC_ROUTE_AUTH_CREATED
     global API_PORT, GATEWAY_PORT, GATEWAY_AUTHORITY, API_FORWARD, GATEWAY_FORWARD
     global RECORDER_FORWARD, RECORDER_PORT, KEY_ID, KEY_VALUE
+    global EXTPROC_METRICS_FORWARD, EXTPROC_METRICS_PORT
     global MTC_ORIGINAL, MTC_HAD_TRANSLATION, MTC_CAPTURED
+    global BASELINE_EXTERNALMODEL_RUNTIME
     parser = argparse.ArgumentParser(description="Run deterministic translation E2E; live providers are opt-in.")
     parser.add_argument("--scope", choices=("all", "shared", "externalmodel"), default="all",
                         help="qualify both pipelines (all), only the shared route, or only ExternalModel")
@@ -3862,6 +5041,7 @@ def main():
     MTC_HAD_TRANSLATION = "apiTranslation" in mtc.get("spec", {})
     MTC_ORIGINAL = mtc.get("spec", {}).get("apiTranslation", None)
     save_json(EVIDENCE / "maastenantconfig-before.json", mtc)
+    BASELINE_EXTERNALMODEL_RUNTIME = externalmodel_runtime_snapshot("pre-run-baseline")
     installed_schema = kubectl("get", "crd", "maastenantconfigs.maas.opendatahub.io", "-o", "json").stdout
     schema = json.loads(installed_schema)
     schema_field = schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"].get("apiTranslation")
@@ -3904,6 +5084,8 @@ def main():
                       json.loads(route_snapshot.stdout))
         else:
             (EVIDENCE / f"httproute-{route_name}-missing-after-apply.txt").write_text(route_snapshot.stderr)
+    if not args.diagnostic_route_auth:
+        remove_interrupted_translation_auth_diagnostics()
     if args.diagnostic_route_auth:
         diagnostic_policy_names = ("api-translation-messages-auth", "api-translation-openai-auth")
         existing_policies = [name for name in diagnostic_policy_names
@@ -3997,6 +5179,7 @@ def main():
     RECORDER_FORWARD, RECORDER_PORT = start_port_forward("translation-openai-mock", 8080, NAMESPACE)
     route_messages = wait_route("api-translation-messages")
     route_openai = wait_route("api-translation-openai")
+    remove_stale_externalmodel_auth_fixture()
     gateway_auth_policy = wait_auth_policy("maas-gateway-auth", namespace="maas-system")
     maas_auth_policy_ready = wait_maas_auth_policy_ready(not_before=route_reconcile_started_at)
     rate_limit_messages = wait_rate_limit_policy("api-translation-messages-rate-limit")
@@ -4129,6 +5312,7 @@ def main():
         selection_body = json.loads(selection_output.read_text()) if selection_output.exists() else {}
     except json.JSONDecodeError:
         selection_body = {}
+    selected_guardrail_checks = selection_body.get("selectedGuardrailChecks")
     selection_diagnostic = {
         "http_status": selection_probe.stdout.strip() or "unknown",
         "curl_exit_status": selection_probe.returncode,
@@ -4140,6 +5324,12 @@ def main():
         "phase": selection_body.get("phase"),
         "subscription_present": bool(selection_body.get("name")),
         "resolved_model": selection_body.get("resolvedModel"),
+        "selected_guardrail_check_ids": sorted(selected_guardrail_checks)
+        if isinstance(selected_guardrail_checks, dict) else None,
+        "selected_guardrail_check_count": len(selected_guardrail_checks)
+        if isinstance(selected_guardrail_checks, dict) else None,
+        "selected_guardrail_checks_all_true": all(value is True for value in selected_guardrail_checks.values())
+        if isinstance(selected_guardrail_checks, dict) else None,
         "response_fields": sorted(selection_body.keys()),
         "identity_and_response_saved": False,
     }
@@ -4164,6 +5354,7 @@ def main():
         path_selection_body = json.loads(path_selection_output.read_text()) if path_selection_output.exists() else {}
     except json.JSONDecodeError:
         path_selection_body = {}
+    path_selected_guardrail_checks = path_selection_body.get("selectedGuardrailChecks")
     path_selection_diagnostic = {
         "http_status": path_selection_probe.stdout.strip() or "unknown",
         "curl_exit_status": path_selection_probe.returncode,
@@ -4173,6 +5364,12 @@ def main():
         "phase": path_selection_body.get("phase"),
         "subscription_present": bool(path_selection_body.get("name")),
         "resolved_model": path_selection_body.get("resolvedModel"),
+        "selected_guardrail_check_ids": sorted(path_selected_guardrail_checks)
+        if isinstance(path_selected_guardrail_checks, dict) else None,
+        "selected_guardrail_check_count": len(path_selected_guardrail_checks)
+        if isinstance(path_selected_guardrail_checks, dict) else None,
+        "selected_guardrail_checks_all_true": all(value is True for value in path_selected_guardrail_checks.values())
+        if isinstance(path_selected_guardrail_checks, dict) else None,
         "response_fields": sorted(path_selection_body.keys()),
         "identity_and_response_saved": False,
     }
@@ -4182,6 +5379,12 @@ def main():
     save_json(RESULTS, RESULT)
 
     if args.scope == "externalmodel":
+        # Verify the inherited MaaS Gateway authorization on the pre-existing
+        # Provider A route before changing translation configuration or
+        # provider membership. This isolates a route-policy failure from the
+        # provider-aware translation scenarios below.
+        probe_provider_a_normal_auth_before_translation(
+            auth_cfg, continue_on_failure=(args.diagnostic_bypass_auth or args.diagnostic_route_auth))
         kubectl("-n", NAMESPACE, "patch", "maastenantconfig", "default-tenant", "--type=merge",
                 "-p", '{"spec":{"apiTranslation":{"enabled":true}}}')
         external_config_ready = False
@@ -4197,6 +5400,7 @@ def main():
         record("externalmodel_translation_permission_projected", external_config_ready,
                {"authoritative_setting": "MaasTenantConfig.spec.apiTranslation.enabled",
                 "enabled": external_config_ready})
+        prepare_extproc_body_limit_metrics()
         if args.diagnostic_bypass_auth:
             enable_externalmodel_diagnostic_bypass_auth()
         test_externalmodel_provider_aware_translation(auth_cfg)
@@ -4220,12 +5424,14 @@ def main():
         sanitize_scan()
         live_statuses = [item["status"] for item in RESULT.get("live_provider_results", [])]
         live_complete = bool(live_statuses) and all(status == "PASS" for status in live_statuses)
-        RESULT["deterministic_status"] = "PASS"
+        assertion_failures = [item for item in RESULT.get("assertions", []) if item.get("result") == "FAIL"]
+        RESULT["deterministic_status"] = "PARTIAL" if assertion_failures else "PASS"
         RESULT["live_provider_status"] = (
             "PASS" if live_complete else "PARTIAL" if LIVE_PROVIDER_SELECTION else "NOT_RUN"
         )
         RESULT["status"] = (
-            "PARTIAL" if args.diagnostic_bypass_auth or (LIVE_PROVIDER_SELECTION and not live_complete)
+            "PARTIAL" if assertion_failures or args.diagnostic_bypass_auth
+            or (LIVE_PROVIDER_SELECTION and not live_complete)
             else "PASS"
         )
         RESULT["other_scope_status"] = "NOT_RUN"
@@ -4359,6 +5565,9 @@ def main():
             "access_allowed": selection_diagnostic["access_allowed"],
             "phase": selection_diagnostic["phase"],
             "resolved_model": selection_diagnostic["resolved_model"],
+            "selected_guardrail_check_ids": selection_diagnostic["selected_guardrail_check_ids"],
+            "selected_guardrail_check_count": selection_diagnostic["selected_guardrail_check_count"],
+            "selected_guardrail_checks_all_true": selection_diagnostic["selected_guardrail_checks_all_true"],
         },
         "gateway_request": {
             "method": "POST",
@@ -4716,6 +5925,7 @@ def main():
             "progressive_delivery_gap_ms": round(openai_total_ms - openai_first_ms, 1)})
 
     if args.scope != "shared":
+        prepare_extproc_body_limit_metrics()
         test_externalmodel_provider_aware_translation(auth_cfg)
 
     if LIVE_PROVIDER_SELECTION:
@@ -4731,8 +5941,12 @@ def main():
                     "credential_value_saved": False,
                 })
         live_statuses = [item["status"] for item in RESULT.get("live_provider_results", [])]
-        RESULT["deterministic_status"] = "PASS"
-        RESULT["status"] = "PASS" if live_statuses and all(status == "PASS" for status in live_statuses) else "PARTIAL"
+        assertion_failures = [item for item in RESULT.get("assertions", []) if item.get("result") == "FAIL"]
+        RESULT["deterministic_status"] = "PARTIAL" if assertion_failures else "PASS"
+        RESULT["status"] = (
+            "PASS" if not assertion_failures and live_statuses and all(status == "PASS" for status in live_statuses)
+            else "PARTIAL"
+        )
 
     all_obs = observations()
     save_json(EVIDENCE / "upstream-observations.json", all_obs)
@@ -4748,9 +5962,16 @@ def main():
     # into an overall pass.
     if LIVE_PROVIDER_SELECTION:
         live_statuses = [item["status"] for item in RESULT.get("live_provider_results", [])]
-        RESULT["status"] = "PASS" if live_statuses and all(status == "PASS" for status in live_statuses) else "PARTIAL"
+        assertion_failures = [item for item in RESULT.get("assertions", []) if item.get("result") == "FAIL"]
+        RESULT["status"] = (
+            "PASS" if not assertion_failures and live_statuses and all(status == "PASS" for status in live_statuses)
+            else "PARTIAL"
+        )
     else:
-        RESULT["status"] = "PASS"
+        RESULT["status"] = (
+            "PARTIAL" if any(item.get("result") == "FAIL" for item in RESULT.get("assertions", []))
+            else "PASS"
+        )
     save_json(RESULTS, RESULT)
 
 
@@ -4801,8 +6022,8 @@ def main_wrapper():
             if current.get("status") == "RUNNING":
                 current["status"] = "FAIL"
                 save_json(RESULTS, current)
-        if RESULT.get("status") == "PARTIAL":
-            raise SystemExit(3)
+        if sys.exc_info()[0] is None and RESULT.get("status") != "PASS":
+            raise SystemExit(3 if RESULT.get("status") == "PARTIAL" else 1)
 
 
 if __name__ == "__main__":
