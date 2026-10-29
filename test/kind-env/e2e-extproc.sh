@@ -352,16 +352,20 @@ provider_request_count() {
 }
 
 wait_normal_auth_policy() {
-  local policy gateway policies route_policies generation ready conflict gateway_accepted gateway_enforced
+  local policy gateway policies listed route_policies generation ready conflict gateway_accepted gateway_enforced
   local snapshot fingerprint previous='' stable=0
   for _ in $(seq 1 120); do
     policy=$(kctl -n "$NS" get maasauthpolicy kind-e2e-access -o json 2>/dev/null || echo '{}')
     gateway=$(kctl -n "$API_NS" get authpolicy maas-gateway-auth -o json 2>/dev/null || echo '{}')
-    policies=$(kctl get authpolicies.kuadrant.io -A -o json 2>/dev/null || echo '{"items":[]}')
-    route_policies=$(jq -c --arg ns "$NS" --arg route external-model-demo-model '
-      [.items[]? | select(.metadata.namespace==$ns and .spec.targetRef.kind=="HTTPRoute" and
-        .spec.targetRef.name==$route) | {namespace:.metadata.namespace,name:.metadata.name,
-        targetRef:.spec.targetRef}]' <<<"$policies")
+    listed=false
+    route_policies=null
+    if policies=$(kctl get authpolicies.kuadrant.io -A -o json 2>/dev/null); then
+      listed=true
+      route_policies=$(jq -c --arg ns "$NS" --arg route external-model-demo-model '
+        [.items[]? | select(.metadata.namespace==$ns and .spec.targetRef.kind=="HTTPRoute" and
+          .spec.targetRef.name==$route) | {namespace:.metadata.namespace,name:.metadata.name,
+          targetRef:.spec.targetRef}]' <<<"$policies")
+    fi
     generation=$(jq -r '.metadata.generation // 0' <<<"$policy")
     ready=$(jq -r --argjson generation "$generation" '
       [.status.conditions[]? | select(.type=="Ready" and .status=="True" and
@@ -374,11 +378,11 @@ wait_normal_auth_policy() {
     snapshot=$(jq -cn --arg namespace "$NS" --arg route external-model-demo-model \
       --argjson maasPolicy "$(jq -c '{name:.metadata.name,generation:.metadata.generation,conditions:[.status.conditions[]? | {type,status,reason,observedGeneration}]}' <<<"$policy")" \
       --argjson gatewayPolicy "$(jq -c '{name:.metadata.name,namespace:.metadata.namespace,conditions:[.status.conditions[]? | {type,status,reason,observedGeneration}]}' <<<"$gateway")" \
-      --argjson routePolicies "$route_policies" \
-      '{namespace:$namespace,route:$route,maas_auth_policy:$maasPolicy,gateway_auth_policy:$gatewayPolicy,route_targeted_auth_policies:$routePolicies}')
+      --argjson policiesListed "$listed" --argjson routePolicies "$route_policies" \
+      '{namespace:$namespace,route:$route,maas_auth_policy:$maasPolicy,gateway_auth_policy:$gatewayPolicy,auth_policy_listing_succeeded:$policiesListed,route_targeted_auth_policies:$routePolicies}')
     fingerprint=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')
     if [[ "$ready" == true && "$conflict" == true && "$gateway_accepted" == true &&
-      "$gateway_enforced" == true && "$route_policies" == '[]' ]]; then
+      "$gateway_enforced" == true && "$listed" == true && "$route_policies" == '[]' ]]; then
       if [[ "$fingerprint" == "$previous" ]]; then stable=$((stable+1)); else stable=1; fi
       previous=$fingerprint
       if [[ "$stable" -ge 2 ]]; then

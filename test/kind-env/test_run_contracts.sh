@@ -196,4 +196,66 @@ JSON
   record_maas_callback_assertion '10 10' '11 11' request-test
 )
 
-echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, provider-log failure handling, and MaaS callback-log failure handling)."
+(
+  eval "$(sed -n '/^wait_normal_auth_policy() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  readiness_tmp=$(mktemp -d)
+  trap 'rm -rf "$readiness_tmp"' EXIT
+  NS=models-as-a-service
+  API_NS=maas-system
+  EVIDENCE=$readiness_tmp
+  seq() { printf '%s\n' 1 2 3; }
+  sleep() { :; }
+  kctl() {
+    case "$*" in
+      *'get maasauthpolicy '*)
+        printf '%s\n' '{"metadata":{"generation":1},"status":{"conditions":[{"type":"Ready","status":"True","observedGeneration":1},{"type":"ConflictingAuthPolicy","status":"False","observedGeneration":1}]}}'
+        ;;
+      *'get authpolicy '*)
+        printf '%s\n' '{"status":{"conditions":[{"type":"Accepted","status":"True"},{"type":"Enforced","status":"True"}]}}'
+        ;;
+      'get authpolicies.kuadrant.io -A -o json')
+        local count
+        count=$(<"$readiness_tmp/list-count")
+        count=$((count+1))
+        printf '%s' "$count" >"$readiness_tmp/list-count"
+        case "$scenario" in
+          failed) return 1 ;;
+          timeout) return 124 ;;
+          interrupted) if [[ "$count" == 2 ]]; then return 1; fi ;;
+          recovered) if [[ "$count" == 1 ]]; then return 1; fi ;;
+          conflict)
+            printf '%s\n' '{"items":[{"metadata":{"namespace":"models-as-a-service","name":"conflicting"},"spec":{"targetRef":{"kind":"HTTPRoute","name":"external-model-demo-model"}}}]}'
+            return 0
+            ;;
+        esac
+        printf '%s\n' '{"items":[]}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  for scenario in failed timeout conflict interrupted; do
+    printf '0' >"$readiness_tmp/list-count"
+    if wait_normal_auth_policy; then
+      echo "AuthPolicy readiness must fail for $scenario listing" >&2
+      exit 1
+    fi
+    if [[ "$scenario" == failed || "$scenario" == timeout ]]; then
+      jq -e '.auth_policy_listing_succeeded == false and .route_targeted_auth_policies == null' \
+        "$EVIDENCE/normal-auth-policy-state.json" >/dev/null || {
+        echo 'failed listings must be recorded as unavailable, not an empty policy list' >&2
+        exit 1
+      }
+    fi
+  done
+  for scenario in empty recovered; do
+    printf '0' >"$readiness_tmp/list-count"
+    wait_normal_auth_policy || { echo "successful stable empty listings must become ready for $scenario" >&2; exit 1; }
+    jq -e '.auth_policy_listing_succeeded == true and .route_targeted_auth_policies == []' \
+      "$EVIDENCE/normal-auth-policy-state.json" >/dev/null || {
+      echo 'successful empty listings must be recorded explicitly' >&2
+      exit 1
+    }
+  done
+)
+
+echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, provider-log failure handling, MaaS callback-log failure handling, and AuthPolicy listing failures)."
