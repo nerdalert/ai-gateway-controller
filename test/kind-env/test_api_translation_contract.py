@@ -295,6 +295,12 @@ other_metric 99
         self.assertNotIn("sk-oai-never-persist-this", repr(facts))
         self.assertNotIn("provider-key-never-persist-this", repr(facts))
 
+    def test_unknown_authorization_scheme_cannot_expose_a_credential(self):
+        for value in ("sk-oai-never-persist-this extra", "sk-oai-never-persist-this"):
+            facts = authorino_logged_header_facts({"headers": {"Authorization": value}})
+            self.assertNotIn("sk-oai-never-persist-this", repr(facts))
+            self.assertIn(facts["authorization_scheme"], ("other", None))
+
     def test_authorino_event_context_keeps_evaluator_identity_but_redacts_values(self):
         event = authorino_event_context({
             "request id": "request-123",

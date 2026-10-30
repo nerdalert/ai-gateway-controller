@@ -17,6 +17,7 @@ limitations under the License.
 package render
 
 import (
+	"os"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -98,9 +99,14 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 
 func TestRenderedExternalModelGatewayHasBoundedTwoMiBRequestBuffer(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
+	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+		t.Skipf("vendored manifests not present at %s", manifestPath)
+	} else if err != nil {
+		t.Fatalf("inspect vendored manifests: %v", err)
+	}
 	resources, err := Build(manifestPath)
 	if err != nil {
-		t.Skipf("vendored manifests not present at %s: %v", manifestPath, err)
+		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
 	}
 
 	var found bool
@@ -183,9 +189,14 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 func TestRenderedExtProcPreservesBufferedMaaSAndAddsHeaderPhaseExternalModel(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 
+	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+		t.Skipf("vendored manifests not present at %s", manifestPath)
+	} else if err != nil {
+		t.Fatalf("inspect vendored manifests: %v", err)
+	}
 	resources, err := Build(manifestPath)
 	if err != nil {
-		t.Skipf("vendored manifests not present at %s: %v", manifestPath, err)
+		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
 	}
 
 	var patches []any
