@@ -224,3 +224,31 @@ func equalStrings(got, want []string) bool {
 	}
 	return true
 }
+
+func TestRecorderRejectsOversizedJSONWithTrailingWhitespace(t *testing.T) {
+	t.Parallel()
+	body := `{}` + strings.Repeat(" ", (4<<20)-1)
+	request := httptest.NewRequestWithContext(t.Context(), "POST", "/v1/messages", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	recorderConfig{}.handleInference(response, request)
+	if response.Code != 413 {
+		t.Fatalf("oversized valid JSON status = %d, want 413", response.Code)
+	}
+}
+
+func TestAnthropicStreamMustBeBoolean(t *testing.T) {
+	t.Parallel()
+	for _, value := range []any{"true", float64(1), nil} {
+		if anthropicTopLevelFieldsAreValid(map[string]any{"stream": value}) {
+			t.Errorf("accepted non-boolean stream: %T", value)
+		}
+	}
+	for _, value := range []bool{true, false} {
+		if !anthropicTopLevelFieldsAreValid(map[string]any{"stream": value}) {
+			t.Errorf("rejected stream %t", value)
+		}
+	}
+	if !anthropicTopLevelFieldsAreValid(map[string]any{}) {
+		t.Fatal("stream may be omitted")
+	}
+}

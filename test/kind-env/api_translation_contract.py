@@ -300,7 +300,9 @@ def authorino_logged_header_facts(http):
     if isinstance(authorization, list):
         authorization = authorization[0] if authorization else ""
     authorization = authorization if isinstance(authorization, str) else ""
-    scheme = authorization.split(" ", 1)[0] if " " in authorization else None
+    candidate = authorization.split(" ", 1)[0] if " " in authorization else None
+    schemes = {"bearer": "Bearer", "basic": "Basic", "apikey": "ApiKey"}
+    scheme = schemes.get(candidate.lower(), "other") if candidate is not None else None
     identity_headers = sorted(name for name in normalized if name in {
         "x-maas-username", "x-maas-group", "x-maas-identity", "x-maas-subscription",
     })

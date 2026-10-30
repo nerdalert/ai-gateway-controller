@@ -228,9 +228,13 @@ func handleObservations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Request) {
-	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, (4<<20)+1))
 	if readErr != nil {
 		http.Error(w, "could not read request body", http.StatusBadRequest)
+		return
+	}
+	if len(requestBytes) > 4<<20 {
+		http.Error(w, "request body exceeds recorder limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	requestBody := map[string]any{}
@@ -685,6 +689,11 @@ func anthropicLegacyOptionsAbsent(body map[string]any) bool {
 }
 
 func anthropicTopLevelFieldsAreValid(body map[string]any) bool {
+	if stream, present := body["stream"]; present {
+		if _, ok := stream.(bool); !ok {
+			return false
+		}
+	}
 	allowed := map[string]bool{
 		"model": true, "max_tokens": true, "messages": true, "system": true,
 		"stream": true, "temperature": true, "top_p": true, "stop_sequences": true,

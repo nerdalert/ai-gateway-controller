@@ -431,10 +431,10 @@ check_repo MAAS_CONTROLLER_REPO
 check_repo KUADRANT_OPERATOR_REPO
 check_repo PRAXIS_EXTPROC_REPO
 if [[ -n "$PRAXIS_AI_REPO" ]]; then check_repo PRAXIS_AI_REPO; fi
-if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
+if [[ -n "$EXPECTED_EXTPROC_SOURCE_SHA" ]]; then
   extproc_head=$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)
   extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
-  [[ "$extproc_head" == "$EXPECTED_EXTPROC_MAIN_SHA" ]] || fail "ExtProc source SHA must be $EXPECTED_EXTPROC_MAIN_SHA; got $extproc_head on branch ${extproc_branch:-detached}"
+  [[ "$extproc_head" == "$EXPECTED_EXTPROC_SOURCE_SHA" ]] || fail "ExtProc source SHA must be $EXPECTED_EXTPROC_SOURCE_SHA; got $extproc_head on branch ${extproc_branch:-detached}"
   [[ -z "$(git -C "$PRAXIS_EXTPROC_REPO" status --porcelain)" ]] || fail "ExtProc source checkout is dirty"
 fi
 extproc_image_mode_is_valid "$EXTPROC_IMAGE_MODE" "$EXTPROC_IMAGE" \
@@ -512,7 +512,7 @@ for pair in \
       && "$extproc_source_label" == https://github.com/opendatahub-io/praxis-extproc \
       && "$extproc_revision_label" == "$EXPECTED_EXTPROC_SOURCE_SHA" \
       && "$extproc_git_commit_label" == "$EXPECTED_EXTPROC_SOURCE_SHA" \
-      && " $(jq -r '.[]' <<<"$extproc_repo_digests") " == *" $expected_extproc_repo_digest "* ]] || \
+      && "$(jq -r --arg d "$expected_extproc_repo_digest" 'index($d) != null' <<<"$extproc_repo_digests")" == true ]] || \
       fail "published ExtProc image digest, platform, or source labels do not match the expected artifact; see extproc-published-image-provenance.json"
     printf '%s\n' "$extproc_local_id" >"$EVIDENCE/extproc-image-id.txt"
     printf '%s\n' "$EXTPROC_IMAGE" >"$EVIDENCE/extproc-image-reference.txt"

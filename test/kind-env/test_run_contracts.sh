@@ -260,7 +260,7 @@ if rg -q '\[\[ "\$extproc_branch" == main' <<<"$run_source"; then
   echo "ExtProc provenance gate incorrectly requires a branch name instead of matching source revision" >&2
   exit 1
 fi
-rg -q 'extproc_head.*EXPECTED_EXTPROC_MAIN_SHA' <<<"$run_source" || {
+rg -q 'extproc_head.*EXPECTED_EXTPROC_SOURCE_SHA' <<<"$run_source" || {
   echo "ExtProc provenance gate does not require the configured exact source SHA" >&2
   exit 1
 }
@@ -278,3 +278,9 @@ JSON
 }
 
 echo "Kind run harness contracts passed (image identity, terminating-pod exclusion, and bounded Authorino CA-mount readiness)."
+
+# Check the actual Docker RepoDigests expression against multiple entries.
+rg -q 'index\(\$d\) != null' "$ROOT/test/kind-env/run.sh"
+for digests in '["other@sha256:abc","expected@sha256:def"]' '["expected@sha256:def","other@sha256:abc"]'; do
+  [[ "$(jq -r --arg d 'expected@sha256:def' 'index($d) != null' <<<"$digests")" == true ]]
+done

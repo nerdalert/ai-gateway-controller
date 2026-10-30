@@ -360,19 +360,23 @@ receipts. The current Kind setup installs KServe CRDs but does not deploy a
 serving runtime or internal model, so an internal-model large-request control
 is not claimed by this qualification.
 
-Run the translation qualification after `./run.sh --provision` and the base
-`./e2e.sh` suite. The translation command covers both shared-route controls and
+Run these commands from the repository root after
+`test/kind-env/run.sh --provision` and the base `test/kind-env/e2e.sh` suite. The translation command covers both shared-route controls and
 the ExternalModel provider-aware path; it restores its temporary provider and
 tenant settings on exit:
 
 ```console
+: "${CLUSTER:?Set to the provisioned Kind cluster name}"
+: "${PROVIDER_RECORDER_IMAGE:?Set to the recorder image used for provisioning}"
+: "${EXTPROC_IMAGE:?Set to the ExtProc image used for provisioning}"
+: "${RUN_EVIDENCE:?Set to this run evidence directory}"
 LOCAL_ENV_CLUSTER="$CLUSTER" \
 LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/api-translation" \
 PROVIDER_RECORDER_IMAGE="$PROVIDER_RECORDER_IMAGE" \
 PRAXIS_EXTPROC_IMAGE="$EXTPROC_IMAGE" \
   python3 test/kind-env/e2e-api-translation.py --scope all
 
-./demo.sh --context "kind-$CLUSTER" --evidence-dir "$RUN_EVIDENCE/demo" --non-interactive
+test/kind-env/demo.sh --context "kind-$CLUSTER" --evidence-dir "$RUN_EVIDENCE/demo" --non-interactive
 ```
 
 The mounted-limit parser and harness policy contracts can be checked without
@@ -395,17 +399,21 @@ immutable registry digest and the matching, clean ExtProc source checkout. The
 provisioner checks the digest, platform, OCI source and revision labels, then
 checks the image digest and image ID in the Kind node and serving Pods. It
 fails closed if the configured source checkout or runtime identity differs.
-Do not pass a mutable tag in published mode.
+Do not pass a mutable tag in published mode. `PRAXIS_AI_REPO` must be unset
+in this mode; it is used only when testing a local AI source override.
 
 ```sh
+CLUSTER="anthropic-published-$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower:]')"
+export PROVIDER_RECORDER_IMAGE="provider-recorder:$CLUSTER"
+unset PRAXIS_AI_REPO
 EXT_SOURCE_SHA=24f2d003ed303a950b6bd8ab042f0d62a5ab4278
 EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd'
 RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
 export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
 export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"
 export EXPECTED_EXTPROC_PLATFORM=linux/amd64 EXTPROC_IMAGE="$EXT_IMAGE"
-LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_EVIDENCE_ROOT="$RUN_EVIDENCE/provision" ./run.sh --provision
-LOCAL_ENV_CLUSTER="$CLUSTER" ./e2e.sh
+LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_EVIDENCE_ROOT="$RUN_EVIDENCE/provision" test/kind-env/run.sh --provision
+LOCAL_ENV_CLUSTER="$CLUSTER" test/kind-env/e2e.sh
 LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/translation" \
 PRAXIS_EXTPROC_IMAGE="$EXT_IMAGE" \
 PRAXIS_EXTPROC_IMAGE_MODE=published \
@@ -458,13 +466,13 @@ records only CA/certificate fingerprints and paths, never keys or credentials.
 Required source checkouts are supplied through environment variables:
 
 * `LLM_KATAN_REPO`
-* `PRAXIS_AI_REPO`
+* `PRAXIS_AI_REPO` (optional local AI override; unset for published images)
 * `MAAS_CONTROLLER_REPO`
 * `KUADRANT_OPERATOR_REPO`
 * `PRAXIS_EXTPROC_REPO`
 
-Source selection and provenance are explicit. `PRAXIS_AI_REPO` and
-`PRAXIS_EXTPROC_REPO` point at the checked-out integration sources; the
+Source selection and provenance are explicit. `PRAXIS_EXTPROC_REPO` points at
+the checked-out ExtProc source; optional `PRAXIS_AI_REPO` selects a local AI override; the
 expected revisions are recorded before each build. `MAAS_CONTROLLER_REPO`
 must point at the merged `main` branch for new runs (the harness verifies that
 the checkout is clean but does not enforce the branch name). `KUADRANT_OPERATOR_REPO`
@@ -474,7 +482,7 @@ public digest-pinned artifact; a source checkout is used only for explicit
 development builds.
 
 For source-built ExtProc qualification, the build helper replaces ExtProc's
-Praxis AI `v0.8.0` Git dependencies with the supplied `PRAXIS_AI_REPO` checkout.
+Praxis AI Git dependencies with the supplied `PRAXIS_AI_REPO` checkout.
 The runtime image therefore contains the exact recorded Praxis AI source, not
 the published tag artifact.
 
