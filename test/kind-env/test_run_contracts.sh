@@ -157,6 +157,16 @@ if rg -q '\[\[ -z "\$source_diff" \]\]' <<<"$published_extproc_gate"; then
   echo "published ExtProc source cleanliness check confuses the content fingerprint with dirty status" >&2
   exit 1
 fi
+published_extproc_load=$(sed -n '/if \[\[ "\$EXTPROC_IMAGE_MODE" == published \]\]/,/^  fi/p' \
+  "$ROOT/test/kind-env/run.sh" | sed -n '/crictl pull "\$EXTPROC_IMAGE"/,$p')
+rg -q 'crictl pull "\$EXTPROC_IMAGE"' <<<"$published_extproc_load" || {
+  echo "published ExtProc qualification does not pull the digest directly into the Kind node" >&2
+  exit 1
+}
+rg -q 'kind load docker-image "\$EXTPROC_IMAGE" --name "\$CLUSTER"' "$ROOT/test/kind-env/run.sh" || {
+  echo "source-built ExtProc qualification no longer uses Kind image loading" >&2
+  exit 1
+}
 authorino_gate=$(sed -n '/authorino_deployment_ready=false/,/set env deployment\/authorino/p' "$ROOT/test/kind-env/run.sh")
 rg -q 'authorino_deployment_deadline=\$\(\(SECONDS \+ 180\)\)' <<<"$authorino_gate" || {
   echo "Authorino Deployment readiness wait is not bounded to 180 seconds" >&2
