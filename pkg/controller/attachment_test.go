@@ -2754,6 +2754,15 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcileModel(t, r, model)
+	pending := getModel(t, r, model)
+	if condition := apiMeta.FindStatusCondition(gatewayResult(t, pending, defaultGateway).Conditions, conditionReady); condition == nil || condition.Reason != reasonAttachmentPending {
+		t.Fatalf("served attachment must drain before reporting final exclusion: %#v", condition)
+	}
+	seedSafeExternalModelRuntime(t, r, tenant.ID(tenant.DefaultAITenantName), "models-as-a-service", nil, false)
+	markSafeExternalModelRuntimeCurrent(t, r, tenant.ID(tenant.DefaultAITenantName), "models-as-a-service", false)
+	reconcileModel(t, r, model)
+	markWithdrawalDrainElapsed(t, r, "models-as-a-service")
+	reconcileModel(t, r, model)
 	got = getModel(t, r, model)
 	result := apiMeta.FindStatusCondition(gatewayResult(t, got, defaultGateway).Conditions, conditionReady)
 	if got.Status.Phase != modelPhaseFailed || result == nil || result.Reason != reasonProviderNotReady ||

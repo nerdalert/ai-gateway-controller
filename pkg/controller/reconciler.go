@@ -495,29 +495,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	if !provider.DeletionTimestamp.IsZero() {
-		inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
-		if inUse {
-			if controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
-				message, messageErr := r.providerWithdrawalWaitMessage(ctx, provider.Namespace, provider.Name)
-				if messageErr != nil {
-					return reconcile.Result{}, messageErr
-				}
-				if statusErr := r.updateProviderStatus(ctx, &provider, providerPhasePending, reasonProviderInUse, message); statusErr != nil {
-					return reconcile.Result{}, statusErr
-				}
-			}
-			return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
-		}
-		if !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
-			return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
-		}
-		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, &provider)
+		return r.reconcileDeletingProvider(ctx, &provider)
 	}
 
 	live, err := r.liveTenantResolution(ctx, provider.Namespace)
@@ -925,6 +903,8 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 		// Its references inherit a credential that is not ready; other models
 		// keep serving.
 		statusErr = publication.report(false, reasonProviderNotReady, publication.unserved, nil)
+	} else if publication.unroutedReason != "" {
+		statusErr = publication.report(false, publication.unroutedReason, publication.unroutedMessage, nil)
 	} else {
 		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", publication.result.Envelope.Revision.Value, publication.result.Envelope.Provenance.SourceGeneration)
 		statusErr = publication.report(true, reasonReconciled, message, &publication.result.Envelope)
@@ -2902,4 +2882,31 @@ func (r *Reconciler) excludedScopedCandidateIDs(ctx context.Context, namespace s
 		}
 	}
 	return ids, nil
+}
+
+// reconcileDeletingProvider retains in-use transport until serving requests drain.
+func (r *Reconciler) reconcileDeletingProvider(ctx context.Context, provider *v1alpha1.ExternalProvider) (reconcile.Result, error) {
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if inUse {
+		if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+			message, messageErr := r.providerWithdrawalWaitMessage(ctx, provider.Namespace, provider.Name)
+			if messageErr != nil {
+				return reconcile.Result{}, messageErr
+			}
+			if statusErr := r.updateProviderStatus(ctx, provider, providerPhasePending, reasonProviderInUse, message); statusErr != nil {
+				return reconcile.Result{}, statusErr
+			}
+		}
+		return reconcile.Result{RequeueAfter: withdrawalRequeueInterval}, nil
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return reconcile.Result{}, r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, provider)
 }
