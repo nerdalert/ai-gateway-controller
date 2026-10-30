@@ -147,6 +147,16 @@ if maas_api_pods_have_exact_ready_image "$maas_pods" "maas-api:run" "$maas_image
 fi
 
 run_source=$(<"$ROOT/test/kind-env/run.sh")
+published_extproc_gate=$(sed -n '/if \[\[ "$label" == extproc && "$EXTPROC_IMAGE_MODE" == published \]\]/,/^  fi/p' \
+  "$ROOT/test/kind-env/run.sh")
+rg -q 'git -C "\$source" status --porcelain' <<<"$published_extproc_gate" || {
+  echo "published ExtProc source cleanliness check does not inspect git status" >&2
+  exit 1
+}
+if rg -q '\[\[ -z "\$source_diff" \]\]' <<<"$published_extproc_gate"; then
+  echo "published ExtProc source cleanliness check confuses the content fingerprint with dirty status" >&2
+  exit 1
+fi
 authorino_gate=$(sed -n '/authorino_deployment_ready=false/,/set env deployment\/authorino/p' "$ROOT/test/kind-env/run.sh")
 rg -q 'authorino_deployment_deadline=\$\(\(SECONDS \+ 180\)\)' <<<"$authorino_gate" || {
   echo "Authorino Deployment readiness wait is not bounded to 180 seconds" >&2
