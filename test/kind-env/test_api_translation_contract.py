@@ -25,6 +25,32 @@ from api_translation_contract import (
 
 
 class TranslationRuntimeContractTest(unittest.TestCase):
+    def test_diagnostic_auth_policy_cleanup_matches_route_names(self):
+        source = pathlib.Path(__file__).with_name("e2e-api-translation.py")
+        tree = ast.parse(source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "remove_interrupted_translation_auth_diagnostics")
+        for owned, remains, expected_pass in ((True, False, True), (True, True, False), (False, True, False)):
+            with self.subTest(owned=owned, remains=remains):
+                policy = {"metadata": {"name": "api-translation-messages-auth", "namespace": "models-as-a-service"},
+                          "spec": {"targetRef": {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute",
+                                                 "name": "api-translation-messages"}}}
+                calls, records = [], []
+                def kubectl(*args, **kwargs):
+                    calls.append(args)
+                    items = [policy] if len(calls) == 1 or remains else []
+                    return SimpleNamespace(stdout=json.dumps({"items": items}), returncode=0)
+                ticks = iter((0, 0, 100))
+                namespace = {"kubectl": kubectl, "json": json, "NAMESPACE": "models-as-a-service",
+                             "EVIDENCE": pathlib.Path("/unused"), "save_json": lambda *args: None,
+                             "is_owned_translation_diagnostic_authpolicy": lambda *args: owned,
+                             "time": SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _: None),
+                             "record": lambda name, passed, details: records.append(passed)}
+                exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+                namespace["remove_interrupted_translation_auth_diagnostics"]()
+                self.assertEqual(records, [expected_pass])
+                self.assertEqual(any("delete" in args for args in calls), owned)
+
     def test_wrapper_returns_nonzero_when_cleanup_fails(self):
         source = pathlib.Path(__file__).with_name("e2e-api-translation.py")
         tree = ast.parse(source.read_text())
