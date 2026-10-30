@@ -12,8 +12,10 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -348,6 +351,99 @@ func TestWithdrawalPreservesServedAttachment(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigHashPreservesScopedAnthropicHeaderWithNoHomeRoutes(t *testing.T) {
+	ctx := context.Background()
+	r, home := reconcilerFixture(t)
+	r.Namespace = ""
+	r.KnownClusters = append(r.KnownClusters, "provider-anthropic")
+	setControllerTranslationEnabled(t, r, home.Namespace, true)
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic", Namespace: "team", UID: "anthropic-provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "anthropic", Endpoint: "api.anthropic.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "anthropic-key"}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("fixture-only-anthropic-key")}}
+	remote := attachmentModel("messages", "team", "claude", time.Unix(100, 0), v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: home.Namespace})
+	remote.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
+		Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "claude-3-5-sonnet", APIFormat: "messages", Path: "/v1/messages",
+	}}
+	for _, object := range []client.Object{provider, secret, remote} {
+		if err := r.Create(ctx, object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile attached Anthropic provider: %v", err)
+	}
+	reconcileModel(t, r, home)
+	reconcileModel(t, r, remote)
+	gateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: home.Namespace}
+	setRouteParentStatus(t, r, remote, gateway, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, remote)
+
+	var copySecret corev1.Secret
+	copyName := credentialCopyName(home.Namespace, "team", "anthropic-key", "api-key", "x-api-key")
+	if err := r.Get(ctx, client.ObjectKey{Namespace: home.Namespace, Name: copyName}, &copySecret); err != nil {
+		t.Fatalf("attached Anthropic credential copy: %v", err)
+	}
+	if copySecret.Labels[tenant.LabelCredentialCopy] != "true" || copySecret.Annotations[tenant.AnnotationCredentialHeader] != "x-api-key" {
+		t.Fatalf("credential copy metadata = labels %#v annotations %#v", copySecret.Labels, copySecret.Annotations)
+	}
+
+	var scoped envelope.Candidate
+	for _, candidate := range overlayEnvelope(t, r, home.Namespace).Overlay.Candidates {
+		if candidate.Cluster == "provider-anthropic" {
+			scoped = cloneCandidate(candidate)
+		}
+	}
+	if scoped.StableID == "" || scoped.APIFormat != "messages" || scoped.Path != "/v1/messages" || scoped.Credential == nil {
+		t.Fatalf("published scoped Anthropic candidate = %#v", scoped)
+	}
+
+	tracker := &secretMetadataReadTracker{Reader: r.APIReader}
+	r.APIReader = tracker
+	// With no home candidates, ErrNoRoutes is a valid empty local set. The
+	// still-serving scoped Anthropic attachment remains in the composed runtime.
+	gotHash, err := runtimeConfigHash(ctx, r, nil, home.Namespace, true)
+	if err != nil {
+		t.Fatalf("hash scoped-only runtime: %v", err)
+	}
+	complete := cloneCandidate(scoped)
+	complete.Credential.Header = "x-api-key"
+	wantHash, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{complete}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutHeader, err := tenant.ExternalModelExtProcConfigHash(home.Namespace, []envelope.Candidate{scoped}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHash != wantHash || gotHash == withoutHeader {
+		t.Fatalf("runtime hash = %s, complete x-api-key hash = %s, missing-header hash = %s", gotHash, wantHash, withoutHeader)
+	}
+	if tracker.metadataReads != 1 || tracker.typedSecretReads != 0 {
+		t.Fatalf("APIReader Secret reads: metadata=%d typed=%d, want metadata-only access", tracker.metadataReads, tracker.typedSecretReads)
+	}
+}
+
+type secretMetadataReadTracker struct {
+	client.Reader
+	metadataReads    int
+	typedSecretReads int
+}
+
+func (r *secretMetadataReadTracker) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *metav1.PartialObjectMetadata:
+		if obj.GetObjectKind().GroupVersionKind().Kind == "Secret" {
+			r.metadataReads++
+		}
+	case *corev1.Secret:
+		r.typedSecretReads++
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
 func TestRapidProviderWithdrawalAndReadditionKeepsRouteReachable(t *testing.T) {
 	ctx := context.Background()
 	r, model := reconcilerFixture(t)
@@ -454,6 +550,30 @@ func TestDeletingModelStagesItsProviderWithdrawalUntilSiblingRuntimeDrains(t *te
 	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
 		t.Fatalf("start deleted model drain: result=%#v err=%v", result, err)
 	}
+	var overlayBeforeSibling corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: deleting.Namespace, Name: "routing-overlay"}, &overlayBeforeSibling); err != nil {
+		t.Fatal(err)
+	}
+	drainBeforeSibling := overlayBeforeSibling.Annotations[withdrawalDrainAnnotation]
+	if drainBeforeSibling == "" {
+		t.Fatal("deleting model did not persist the deliberate drain state")
+	}
+	// The sink Service has owner-reference updates which can enqueue sibling
+	// reconciles. A sibling pass must not recompose the terminating model or
+	// restart the drain timer.
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sibling)}); err != nil {
+		t.Fatalf("reconcile sibling while deleted model drains: %v", err)
+	}
+	if got := overlayEnvelope(t, r, deleting.Namespace).Overlay.Candidates; len(got) != 1 || got[0].Name != "sibling-client-model" {
+		t.Fatalf("sibling reconcile republished terminating model: %#v", got)
+	}
+	var overlayAfterSibling corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: deleting.Namespace, Name: "routing-overlay"}, &overlayAfterSibling); err != nil {
+		t.Fatal(err)
+	}
+	if got := overlayAfterSibling.Annotations[withdrawalDrainAnnotation]; got != drainBeforeSibling {
+		t.Fatalf("sibling reconcile changed drain state from %q to %q", drainBeforeSibling, got)
+	}
 	markWithdrawalDrainElapsed(t, r, deleting.Namespace)
 	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(deleting)}); err != nil {
 		t.Fatalf("finish deleted model withdrawal: %v", err)
@@ -462,6 +582,123 @@ func TestDeletingModelStagesItsProviderWithdrawalUntilSiblingRuntimeDrains(t *te
 		t.Fatalf("deleted model route error = %v, want NotFound", err)
 	}
 	assertRouteProviders(t, r, sibling.Namespace, sibling.Name, "provider")
+}
+
+func TestDeletingOnlyAnthropicProviderRetainsMessagesRouteContractUntilDrain(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	provider := createWithdrawalProvider(t, r, model.Namespace, "anthropic")
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.Provider = "anthropic"
+	provider.Spec.Endpoint = "api.anthropic.com"
+	if err := r.Update(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile Anthropic provider: %v", err)
+	}
+	r.KnownClusters = append(r.KnownClusters, "provider-anthropic")
+	setControllerTranslationEnabled(t, r, model.Namespace, true)
+	model.Spec.ModelName = "claude-client"
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{{
+		Ref: v1alpha1.ExternalProviderReference{Name: provider.Name}, TargetModel: "claude-3-5-sonnet", APIFormat: "messages", Path: "/v1/messages",
+	}}
+	sibling := model.DeepCopy()
+	sibling.Name = "sibling"
+	sibling.UID = "sibling-model-uid"
+	sibling.ResourceVersion = ""
+	sibling.ManagedFields = nil
+	sibling.Finalizers = nil
+	sibling.Status = v1alpha1.ExternalModelStatus{}
+	sibling.Spec.ModelName = "sibling-client"
+	sibling.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef("provider", "gpt")}
+	if err := r.Update(ctx, model); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, sibling); err != nil {
+		t.Fatal(err)
+	}
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatalf("publish Anthropic model and sibling: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sibling)}); err != nil {
+		t.Fatalf("publish sibling model: %v", err)
+	}
+	prior := overlayEnvelope(t, r, model.Namespace).Overlay.Candidates
+	if len(prior) != 2 || prior[0].APIFormat != "messages" && prior[1].APIFormat != "messages" {
+		t.Fatalf("pre-delete overlay did not contain translated Anthropic candidate: %#v", prior)
+	}
+	if err := r.Delete(ctx, model); err != nil {
+		t.Fatal(err)
+	}
+	result, err := r.Reconcile(ctx, request)
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("stage final Anthropic model withdrawal: result=%#v err=%v", result, err)
+	}
+	assertRouteProviders(t, r, model.Namespace, model.Name, "anthropic")
+	if got := len(overlayEnvelope(t, r, model.Namespace).Overlay.Candidates); got != 1 {
+		t.Fatalf("reduced overlay has %d candidates, want only sibling", got)
+	}
+	stableID := envelope.CandidateStableID(model.Name, "anthropic")
+	route, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeRules, _, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := routeClientName(routeRules, model.Namespace, model.Name); got != "claude-client" {
+		t.Fatalf("retained route client model = %q", got)
+	}
+	assertExactSelectedPathRule(t, route, "/v1/messages", stableID)
+	filter, err := getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+		model.Namespace, tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRoutes, responseModes := map[string]bool{}, map[string]string{}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("tenant-a.%s.%d", modelRouteName(model.Name), i)
+		expectedRoutes[name], responseModes[name] = false, "STREAMED"
+	}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("tenant-a.%s.%d", modelRouteName(sibling.Name), i)
+		expectedRoutes[name], responseModes[name] = false, "NONE"
+	}
+	assertExternalModelRoutePatches(t, nestedSlice(t, filter.Object, "spec", "configPatches"), expectedRoutes, responseModes, 8)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "provider-anthropic"}, &corev1.Service{}); err != nil {
+		t.Fatalf("Anthropic provider transport removed before drain: %v", err)
+	}
+
+	sibling = getModel(t, r, sibling)
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{sibling}, true)
+	result, err = r.Reconcile(ctx, request)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start Anthropic request drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, model.Namespace)
+	result, err = r.Reconcile(ctx, request)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish Anthropic withdrawal: result=%#v err=%v", result, err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("Anthropic route remains after drain: %v", err)
+	}
+	filter, err = getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+		model.Namespace, tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRoutes, responseModes = map[string]bool{}, map[string]string{}
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("tenant-a.%s.%d", modelRouteName(sibling.Name), i)
+		expectedRoutes[name], responseModes[name] = false, "NONE"
+	}
+	assertExternalModelRoutePatches(t, nestedSlice(t, filter.Object, "spec", "configPatches"), expectedRoutes, responseModes, 4)
 }
 
 func TestGatewayRebindStagesProviderWithdrawalUntilHomeRuntimeDrains(t *testing.T) {
@@ -805,26 +1042,26 @@ func TestWithdrawalReconciliationErrorKeepsRouteAndRetryResumes(t *testing.T) {
 
 func TestProviderDeletionWaitsForTenantOwnedWithdrawalRoute(t *testing.T) {
 	r, model := reconcilerFixture(t)
+	provider := createWithdrawalProvider(t, r, model.Namespace, "provider-b")
+	model = getModel(t, r, model)
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef(provider.Name, "gpt-b")}
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("publish final-provider route: %v", err)
+	}
+	model = getModel(t, r, model)
+	var storedProvider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &storedProvider); err != nil {
 		t.Fatal(err)
 	}
-	provider := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace,
-		Finalizers: []string{externalProviderFinalizer}}, Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
-	if err := r.Create(context.Background(), provider); err != nil {
-		t.Fatal(err)
-	}
+	provider = &storedProvider
 	neighbor := modelHTTPRouteSet([]resolver.Route{{Model: "neighbor-model", ClientName: "neighbor", Namespace: "tenant-b",
 		Provider: "provider-b", Cluster: "provider-provider-b", Endpoint: "provider-b.example.com"}}, "tenant-b", "gateway-b", "tenant-b")
 	if err := render.Apply(context.Background(), r.Client, []unstructured.Unstructured{neighbor}); err != nil {
 		t.Fatal(err)
 	}
-	retained := modelHTTPRouteSet([]resolver.Route{{Model: model.Name, ClientName: model.Name, Namespace: model.Namespace,
-		Provider: "provider-b", Cluster: "provider-provider-b", Endpoint: "provider-b.example.com"}}, model.Namespace, r.GatewayName, r.GatewayNamespace)
-	if err := render.Apply(context.Background(), r.Client, []unstructured.Unstructured{retained}); err != nil {
-		t.Fatal(err)
-	}
-	// The fixture's initial overlay references provider A. The retained HTTPRoute
-	// is sufficient to defer provider cleanup until the model reconcile drains it.
 	if err := r.Delete(context.Background(), provider); err != nil {
 		t.Fatal(err)
 	}
@@ -835,11 +1072,55 @@ func TestProviderDeletionWaitsForTenantOwnedWithdrawalRoute(t *testing.T) {
 	if result.RequeueAfter != withdrawalRequeueInterval {
 		t.Fatalf("provider deletion requeue = %s, want %s", result.RequeueAfter, withdrawalRequeueInterval)
 	}
-	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
-		t.Fatalf("tenant's retained provider route disappeared: %v", err)
+	var pendingProvider v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &pendingProvider); err != nil {
+		t.Fatal(err)
+	}
+	condition := apiMeta.FindStatusCondition(pendingProvider.Status.Conditions, conditionReady)
+	if pendingProvider.Status.Phase != providerPhasePending || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != reasonProviderInUse ||
+		!strings.Contains(condition.Message, model.Namespace+"/"+model.Name) || !strings.Contains(condition.Message, "updated or deleted") {
+		t.Fatalf("deleting provider status = %#v, want an explicit in-use blocking state", pendingProvider.Status)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName("neighbor-model")); err != nil {
 		t.Fatalf("neighbor tenant route was changed: %v", err)
+	}
+
+	// Removing the final model reference is the documented operator action that
+	// starts safe staged withdrawal; the provider finalizer remains until the
+	// serving revision and request drain have completed.
+	model = getModel(t, r, model)
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef("provider", "gpt-a")}
+	if err := r.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("stage replacement provider route: result=%#v err=%v", result, err)
+	}
+	assertRouteProviders(t, r, model.Namespace, model.Name, "provider", "provider-b")
+	if got := len(overlayEnvelope(t, r, model.Namespace).Overlay.Candidates); got != 1 || overlayEnvelope(t, r, model.Namespace).Overlay.Candidates[0].Cluster != "provider-provider" {
+		t.Fatalf("replacement overlay candidates = %#v, want Provider A only", overlayEnvelope(t, r, model.Namespace).Overlay.Candidates)
+	}
+	model = getModel(t, r, model)
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{model})
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start provider drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, model.Namespace)
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish provider drain: result=%#v err=%v", result, err)
+	}
+	assertRouteProviders(t, r, model.Namespace, model.Name, "provider")
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName("neighbor-model")); err != nil {
+		t.Fatalf("neighbor route did not survive local provider cleanup: %v", err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("finish provider finalizer after model drain: %v", err)
+	}
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, model.Namespace, "provider-provider-b"); !apierrors.IsNotFound(err) {
+		t.Fatalf("withdrawn provider Service remains: %v", err)
 	}
 }
 
@@ -900,8 +1181,9 @@ func markWithdrawalDrainElapsed(t *testing.T, r *Reconciler, namespace string) {
 	}
 }
 
-func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespace string, models []*v1alpha1.ExternalModel) {
+func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespace string, models []*v1alpha1.ExternalModel, translation ...bool) {
 	t.Helper()
+	apiTranslationEnabled := len(translation) > 0 && translation[0]
 	r.readPodLogs = func(ctx context.Context, _, _, container string) (string, error) {
 		if container != externalModelExtProcContainer {
 			t.Fatalf("pod log container = %q, want %q", container, externalModelExtProcContainer)
@@ -926,20 +1208,37 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 			providerPtrs = append(providerPtrs, &providers.Items[i])
 		}
 	}
-	routes, err := resolver.ResolveAll(models, providerPtrs)
+	routes, err := resolver.ResolveAllWithAPITranslation(models, providerPtrs, apiTranslationEnabled)
+	if errors.Is(err, resolver.ErrNoRoutes) {
+		routes, err = &resolver.ResolvedRouteSet{}, nil
+	}
 	if err != nil {
 		t.Fatalf("resolve runtime for safe fixture: %v", err)
 	}
-	candidates, err := tenant.ExternalModelRuntimeCandidates(routes, false)
+	candidates, err := tenant.ExternalModelRuntimeCandidates(routes, apiTranslationEnabled)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, candidate := range overlayEnvelope(t, r, namespace).Overlay.Candidates {
 		if envelope.IsScopedStableID(candidate.StableID) {
+			candidate = cloneCandidate(candidate)
+			if candidate.Credential != nil {
+				copySecret := &metav1.PartialObjectMetadata{}
+				copySecret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+				ref := candidate.Credential.SecretRef
+				if err := r.APIReader.Get(context.Background(), client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, copySecret); err != nil {
+					t.Fatalf("read projected credential metadata %s/%s: %v", ref.Namespace, ref.Name, err)
+				}
+				if copySecret.GetLabels()[tenant.LabelCredentialCopy] == "true" {
+					if header := copySecret.GetAnnotations()[tenant.AnnotationCredentialHeader]; envelope.IsQualifiedAuthHeader(header) {
+						candidate.Credential.Header = header
+					}
+				}
+			}
 			candidates = append(candidates, candidate)
 		}
 	}
-	config, configHash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, false)
+	config, configHash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,6 +1284,80 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 		if err := r.Create(context.Background(), object); err != nil {
 			t.Fatalf("create safe runtime %T %s/%s: %v", object, object.GetNamespace(), object.GetName(), err)
 		}
+	}
+}
+
+// markSafeExternalModelRuntimeCurrent simulates completion of the rollout
+// after an earlier safe runtime was seeded. It updates the exact config,
+// Deployment template hash, and current ReplicaSet template without changing
+// pod identity or EndpointSlice membership.
+func markSafeExternalModelRuntimeCurrent(t *testing.T, r *Reconciler, tenantID, namespace string, apiTranslationEnabled bool, models ...*v1alpha1.ExternalModel) {
+	t.Helper()
+	ctx := context.Background()
+	env := overlayEnvelope(t, r, namespace)
+	config, hash, err := tenant.ExternalModelExtProcConfig(namespace, env.Overlay.Candidates, apiTranslationEnabled)
+	if err != nil {
+		t.Fatalf("render serving ExtProc config from reduced overlay: %v", err)
+	}
+	deploymentName := tenant.PayloadProcessingExternalModelDeploymentName(tenantID)
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: deploymentName}, deployment); err != nil {
+		t.Fatalf("get seeded ExternalModel ExtProc Deployment: %v", err)
+	}
+	if deployment.Spec.Template.Annotations == nil {
+		deployment.Spec.Template.Annotations = map[string]string{}
+	}
+	deployment.Spec.Template.Annotations[extprocConfigHashAnnotation] = hash
+	if err := r.Update(ctx, deployment); err != nil {
+		t.Fatalf("update ExternalModel ExtProc Deployment revision: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(deployment), deployment); err != nil {
+		t.Fatalf("read updated ExternalModel ExtProc Deployment: %v", err)
+	}
+	deployment.Status.ObservedGeneration = deployment.Generation
+	if err := r.Status().Update(ctx, deployment); err != nil {
+		t.Fatalf("mark ExternalModel ExtProc Deployment revision observed: %v", err)
+	}
+	rs := &appsv1.ReplicaSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: deploymentName + "-new"}, rs); err != nil {
+		t.Fatalf("get seeded ExternalModel ExtProc ReplicaSet: %v", err)
+	}
+	rs.Spec.Template.Annotations[extprocConfigHashAnnotation] = hash
+	if err := r.Update(ctx, rs); err != nil {
+		t.Fatalf("update ExternalModel ExtProc ReplicaSet revision: %v", err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID)}, configMap); err != nil {
+		t.Fatalf("get seeded ExternalModel ExtProc ConfigMap: %v", err)
+	}
+	configMap.Data["extproc.yaml"] = config
+	if err := r.Update(ctx, configMap); err != nil {
+		t.Fatalf("update ExternalModel ExtProc ConfigMap revision: %v", err)
+	}
+	expectedHash, err := runtimeConfigHash(ctx, r, models, namespace, apiTranslationEnabled)
+	if err != nil {
+		t.Fatalf("compute current serving config hash: %v", err)
+	}
+	deployment, replicas, deploymentSafe, err := r.externalModelDeploymentSafe(ctx, namespace, tenantID, expectedHash)
+	if err != nil {
+		t.Fatalf("check current ExternalModel Deployment: %v", err)
+	}
+	if !deploymentSafe {
+		actual := &appsv1.Deployment{}
+		readErr := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.PayloadProcessingExternalModelDeploymentName(tenantID)}, actual)
+		configMap := &corev1.ConfigMap{}
+		cmErr := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.PayloadProcessingExternalModelPluginsConfigMapForTenant(tenantID)}, configMap)
+		cmDigest := sha256.Sum256([]byte(configMap.Data["extproc.yaml"]))
+		t.Fatalf("simulated current Deployment is not safe: expected hash=%s replicas=%d readErr=%v labels=%#v generation=%d observed=%d status=%#v specReplicas=%v template=%#v configMapErr=%v configHash=%x configBytes=%d",
+			expectedHash, replicas, readErr, actual.Labels, actual.Generation, actual.Status.ObservedGeneration, actual.Status,
+			actual.Spec.Replicas, actual.Spec.Template.Annotations, cmErr, cmDigest, len(configMap.Data["extproc.yaml"]))
+	}
+	pods, podsSafe, err := r.externalModelPodsSafe(ctx, namespace, deployment, replicas, expectedHash, env.Revision.Value)
+	if err != nil || !podsSafe {
+		t.Fatalf("simulated current Pods are not safe: err=%v pods=%#v", err, pods)
+	}
+	if safe, err := r.externalModelEndpointsSafe(ctx, namespace, tenantID, pods); err != nil || !safe {
+		t.Fatalf("simulated current endpoints are not safe: safe=%t err=%v pods=%#v", safe, err, pods)
 	}
 }
 

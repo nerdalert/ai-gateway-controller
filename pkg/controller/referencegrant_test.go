@@ -253,14 +253,44 @@ func TestAttachedModelOverrideCredentialIsModelLocalWithoutFallback(t *testing.T
 	if len(candidates) != 1 || candidates[0].StableID != "team/chat/shared/openai" || candidates[0].Credential.SecretRef.Name != modelCopy {
 		t.Fatalf("overlay candidates = %#v", candidates)
 	}
+	seedSafeExternalModelRuntime(t, r, "tenant-b", "tenant-b", nil)
 
 	// A missing model-local override never falls back to the provider-namespace Secret.
 	if err := r.Delete(context.Background(), modelSecret); err != nil {
 		t.Fatal(err)
 	}
-	reconcileModel(t, r, model)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+	result, err := r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
+		t.Fatalf("stage attachment withdrawal after model-local credential loss: result=%#v err=%v", result, err)
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("status = %q %q, want staged withdrawal while the old serving revision may select the provider", readyReason(got), readyMessage(got))
+	}
+	if !attachmentRouteExists(t, r, model) {
+		t.Fatal("accepted route was removed before the reduced ExtProc revision served")
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: modelCopy}, &copied); err != nil {
+		t.Fatalf("model-local credential copy removed before the drain: %v", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: sharedCopy}, &copied); !apierrors.IsNotFound(err) {
+		t.Fatalf("provider default credential copy unexpectedly appeared during withdrawal: %v", err)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 0 {
+		t.Fatalf("reduced overlay = %#v, want no candidates", candidates)
+	}
+	markSafeExternalModelRuntimeCurrent(t, r, tenant.ID("tenant-b"), "tenant-b", false)
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("begin model-local credential drain after rollout: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, "tenant-b")
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finish model-local credential drain: result=%#v err=%v", result, err)
+	}
 	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "team/openai-key") {
-		t.Fatalf("status = %q %q, want the missing model-local Secret", readyReason(got), readyMessage(got))
+		t.Fatalf("status = %q %q, want the missing model-local Secret after cleanup", readyReason(got), readyMessage(got))
 	}
 	for _, name := range []string{modelCopy, sharedCopy} {
 		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: name}, &copied); !apierrors.IsNotFound(err) {

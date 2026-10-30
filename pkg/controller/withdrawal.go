@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,7 @@ const (
 	withdrawalDrainSafetyMarginSecs = 10
 	extprocConfigHashAnnotation     = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
 	externalModelExtProcContainer   = "payload-processing"
+	reasonProviderInUse             = "ProviderInUse"
 )
 
 var extprocServingRevisionPattern = regexp.MustCompile(`accepted_revision.*?="([0-9a-f]{64})".*?serving_revision.*?="([0-9a-f]{64})"`)
@@ -113,7 +115,7 @@ func (r *Reconciler) readPublishedEnvelope(ctx context.Context, namespace string
 // published overlay and any already applied HTTPRoute to the desired routes.
 // Additions therefore reach Envoy before publication, while withdrawals keep
 // their old provider rule until the serving workload has drained.
-func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespace string, desired []resolver.Route, previous *envelope.Envelope) ([]resolver.Route, bool, error) {
+func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespace string, desired []resolver.Route, previous *envelope.Envelope, apiTranslationEnabled bool) ([]resolver.Route, bool, error) {
 	byID := make(map[string]resolver.Route, len(desired))
 	for _, route := range desired {
 		for _, id := range desiredCandidateIDs(route) {
@@ -126,9 +128,32 @@ func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespac
 	if err != nil {
 		return nil, false, err
 	}
+	previousCandidates := map[string]envelope.Candidate{}
+	if previous != nil {
+		for _, candidate := range previous.Overlay.Candidates {
+			if candidate.Kind == "inference_model" && candidate.StableID != "" {
+				previousCandidates[candidate.StableID] = candidate
+			}
+		}
+	}
 	for id, route := range transportRoutes {
 		if _, current := byID[id]; current {
 			continue
+		}
+		// HTTPRoute parsing recovers transport and matching identity, but not
+		// the full serving profile. Restore the API format, exact path,
+		// translation permission, and credential reference from the prior
+		// envelope before using this rule to stage a withdrawal.
+		if candidate, found := previousCandidates[id]; found {
+			modelName, providerNamespace, providerName, belongsToTenant := splitTenantWithdrawalStableID(id, namespace)
+			if !belongsToTenant {
+				return nil, false, fmt.Errorf("cannot associate applied route %q with this tenant's prior candidate", id)
+			}
+			restored, err := r.routeForWithdrawnCandidate(ctx, namespace, candidate, modelName, providerNamespace, providerName, transportRoutes, apiTranslationEnabled)
+			if err != nil {
+				return nil, false, err
+			}
+			route = restored
 		}
 		byID[id] = route
 		union = append(union, route)
@@ -156,7 +181,7 @@ func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespac
 			if modelName == "" || providerName == "" || candidate.Cluster == "" {
 				return nil, false, fmt.Errorf("cannot stage stale candidate %q with cluster %q", candidate.StableID, candidate.Cluster)
 			}
-			route, err := r.routeForWithdrawnCandidate(ctx, namespace, candidate, modelName, providerNamespace, providerName, transportRoutes)
+			route, err := r.routeForWithdrawnCandidate(ctx, namespace, candidate, modelName, providerNamespace, providerName, transportRoutes, apiTranslationEnabled)
 			if err != nil {
 				return nil, false, err
 			}
@@ -242,62 +267,85 @@ func (r *Reconciler) routeForWithdrawnCandidate(
 	candidate envelope.Candidate,
 	modelName, providerNamespace, providerName string,
 	applied map[string]resolver.Route,
+	apiTranslationEnabled bool,
 ) (resolver.Route, error) {
 	stableID := candidate.StableID
-	if route, ok := applied[stableID]; ok {
-		route.ClientName = candidate.Name
-		route.APIFormat, route.Path, route.TargetModel = candidate.APIFormat, candidate.Path, candidate.TargetModel
-		route.Cluster = candidate.Cluster
-		return route, nil
-	}
+	route, appliedRoute := applied[stableID]
 	var model v1alpha1.ExternalModel
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: modelName}, &model); err != nil && !apierrors.IsNotFound(err) {
-		return resolver.Route{}, fmt.Errorf("read ExternalModel %s/%s for withdrawn route: %w", namespace, modelName, err)
-	}
-	if providerNamespace == "" {
-		providerNamespace = namespace
-	}
-	if providerNamespace == namespace {
-		providerNamespace = ""
-	}
-	if providerNamespace == "" && candidate.Cluster != providerServicePrefix+providerName {
-		resolvedNamespace, found, err := r.providerNamespaceForService(ctx, namespace, modelName, providerName, candidate.Cluster)
-		if err != nil {
-			return resolver.Route{}, err
+	if !appliedRoute {
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: modelName}, &model); err != nil && !apierrors.IsNotFound(err) {
+			return resolver.Route{}, fmt.Errorf("read ExternalModel %s/%s for withdrawn route: %w", namespace, modelName, err)
 		}
-		if !found {
-			return resolver.Route{}, fmt.Errorf("cannot identify provider namespace for withdrawn candidate %q and cluster %q", stableID, candidate.Cluster)
+		if providerNamespace == "" {
+			providerNamespace = namespace
 		}
-		providerNamespace = resolvedNamespace
+		if providerNamespace == namespace {
+			providerNamespace = ""
+		}
+		if providerNamespace == "" && candidate.Cluster != providerServicePrefix+providerName {
+			resolvedNamespace, found, err := r.providerNamespaceForService(ctx, namespace, modelName, providerName, candidate.Cluster)
+			if err != nil {
+				return resolver.Route{}, err
+			}
+			if !found {
+				return resolver.Route{}, fmt.Errorf("cannot identify provider namespace for withdrawn candidate %q and cluster %q", stableID, candidate.Cluster)
+			}
+			providerNamespace = resolvedNamespace
+		}
+		if providerNamespace == "" {
+			providerNamespace = namespace
+		}
+		clientName := candidate.Name
+		if clientName == "" {
+			clientName = model.Spec.ModelName
+			if clientName == "" {
+				clientName = modelName
+			}
+		}
+		route = resolver.Route{
+			Model: modelName, ClientName: clientName, Namespace: namespace,
+			Provider: providerName, ProviderNamespace: providerNamespace,
+			APITranslationEnabled: apiTranslationEnabled,
+			StableID:              candidate.StableID,
+		}
 	}
-	if providerNamespace == "" {
-		providerNamespace = namespace
+	if appliedRoute {
+		route.ClientName = candidate.Name
+		route.Cluster = candidate.Cluster
 	}
 	var provider v1alpha1.ExternalProvider
-	if err := r.Get(ctx, client.ObjectKey{Namespace: providerNamespace, Name: providerName}, &provider); err != nil {
-		return resolver.Route{}, fmt.Errorf("read ExternalProvider %s/%s for withdrawn route: %w", providerNamespace, providerName, err)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: route.ProviderNamespace, Name: providerName}, &provider); err != nil {
+		return resolver.Route{}, fmt.Errorf("read ExternalProvider %s/%s for withdrawn route: %w", route.ProviderNamespace, providerName, err)
 	}
-	clientName := candidate.Name
-	if clientName == "" {
-		clientName = model.Spec.ModelName
-		if clientName == "" {
-			clientName = modelName
+	route.APIFormat, route.Path, route.TargetModel = candidate.APIFormat, candidate.Path, candidate.TargetModel
+	route.APITranslationEnabled = apiTranslationEnabled
+	route.ProviderType = provider.Spec.Provider
+	route.TLSCACertificates = strings.TrimSpace(provider.Spec.Config["tls.caCertificates"])
+	if route.Cluster == "" {
+		route.Cluster = candidate.Cluster
+		if route.Cluster == "" {
+			route.Cluster = providerServicePrefix + providerName
 		}
 	}
-	cluster := candidate.Cluster
-	if cluster == "" {
-		cluster = providerServicePrefix + providerName
+	if route.Endpoint == "" {
+		route.Endpoint = provider.Spec.Endpoint
 	}
-	return resolver.Route{
-		Model: modelName, ClientName: clientName, Namespace: namespace,
-		Provider: providerName, ProviderNamespace: providerNamespace, ProviderType: provider.Spec.Provider,
-		Cluster: cluster, Endpoint: provider.Spec.Endpoint,
-		TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
-		APIFormat:         candidate.APIFormat, Path: candidate.Path, TargetModel: candidate.TargetModel,
-		AuthType: provider.Spec.Auth.Type, SecretName: provider.Spec.Auth.SecretRef.Name,
-		SecretNamespace: provider.Namespace, SecretKey: "api-key",
-		StableID: candidate.StableID,
-	}, nil
+	if candidate.Credential != nil {
+		// The prior serving envelope is authoritative during drain. Its
+		// SecretRef may name a model override or an attachment copy rather than
+		// the provider's default credential.
+		route.AuthType = "apikey"
+		route.SecretName = candidate.Credential.SecretRef.Name
+		route.SecretNamespace = candidate.Credential.SecretRef.Namespace
+		route.SecretKey = candidate.Credential.SecretRef.Key
+	} else {
+		route.AuthType = provider.Spec.Auth.Type
+		route.SecretName = provider.Spec.Auth.SecretRef.Name
+		route.SecretNamespace = provider.Namespace
+		route.SecretKey = "api-key"
+	}
+	route.StableID = candidate.StableID
+	return route, nil
 }
 
 // readAppliedModelRoutes parses only controller-owned model HTTPRoutes in the
@@ -399,7 +447,48 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 			return true, nil
 		}
 	}
+	// Attached routes live in the source ExternalModel namespace and do not
+	// carry the home-route label parsed above. They still use this namespace's
+	// provider Service, so the provider finalizer must wait for their staged
+	// route withdrawal too.
+	attachments, err := r.listAttachmentRoutes(ctx, r.APIReader, client.InNamespace(namespace))
+	if err != nil {
+		return false, err
+	}
+	if routeBackends(attachments)[cluster] {
+		return true, nil
+	}
 	return false, nil
+}
+
+// providerWithdrawalWaitMessage makes the safe provider-deletion contract
+// visible while a provider finalizer waits for model references and serving
+// route state to be withdrawn. The controller deliberately does not discard a
+// last-known-good route just because its provider object is terminating.
+func (r *Reconciler) providerWithdrawalWaitMessage(ctx context.Context, namespace, providerName string) (string, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models); err != nil {
+		return "", fmt.Errorf("list ExternalModels while reporting provider withdrawal: %w", err)
+	}
+	var references []string
+	for i := range models.Items {
+		model := &models.Items[i]
+		for _, ref := range model.Spec.ExternalProviderRefs {
+			refNamespace := ref.Ref.Namespace
+			if refNamespace == "" {
+				refNamespace = model.Namespace
+			}
+			if refNamespace == namespace && ref.Ref.Name == providerName {
+				references = append(references, model.Namespace+"/"+model.Name)
+				break
+			}
+		}
+	}
+	sort.Strings(references)
+	if len(references) > 0 {
+		return "provider deletion is waiting for referencing ExternalModel resources to be updated or deleted before the serving route and in-flight request drain can complete: " + strings.Join(references, ", "), nil
+	}
+	return "provider deletion is waiting for controller-owned serving routes to complete their reduced-runtime rollout and in-flight request drain", nil
 }
 
 func providerStableIDFromRule(rule map[string]any) string {
@@ -507,7 +596,11 @@ func (r *Reconciler) finishProviderWithdrawal(ctx context.Context, namespace, te
 	models []*v1alpha1.ExternalModel, owners map[string]*v1alpha1.ExternalModel, desired []resolver.Route,
 	attached []attachedModel, revision string, pending, apiTranslationEnabled bool, state map[string]attachedModel) (time.Duration, error) {
 	if !pending {
-		return 0, r.clearWithdrawalDrainState(ctx, namespace)
+		return 0, r.clearWithdrawalDrainStateIfNoAttachmentWithdrawal(ctx, attachmentTenant{
+			namespace: namespace, tenantID: tenantID,
+			gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+			apiTranslationEnabled: apiTranslationEnabled,
+		})
 	}
 	runtimeHash, err := runtimeConfigHash(ctx, r, models, namespace, apiTranslationEnabled)
 	if err != nil {
@@ -521,7 +614,7 @@ func (r *Reconciler) finishProviderWithdrawal(ctx context.Context, namespace, te
 	if err != nil || remaining > 0 {
 		return remaining, err
 	}
-	if err := r.applyTransport(ctx, desired, namespace, tenantID, gatewayName, gatewayNamespace, owners, attached, state); err != nil {
+	if err := r.applyTransport(ctx, desired, namespace, tenantID, gatewayName, gatewayNamespace, owners, attached, state, apiTranslationEnabled); err != nil {
 		return 0, err
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -530,7 +623,41 @@ func (r *Reconciler) finishProviderWithdrawal(ctx context.Context, namespace, te
 	if err := r.cleanupModelTransport(ctx, namespace, desired); err != nil {
 		return 0, err
 	}
-	return 0, r.clearWithdrawalDrainState(ctx, namespace)
+	return 0, r.clearWithdrawalDrainStateIfNoAttachmentWithdrawal(ctx, attachmentTenant{
+		namespace: namespace, tenantID: tenantID,
+		gateway:               v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		apiTranslationEnabled: apiTranslationEnabled,
+	})
+}
+
+func (r *Reconciler) clearWithdrawalDrainStateIfNoAttachmentWithdrawal(ctx context.Context, t attachmentTenant) error {
+	attachmentWithdrawalPending, err := r.hasPendingAttachmentWithdrawal(ctx, t)
+	if err != nil {
+		return err
+	}
+	if attachmentWithdrawalPending {
+		// The drain annotation is shared by the tenant's runtime. A home-model
+		// reconcile must not clear another attachment's active drain state.
+		return nil
+	}
+	return r.clearWithdrawalDrainState(ctx, t.namespace)
+}
+
+func (r *Reconciler) hasPendingAttachmentWithdrawal(ctx context.Context, t attachmentTenant) (bool, error) {
+	candidates, err := r.attachmentCandidates(ctx, t)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range candidates {
+		withdrawn, err := r.withdrawnAttachmentCandidates(ctx, candidate, t)
+		if err != nil {
+			return false, err
+		}
+		if len(withdrawn) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *Reconciler) externalModelDeploymentSafe(ctx context.Context, namespace, tenantID, expectedConfigHash string) (*appsv1.Deployment, int32, bool, error) {
@@ -806,7 +933,12 @@ func runtimeConfigHash(ctx context.Context, r *Reconciler, models []*v1alpha1.Ex
 		}
 	}
 	routes, err := resolver.ResolveAllWithAPITranslation(models, providers, apiTranslationEnabled)
-	if err != nil {
+	if errors.Is(err, resolver.ErrNoRoutes) {
+		// The tenant's ExtProc runtime also serves scoped attachment
+		// candidates. An empty home candidate set is valid when those scoped
+		// candidates define the complete runtime.
+		routes = &resolver.ResolvedRouteSet{}
+	} else if err != nil {
 		return "", fmt.Errorf("resolve current ExternalModel ExtProc runtime routes: %w", err)
 	}
 	candidates, err := tenant.ExternalModelRuntimeCandidates(routes, apiTranslationEnabled)
@@ -823,14 +955,24 @@ func runtimeConfigHash(ctx context.Context, r *Reconciler, models []*v1alpha1.Ex
 			if !envelope.IsScopedStableID(candidate.StableID) {
 				continue
 			}
+			candidate = cloneCandidate(candidate)
 			if candidate.Credential != nil {
 				ref := candidate.Credential.SecretRef
-				secret := &corev1.Secret{}
-				if err := r.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+				if r.APIReader == nil {
+					return "", errors.New("APIReader is required to verify attachment credential references")
+				}
+				secret := &metav1.PartialObjectMetadata{}
+				secret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+				if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
 					if apierrors.IsNotFound(err) {
 						continue
 					}
 					return "", fmt.Errorf("read attachment credential copy %s/%s: %w", ref.Namespace, ref.Name, err)
+				}
+				if secret.GetLabels()[tenant.LabelCredentialCopy] == "true" {
+					if header := secret.GetAnnotations()[tenant.AnnotationCredentialHeader]; envelope.IsQualifiedAuthHeader(header) {
+						candidate.Credential.Header = header
+					}
 				}
 			}
 			candidates = append(candidates, candidate)
@@ -841,4 +983,13 @@ func runtimeConfigHash(ctx context.Context, r *Reconciler, models []*v1alpha1.Ex
 		return "", fmt.Errorf("compute current ExternalModel ExtProc config hash: %w", err)
 	}
 	return hash, nil
+}
+
+func cloneCandidate(candidate envelope.Candidate) envelope.Candidate {
+	cloned := candidate
+	if candidate.Credential != nil {
+		credential := *candidate.Credential
+		cloned.Credential = &credential
+	}
+	return cloned
 }
