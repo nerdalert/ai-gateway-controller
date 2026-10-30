@@ -1652,6 +1652,22 @@ func TestSiblingAttachmentReconcilePreservesOtherWithdrawalDrain(t *testing.T) {
 	if err := r.Update(ctx, updated); err != nil {
 		t.Fatal(err)
 	}
+	before := overlayEnvelope(t, r, "tenant-b").Revision.Value
+	originalClient := r.Client
+	r.Client = withdrawalAnnotationFailureClient{Client: originalClient}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(home)}); err == nil {
+		t.Fatal("home writer published despite failed withdrawal persistence")
+	}
+	if revision := overlayEnvelope(t, r, "tenant-b").Revision.Value; revision != before {
+		t.Fatal("failed persistence replaced the prior overlay")
+	}
+	r.Client = originalClient
+	reconcileModel(t, r, home)
+	if retained := envCandidateWithdrawalAnnotation(t, r, withdrawing.Namespace, attachmentRouteName(withdrawing, gatewayB)); len(retained) != 1 {
+		t.Fatalf("home-first writer did not persist withdrawn B: %#v", retained)
+	}
+	reconcileModel(t, r, home)
+	reconcileModel(t, r, sibling)
 	withdrawRequest := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(withdrawing)}
 	result, err := r.Reconcile(ctx, withdrawRequest)
 	if err != nil || result.RequeueAfter != withdrawalRequeueInterval {
@@ -2772,5 +2788,75 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 	}
 	if got.Status.HTTPRouteName != "" {
 		t.Fatalf("failed model keeps httpRouteName %q", got.Status.HTTPRouteName)
+	}
+}
+
+type withdrawalAnnotationFailureClient struct{ client.Client }
+
+func (c withdrawalAnnotationFailureClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if route, ok := obj.(*unstructured.Unstructured); ok && route.GetKind() == "HTTPRoute" && route.GetAnnotations()[annotationWithdrawalCandidates] != "" {
+		return errors.New("injected withdrawal annotation persistence failure")
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func TestAttachmentProtectionDoesNotClaimStandaloneProviderStatus(t *testing.T) {
+	ctx := context.Background()
+	r, model := servedImplicitFixture(t)
+	key := client.ObjectKey{Namespace: model.Namespace, Name: "openai"}
+	provider := &v1alpha1.ExternalProvider{}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("served attachment lacks provider protection")
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.Status.Phase != resolver.PhaseReady || !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatalf("protected standalone provider must remain Ready: %#v", provider)
+	}
+	if err := r.removeAttachmentRoute(ctx, model, defaultGateway); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.collectProviderTransport(ctx, model.Namespace); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, key, provider); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("unused standalone provider retains protection")
+	}
+}
+
+func TestStandaloneProviderProtectionIncludesForeignAttachmentRoutes(t *testing.T) {
+	ctx := context.Background()
+	provider, secret := attachmentProvider("shared")
+	model := referenceProvider(attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB), "shared")
+	grant := referenceGrant("shared", "team", "openai")
+	objects := append([]client.Object{provider, secret, model, grant}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("foreign provider lacks protection")
+	}
+	if err := r.releaseUnusedAttachmentProvider(ctx, provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("active foreign attachment lost protection")
 	}
 }

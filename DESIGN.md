@@ -775,3 +775,22 @@ alone:
 - This repo has no git remote yet, so none of `.github/workflows/*` have
   actually executed — they're believed correct against the Makefile targets
   but unverified in GitHub Actions.
+
+### Withdrawal evidence and attachment-only providers
+
+Before reducing a tenant overlay, every shared route-filter writer persists
+removed attachment candidates on their owned HTTPRoute. Failed persistence
+leaves the previous overlay available for retry; later writers can reconstruct
+the old route contract without republishing withdrawn candidates.
+
+A missing or unreadable serving-revision log line is unknown evidence. It
+blocks cleanup and preserves any existing drain timestamp. A confirmed
+revision mismatch invalidates the drain; cleanup still requires fresh rollout,
+endpoint, and revision proof after the interval. Bounded log tails can therefore
+delay cleanup when no fresh revision evidence is available, but cannot authorize
+cleanup or repeatedly erase a previously proven interval merely by losing a line.
+
+An attachment may protect an unclaimed-namespace provider with the cleanup
+finalizer without changing its standalone validation/status ownership. Once no
+controller-owned serving route uses that provider, transport collection releases
+that protection. A namespace claimed by an AITenant retains its tenant lifecycle.

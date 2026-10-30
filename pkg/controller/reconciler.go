@@ -450,7 +450,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if validationErr == nil {
 		validationErr = r.validateProviderCredential(ctx, &provider)
 	}
-	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+	if live.missingConfig {
 		// A namespace no tenant claims is served only through Gateway
 		// attachments: its provider has no tenant-local transport, so only its
 		// own configuration is reported. While IPP serves the default tenant,
@@ -463,13 +463,20 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
+			if err := r.releaseUnusedAttachmentProvider(ctx, &provider); err != nil {
+				return reconcile.Result{}, err
+			}
 			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
 				return reconcile.Result{}, err
 			}
-			if validationErr != nil {
-				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+			result := reconcile.Result{}
+			if controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+				result.RequeueAfter = 30 * time.Second
 			}
-			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			if validationErr != nil {
+				return result, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+			}
+			return result, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
 		}
 	}
 	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
@@ -2734,4 +2741,30 @@ func (r *Reconciler) reconcileDeletingProvider(ctx context.Context, provider *v1
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, r.removeExternalProviderFinalizer(ctx, provider)
+}
+
+// releaseUnusedAttachmentProvider releases attachment-only deletion protection
+// without changing the status ownership of a namespace claimed by a tenant.
+func (r *Reconciler) releaseUnusedAttachmentProvider(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return nil
+	}
+	claimed, err := r.tenantNamespace(ctx, provider.Namespace)
+	if err != nil || claimed {
+		return err
+	}
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: provider.Namespace, Name: "default-tenant"}, mtc); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	inUse, err := r.providerTransportStillInUse(ctx, provider.Namespace, provider.Name)
+	if err != nil || inUse {
+		return err
+	}
+	if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		return err
+	}
+	return r.removeExternalProviderFinalizer(ctx, provider)
 }

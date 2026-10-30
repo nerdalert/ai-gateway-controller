@@ -1563,6 +1563,9 @@ func (r *Reconciler) writeTenantExternalModelRoutes(
 		if len(withdrawnCandidates) == 0 {
 			continue
 		}
+		if err := r.persistAttachmentWithdrawal(ctx, candidate, t, withdrawnCandidates); err != nil {
+			return false, err
+		}
 		retainingWithdrawal = true
 		withdrawn, err := r.routesForAttachmentWithdrawal(ctx, candidate.model, t, withdrawnCandidates)
 		if err != nil {
@@ -1644,6 +1647,9 @@ func (r *Reconciler) attachmentWithdrawalRemaining(ctx context.Context, t attach
 		return 0, err
 	}
 	safe, err := r.externalModelRolloutSafe(ctx, t.namespace, t.tenantID, configHash)
+	if errors.Is(err, errServingRevisionUnknown) {
+		return withdrawalRequeueInterval, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -2376,4 +2382,32 @@ func (r *Reconciler) attachedModelSinks(ctx context.Context, namespace string) (
 		models[routes[i].GetAnnotations()[annotationAttachmentModel]] = true
 	}
 	return models, nil
+}
+
+// persistAttachmentWithdrawal makes the prior serving contract durable before
+// any tenant writer can remove its candidates from the published overlay.
+func (r *Reconciler) persistAttachmentWithdrawal(ctx context.Context, a attachedModel, t attachmentTenant, candidates []envelope.Candidate) error {
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(httpRouteGVK)
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: a.model.Namespace, Name: a.routeName}, route); err != nil {
+		return err
+	}
+	if !isAttachmentRoute(route, a.model, t.gateway) {
+		return fmt.Errorf("refusing to persist withdrawal on foreign attachment route %s/%s", route.GetNamespace(), route.GetName())
+	}
+	encoded, err := json.Marshal(candidates)
+	if err != nil {
+		return err
+	}
+	if route.GetAnnotations()[annotationWithdrawalCandidates] == string(encoded) {
+		return nil
+	}
+	base := route.DeepCopy()
+	annotations := route.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[annotationWithdrawalCandidates] = string(encoded)
+	route.SetAnnotations(annotations)
+	return r.Patch(ctx, route, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
