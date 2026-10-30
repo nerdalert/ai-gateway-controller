@@ -99,11 +99,7 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 
 func TestRenderedExternalModelGatewayHasBoundedTwoMiBRequestBuffer(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
-	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-		t.Skipf("vendored manifests not present at %s", manifestPath)
-	} else if err != nil {
-		t.Fatalf("inspect vendored manifests: %v", err)
-	}
+	requireVendoredManifests(t, manifestPath)
 	resources, err := Build(manifestPath)
 	if err != nil {
 		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
@@ -189,11 +185,7 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 func TestRenderedExtProcPreservesBufferedMaaSAndAddsHeaderPhaseExternalModel(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 
-	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-		t.Skipf("vendored manifests not present at %s", manifestPath)
-	} else if err != nil {
-		t.Fatalf("inspect vendored manifests: %v", err)
-	}
+	requireVendoredManifests(t, manifestPath)
 	resources, err := Build(manifestPath)
 	if err != nil {
 		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
@@ -319,4 +311,13 @@ func assertRenderedIPPPreResponseNone(t *testing.T, patches []any) int {
 		count++
 	}
 	return count
+}
+
+func requireVendoredManifests(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skipf("vendored manifests not present at %s", path)
+	} else if err != nil {
+		t.Fatalf("inspect vendored manifests: %v", err)
+	}
 }
