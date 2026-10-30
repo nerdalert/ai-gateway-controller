@@ -1432,3 +1432,51 @@ func assertRouteProviders(t *testing.T, r *Reconciler, namespace, model string, 
 func boolPtr(value bool) *bool       { return &value }
 func stringPtr(value string) *string { return &value }
 func int32Ptr(value int32) *int32    { return &value }
+
+func TestUnknownServingRevisionPreservesDrainButCannotAuthorizeCleanup(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{model})
+	markSafeExternalModelRuntimeCurrent(t, r, "tenant", model.Namespace, false, model)
+	env := overlayEnvelope(t, r, model.Namespace)
+	now := time.Now()
+	if _, err := r.withdrawalDrainRemaining(ctx, model.Namespace, env.Revision.Value, true, now.Add(-withdrawalDrainDuration)); err != nil {
+		t.Fatal(err)
+	}
+	readState := func() string {
+		var cm corev1.ConfigMap
+		if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: r.configMapName()}, &cm); err != nil {
+			t.Fatal(err)
+		}
+		return cm.Annotations[withdrawalDrainAnnotation]
+	}
+	before := readState()
+	knownLogs := r.readPodLogs
+	r.readPodLogs = func(context.Context, string, string, string) (string, error) {
+		return strings.Repeat("request handled\n", 301), nil
+	}
+	tnt := attachmentTenant{namespace: model.Namespace, tenantID: "tenant"}
+	remaining, err := r.attachmentWithdrawalRemaining(ctx, tnt)
+	if err != nil || remaining != withdrawalRequeueInterval {
+		t.Fatalf("unknown revision must block cleanup: remaining=%v err=%v", remaining, err)
+	}
+	if readState() != before {
+		t.Fatal("unknown revision reset the persisted drain")
+	}
+	r.readPodLogs = knownLogs
+	remaining, err = r.attachmentWithdrawalRemaining(ctx, tnt)
+	if err != nil || remaining != 0 {
+		t.Fatalf("fresh proof should finish the original elapsed drain: remaining=%v err=%v", remaining, err)
+	}
+	r.readPodLogs = func(context.Context, string, string, string) (string, error) {
+		return `accepted_revision="` + strings.Repeat("b", 64) + `" serving_revision="` + strings.Repeat("b", 64) + `"`, nil
+	}
+	remaining, err = r.attachmentWithdrawalRemaining(ctx, tnt)
+	if err != nil || remaining != withdrawalRequeueInterval {
+		t.Fatalf("mismatch must block: %v %v", remaining, err)
+	}
+	if readState() != "" {
+		t.Fatal("confirmed mismatch did not invalidate the drain")
+	}
+}

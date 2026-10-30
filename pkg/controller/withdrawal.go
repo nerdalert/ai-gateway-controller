@@ -50,6 +50,9 @@ const (
 	reasonProviderInUse             = "ProviderInUse"
 )
 
+// errServingRevisionUnknown blocks cleanup without invalidating a proven drain.
+var errServingRevisionUnknown = errors.New("serving revision is absent from the bounded pod log tail")
+
 var extprocServingRevisionPattern = regexp.MustCompile(`accepted_revision.*?="([0-9a-f]{64})".*?serving_revision.*?="([0-9a-f]{64})"`)
 var terminalEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
@@ -451,12 +454,15 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 	// carry the home-route label parsed above. They still use this namespace's
 	// provider Service, so the provider finalizer must wait for their staged
 	// route withdrawal too.
-	attachments, err := r.listAttachmentRoutes(ctx, r.APIReader, client.InNamespace(namespace))
+	attachments, err := r.listAttachmentRoutes(ctx, r.APIReader)
 	if err != nil {
 		return false, err
 	}
-	if routeBackends(attachments)[cluster] {
-		return true, nil
+	for i := range attachments {
+		route := resolver.Route{Namespace: attachments[i].GetNamespace(), ProviderNamespace: namespace, Provider: providerName}
+		if routeBackends(attachments[i : i+1])[route.ServiceName()] {
+			return true, nil
+		}
 	}
 	return false, nil
 }
@@ -607,6 +613,9 @@ func (r *Reconciler) finishProviderWithdrawal(ctx context.Context, namespace, te
 		return 0, err
 	}
 	safe, err := r.externalModelRolloutSafe(ctx, namespace, tenantID, runtimeHash)
+	if errors.Is(err, errServingRevisionUnknown) {
+		return withdrawalRequeueInterval, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -795,7 +804,7 @@ func (r *Reconciler) externalModelPodsSafe(ctx context.Context, namespace string
 func (r *Reconciler) podServesOverlayRevision(ctx context.Context, pod *corev1.Pod, expectedRevision string) (bool, error) {
 	logs, err := r.readPodLogs(ctx, pod.Namespace, pod.Name, externalModelExtProcContainer)
 	if err != nil {
-		return false, fmt.Errorf("read ExternalModel ExtProc logs for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		return false, fmt.Errorf("%w: read pod %s/%s logs: %w", errServingRevisionUnknown, pod.Namespace, pod.Name, err)
 	}
 	lines := strings.Split(logs, "\n")
 	for index := len(lines) - 1; index >= 0; index-- {
@@ -804,9 +813,12 @@ func (r *Reconciler) podServesOverlayRevision(ctx context.Context, pod *corev1.P
 			continue
 		}
 		match := extprocServingRevisionPattern.FindStringSubmatch(line)
-		return len(match) == 3 && match[1] == expectedRevision && match[2] == expectedRevision, nil
+		if len(match) != 3 {
+			return false, errServingRevisionUnknown
+		}
+		return match[1] == expectedRevision && match[2] == expectedRevision, nil
 	}
-	return false, nil
+	return false, errServingRevisionUnknown
 }
 
 func (r *Reconciler) externalModelEndpointsSafe(ctx context.Context, namespace, tenantID string, currentPods map[types.UID]bool) (bool, error) {
