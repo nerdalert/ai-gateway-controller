@@ -387,6 +387,39 @@ Use a distinct `RUN_EVIDENCE` directory for every cold run. The translation
 test uses synthetic request bodies and records body sizes and structural
 provider receipts only; large prompt contents and image bytes are not retained.
 
+### Qualifying a published ExtProc image
+
+The default Kind path builds ExtProc from `PRAXIS_EXTPROC_REPO`. To qualify a
+published release artifact instead, use `EXTPROC_IMAGE_MODE=published` with an
+immutable registry digest and the matching, clean ExtProc source checkout. The
+provisioner checks the digest, platform, OCI source and revision labels, then
+checks the image digest and image ID in the Kind node and serving Pods. It
+fails closed if the configured source checkout or runtime identity differs.
+Do not pass a mutable tag in published mode.
+
+```sh
+EXT_SOURCE_SHA=24f2d003ed303a950b6bd8ab042f0d62a5ab4278
+EXT_IMAGE='quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd'
+RUN_EVIDENCE="$PWD/evidence/published-extproc-qualification"
+export PRAXIS_EXTPROC_REPO=/path/to/clean/praxis-extproc-at-merge-sha
+export EXTPROC_IMAGE_MODE=published EXPECTED_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA"
+export EXPECTED_EXTPROC_PLATFORM=linux/amd64 EXTPROC_IMAGE="$EXT_IMAGE"
+LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_EVIDENCE_ROOT="$RUN_EVIDENCE/provision" ./run.sh --provision
+LOCAL_ENV_CLUSTER="$CLUSTER" ./e2e.sh
+LOCAL_ENV_CLUSTER="$CLUSTER" LOCAL_ENV_TRANSLATION_EVIDENCE="$RUN_EVIDENCE/translation" \
+PRAXIS_EXTPROC_IMAGE="$EXT_IMAGE" \
+PRAXIS_EXTPROC_IMAGE_MODE=published \
+PRAXIS_EXTPROC_SOURCE_SHA="$EXT_SOURCE_SHA" \
+PRAXIS_EXTPROC_PLATFORM=linux/amd64 \
+  python3 test/kind-env/e2e-api-translation.py --scope all
+```
+
+Use the same run evidence directory for provisioning and tests. The provisioner
+records `extproc-published-image-provenance.json` and per-tenant
+`extproc-runtime-digest-*.json`; the translation E2E independently records the
+requested reference, pulled image identity, source labels, and running Pod
+image IDs. Source mode remains the default for ordinary local development.
+
 The transition fixture uses a real `MaasTenantConfig` explicitly set to
 `ipp` and MaaS model
 resources. It reached real IPP ownership in the fresh run, but the existing IPP

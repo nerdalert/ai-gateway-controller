@@ -243,12 +243,11 @@ func buildMetricsServerOptions(bindAddress string, secureMetrics bool) metricsse
 // resolveExtprocImage returns the praxis-extproc container image.
 // In operator-managed deployments the RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE
 // env var carries a digest-pinned reference suitable for disconnected clusters.
-// When the variable is unset (local development), the mutable tag fallback is
-// returned instead.
+// When the variable is unset, local development uses the pinned release image.
 func resolveExtprocImage() string {
 	return cmp.Or(
 		os.Getenv("RELATED_IMAGE_ODH_PRAXIS_EXTPROC_IMAGE"),
-		"quay.io/opendatahub/odh-praxis-extproc:odh-stable",
+		"quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd",
 	)
 }
 

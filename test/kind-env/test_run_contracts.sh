@@ -6,6 +6,57 @@ source "$ROOT/test/kind-env/lib/image_refs.sh"
 source "$ROOT/test/kind-env/lib/maas_api_image_identity.sh"
 source "$ROOT/test/kind-env/lib/registry_image_identity.sh"
 
+published_extproc_ref='quay.io/opendatahub/odh-praxis-extproc@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+published_extproc_runtime='{"status":{"id":"sha256:config","repoDigests":["quay.io/opendatahub/odh-praxis-extproc@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]}}'
+image_reference_is_immutable_digest "$published_extproc_ref" || {
+  echo "published ExtProc digest reference was rejected" >&2
+  exit 1
+}
+if image_reference_is_immutable_digest 'quay.io/opendatahub/odh-praxis-extproc:odh-stable'; then
+  echo "mutable ExtProc image tag was accepted as immutable" >&2
+  exit 1
+fi
+extproc_image_mode_is_valid published "$published_extproc_ref" 24f2d003ed303a950b6bd8ab042f0d62a5ab4278 linux/amd64 "" || {
+  echo "valid published ExtProc qualification inputs were rejected" >&2
+  exit 1
+}
+for invalid_extproc_mode in \
+  "published quay.io/opendatahub/odh-praxis-extproc:odh-stable 24f2d003ed303a950b6bd8ab042f0d62a5ab4278 linux/amd64" \
+  "published $published_extproc_ref short linux/amd64" \
+  "published $published_extproc_ref 24f2d003ed303a950b6bd8ab042f0d62a5ab4278 linux/ppc64le" \
+  "published $published_extproc_ref 24f2d003ed303a950b6bd8ab042f0d62a5ab4278 linux/amd64 /local/praxis-ai" \
+  "unknown $published_extproc_ref 24f2d003ed303a950b6bd8ab042f0d62a5ab4278 linux/amd64"; do
+  read -r mode image source_sha platform ai_repo <<<"$invalid_extproc_mode"
+  if extproc_image_mode_is_valid "$mode" "$image" "$source_sha" "$platform" "$ai_repo"; then
+    echo "invalid published ExtProc qualification inputs were accepted: $invalid_extproc_mode" >&2
+    exit 1
+  fi
+done
+extproc_image_mode_is_valid source praxis-extproc:local "" linux/amd64 "" || {
+  echo "default source-built ExtProc mode was rejected" >&2
+  exit 1
+}
+containerd_image_has_exact_digest_reference "$published_extproc_runtime" "$published_extproc_ref" || {
+  echo "containerd image identity rejected the exact requested ExtProc digest" >&2
+  exit 1
+}
+if containerd_image_has_exact_digest_reference "$published_extproc_runtime" 'quay.io/opendatahub/odh-praxis-extproc@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'; then
+  echo "containerd image identity accepted a different ExtProc digest" >&2
+  exit 1
+fi
+containerd_pod_image_id_matches_runtime "$published_extproc_runtime" 'containerd://sha256:config' || {
+  echo "pod config image ID was not correlated with the inspected runtime image" >&2
+  exit 1
+}
+containerd_pod_image_id_matches_runtime "$published_extproc_runtime" 'docker-pullable://quay.io/opendatahub/odh-praxis-extproc@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' || {
+  echo "pod digest image ID was not correlated with the inspected runtime image" >&2
+  exit 1
+}
+if containerd_pod_image_id_matches_runtime "$published_extproc_runtime" 'docker-pullable://quay.io/opendatahub/odh-praxis-extproc@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'; then
+  echo "pod image ID matched a digest absent from the inspected runtime image" >&2
+  exit 1
+fi
+
 run_image_resolution() {
   env -i PATH="$PATH" "$@" bash -c '
     set -e

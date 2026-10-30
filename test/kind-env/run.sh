@@ -34,6 +34,9 @@ KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
 PRAXIS_AI_REPO=${PRAXIS_AI_REPO:-}
 EXTPROC_IMAGE=${EXTPROC_IMAGE:-praxis-extproc:dev}
+EXTPROC_IMAGE_MODE=${EXTPROC_IMAGE_MODE:-source}
+EXPECTED_EXTPROC_SOURCE_SHA=${EXPECTED_EXTPROC_SOURCE_SHA:-${EXPECTED_EXTPROC_MAIN_SHA:-}}
+EXPECTED_EXTPROC_PLATFORM=${EXPECTED_EXTPROC_PLATFORM:-linux/amd64}
 ISTIOCTL=${ISTIOCTL:-/tmp/istio-1.27.3/bin/istioctl}
 EVIDENCE_ROOT=${LOCAL_ENV_EVIDENCE_ROOT:-"$ROOT/evidence"}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -434,6 +437,9 @@ if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
   [[ "$extproc_head" == "$EXPECTED_EXTPROC_MAIN_SHA" ]] || fail "ExtProc source SHA must be $EXPECTED_EXTPROC_MAIN_SHA; got $extproc_head on branch ${extproc_branch:-detached}"
   [[ -z "$(git -C "$PRAXIS_EXTPROC_REPO" status --porcelain)" ]] || fail "ExtProc source checkout is dirty"
 fi
+extproc_image_mode_is_valid "$EXTPROC_IMAGE_MODE" "$EXTPROC_IMAGE" \
+  "$EXPECTED_EXTPROC_SOURCE_SHA" "$EXPECTED_EXTPROC_PLATFORM" "$PRAXIS_AI_REPO" \
+  || fail "invalid ExtProc image mode or identity inputs; published mode requires an immutable digest, full source SHA, supported platform, and no local Praxis AI override"
 
 if rg -q 'For\(.*ExternalModel|ExternalModel.*Reconciler|SetupWithManager' "$ROOT/cmd" "$ROOT/pkg" 2>/dev/null; then
   echo "reconciler_source=present"
@@ -477,6 +483,40 @@ for pair in \
         "$(git -C "$PRAXIS_AI_REPO" branch --show-current)" "$ai_sha" "$ai_diff" >"$EVIDENCE/praxis-ai-source.txt"
       printf 'praxis-ai=%s\n%s\n' "$ai_sha" "$ai_diff" >>"$EVIDENCE/${label}.inputs"
     fi
+  fi
+  if [[ "$label" == extproc && "$EXTPROC_IMAGE_MODE" == published ]]; then
+    [[ "$source_sha" == "$EXPECTED_EXTPROC_SOURCE_SHA" ]] || fail "published ExtProc source checkout must be $EXPECTED_EXTPROC_SOURCE_SHA; got $source_sha"
+    [[ -z "$source_diff" ]] || fail "published ExtProc provenance checkout is dirty"
+    timeout 300s docker pull --platform "$EXPECTED_EXTPROC_PLATFORM" "$EXTPROC_IMAGE"
+    extproc_image_json=$(docker image inspect "$EXTPROC_IMAGE")
+    extproc_local_id=$(jq -r '.[0].Id // empty' <<<"$extproc_image_json")
+    extproc_platform=$(jq -r '.[0] | .Os + "/" + .Architecture' <<<"$extproc_image_json")
+    extproc_labels=$(jq -c '.[0].Config.Labels // {}' <<<"$extproc_image_json")
+    extproc_source_label=$(jq -r '."org.opencontainers.image.source" // empty' <<<"$extproc_labels")
+    extproc_revision_label=$(jq -r '."org.opencontainers.image.revision" // empty' <<<"$extproc_labels")
+    extproc_git_commit_label=$(jq -r '."git.commit" // empty' <<<"$extproc_labels")
+    extproc_repo_digests=$(jq -c '.[0].RepoDigests // []' <<<"$extproc_image_json")
+    extproc_digest=${EXTPROC_IMAGE##*@}
+    extproc_repo=${EXTPROC_IMAGE%@*}
+    expected_extproc_repo_digest="$extproc_repo@$extproc_digest"
+    jq -n --arg reference "$EXTPROC_IMAGE" --arg imageID "$extproc_local_id" \
+      --arg platform "$extproc_platform" --arg expectedPlatform "$EXPECTED_EXTPROC_PLATFORM" \
+      --arg source "$extproc_source_label" --arg revision "$extproc_revision_label" \
+      --arg gitCommit "$extproc_git_commit_label" --arg expectedSource "$EXPECTED_EXTPROC_SOURCE_SHA" \
+      --arg expectedRepoDigest "$expected_extproc_repo_digest" --argjson repoDigests "$extproc_repo_digests" \
+      '{reference:$reference,imageID:$imageID,platform:$platform,expectedPlatform:$expectedPlatform,
+        source:$source,revision:$revision,gitCommit:$gitCommit,expectedSource:$expectedSource,
+        repoDigests:$repoDigests,expectedRepoDigest:$expectedRepoDigest}' \
+      >"$EVIDENCE/extproc-published-image-provenance.json"
+    [[ -n "$extproc_local_id" && "$extproc_platform" == "$EXPECTED_EXTPROC_PLATFORM" \
+      && "$extproc_source_label" == https://github.com/opendatahub-io/praxis-extproc \
+      && "$extproc_revision_label" == "$EXPECTED_EXTPROC_SOURCE_SHA" \
+      && "$extproc_git_commit_label" == "$EXPECTED_EXTPROC_SOURCE_SHA" \
+      && " $(jq -r '.[]' <<<"$extproc_repo_digests") " == *" $expected_extproc_repo_digest "* ]] || \
+      fail "published ExtProc image digest, platform, or source labels do not match the expected artifact; see extproc-published-image-provenance.json"
+    printf '%s\n' "$extproc_local_id" >"$EVIDENCE/extproc-image-id.txt"
+    printf '%s\n' "$EXTPROC_IMAGE" >"$EVIDENCE/extproc-image-reference.txt"
+    continue
   fi
   cache="$EVIDENCE_ROOT/.image-inputs/$label"
   rebuild=true
@@ -568,6 +608,9 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
     "$EXTPROC_IMAGE" \
     "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" \
     "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}"; do
+    if [[ "$image" == "$EXTPROC_IMAGE" && "$EXTPROC_IMAGE_MODE" == published ]]; then
+      continue
+    fi
     docker exec "${CLUSTER}-control-plane" crictl rmi "docker.io/library/$image" >/dev/null 2>&1 || true
   done
   kind load docker-image "${AI_CONTROLLER_IMAGE:-ai-gateway-controller:external-model-two-plane}" --name "$CLUSTER"
@@ -1433,6 +1476,36 @@ EOF
       fail "ExtProc Deployment $extproc_ref has $ready_current_count Ready pods with image IDs from current revision $revision; expected $desired_replicas"
       exit 2
     }
+    if [[ "$EXTPROC_IMAGE_MODE" == published ]]; then
+      node_runtime_json=$(docker exec "${CLUSTER}-control-plane" crictl inspecti "$EXTPROC_IMAGE")
+      node_repo_digests=$(jq -c '.status.repoDigests // []' <<<"$node_runtime_json")
+      node_image_id=$(jq -r '.status.id // empty' <<<"$node_runtime_json")
+      node_has_digest=false
+      containerd_image_has_exact_digest_reference "$node_runtime_json" "$EXTPROC_IMAGE" && node_has_digest=true
+      matched_pods='[]'
+      while IFS= read -r pod_image_id; do
+        [[ -n "$pod_image_id" ]] || continue
+        if containerd_pod_image_id_matches_runtime "$node_runtime_json" "$pod_image_id"; then
+          already_matched=$(jq -e --arg imageID "$pod_image_id" 'any(.[]; .imageID == $imageID)' \
+            <<<"$matched_pods" >/dev/null && echo true || echo false)
+          if [[ "$already_matched" != true ]]; then
+            matched_pods=$(jq -c --arg imageID "$pod_image_id" --argjson pods "$ready_current_pods" \
+              '. + [$pods[] | select(.imageID == $imageID)]' <<<"$matched_pods")
+          fi
+        fi
+      done < <(jq -r '.[].imageID' <<<"$ready_current_pods")
+      ready_current_pods="$matched_pods"
+      [[ "$node_has_digest" == true && -n "$node_image_id" \
+        && "$(jq 'length' <<<"$ready_current_pods")" -eq "$desired_replicas" ]] || {
+        fail "ExtProc node runtime did not match the requested published image digest or serving Pod image IDs for $extproc_ref; see extproc-published-image-provenance.json"
+        exit 2
+      }
+      jq -n --arg requestedImage "$EXTPROC_IMAGE" --arg imageID "$node_image_id" \
+        --arg localDockerImageID "$(<"$EVIDENCE/extproc-image-id.txt")" \
+        --argjson repoDigests "$node_repo_digests" --argjson pods "$ready_current_pods" \
+        '{requestedImage:$requestedImage,runtimeImageID:$imageID,localDockerImageID:$localDockerImageID,repoDigests:$repoDigests,pods:$pods}' \
+        >"$EVIDENCE/extproc-runtime-digest-${extproc_namespace}.json"
+    fi
     jq -n --arg requestedImage "$EXTPROC_IMAGE" --arg deployment "$extproc_name" --arg revision "$revision" --argjson generation "$generation" --argjson observedGeneration "$observed_generation" --argjson desiredReplicas "$desired_replicas" --argjson pods "$ready_current_pods" '{requestedImage:$requestedImage,deployment:$deployment,generation:$generation,observedGeneration:$observedGeneration,replicaSetRevision:$revision,desiredReplicas:$desiredReplicas,pods:$pods}' >"$EVIDENCE/extproc-image-${extproc_namespace}.json"
   done
   "${KCTL[@]}" -n maas-system rollout status deployment/katan-a-tenant-b --timeout=180s
