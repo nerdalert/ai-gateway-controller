@@ -486,7 +486,7 @@ for pair in \
   fi
   if [[ "$label" == extproc && "$EXTPROC_IMAGE_MODE" == published ]]; then
     [[ "$source_sha" == "$EXPECTED_EXTPROC_SOURCE_SHA" ]] || fail "published ExtProc source checkout must be $EXPECTED_EXTPROC_SOURCE_SHA; got $source_sha"
-    [[ -z "$source_diff" ]] || fail "published ExtProc provenance checkout is dirty"
+    [[ -z "$(git -C "$source" status --porcelain)" ]] || fail "published ExtProc provenance checkout is dirty"
     timeout 300s docker pull --platform "$EXPECTED_EXTPROC_PLATFORM" "$EXTPROC_IMAGE"
     extproc_image_json=$(docker image inspect "$EXTPROC_IMAGE")
     extproc_local_id=$(jq -r '.[0].Id // empty' <<<"$extproc_image_json")
