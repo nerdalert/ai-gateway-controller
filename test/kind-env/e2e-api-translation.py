@@ -298,6 +298,9 @@ def verify_controller_image():
 
 def verify_externalmodel_extproc_image():
     image = os.environ.get("PRAXIS_EXTPROC_IMAGE", "")
+    image_mode = os.environ.get("PRAXIS_EXTPROC_IMAGE_MODE", "source")
+    expected_source_sha = os.environ.get("PRAXIS_EXTPROC_SOURCE_SHA", "")
+    expected_platform = os.environ.get("PRAXIS_EXTPROC_PLATFORM", "linux/amd64")
     deployment = json.loads(kubectl(
         "-n", NAMESPACE, "get", "deployment", "payload-processing-external-model", "-o", "json").stdout)
     containers = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
@@ -305,7 +308,16 @@ def verify_externalmodel_extproc_image():
     local = run(["docker", "image", "inspect", image, "--format", "{{.Id}}"], check=False) if image else None
     local_image_id = local.stdout.strip() if local and local.returncode == 0 else ""
     local_config_id = local_image_config_id(image) if image else None
+    local_json_result = run(["docker", "image", "inspect", image], check=False) if image else None
+    try:
+        local_image = json.loads(local_json_result.stdout)[0] if local_json_result and local_json_result.returncode == 0 else {}
+    except (json.JSONDecodeError, IndexError):
+        local_image = {}
+    local_labels = (local_image.get("Config") or {}).get("Labels") or {}
+    local_repo_digests = local_image.get("RepoDigests") or []
+    local_platform = f"{local_image.get('Os', '')}/{local_image.get('Architecture', '')}".strip("/")
     cri_reference = image if "/" in image else f"docker.io/library/{image}"
+    digest_reference = bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image))
     selector = deployment.get("spec", {}).get("selector", {}).get("matchLabels", {})
     selector_text = ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
     pods = json.loads(kubectl(
@@ -335,22 +347,61 @@ def verify_externalmodel_extproc_image():
         runtime_status = runtime.get("status", {})
         identity["runtime_imageID"] = runtime_status.get("id")
         identity["repoTags"] = runtime_status.get("repoTags", [])
-        identity["requested_tag_present"] = cri_reference in identity["repoTags"]
+        identity["repoDigests"] = runtime_status.get("repoDigests", [])
+        if digest_reference:
+            identity["requested_reference_present"] = image in identity["repoDigests"]
+        else:
+            identity["requested_reference_present"] = cri_reference in identity["repoTags"]
         ready_pods.append(identity)
 
+    def pod_runtime_identity_matches(identity):
+        runtime_id = str(identity.get("runtime_imageID", "")).removeprefix("containerd://")
+        pod_id = str(identity.get("pod_imageID", ""))
+        if "://" in pod_id:
+            pod_id = pod_id.split("://", 1)[1]
+        if pod_id == runtime_id:
+            return True
+        if "@sha256:" in pod_id:
+            pod_digest = pod_id.rsplit("@", 1)[1]
+            return any(str(ref).endswith("@" + pod_digest) for ref in identity.get("repoDigests", []))
+        return False
+
+    mode_valid = (
+        (image_mode == "source" and not digest_reference)
+        or (image_mode == "published" and digest_reference
+            and bool(re.fullmatch(r"[0-9a-f]{40}", expected_source_sha)))
+    )
+    provenance_matches = (
+        image_mode == "source" or (
+            bool(re.fullmatch(r"[0-9a-f]{40}", expected_source_sha))
+            and image in local_repo_digests
+            and local_platform == expected_platform
+            and local_labels.get("org.opencontainers.image.source") == "https://github.com/opendatahub-io/praxis-extproc"
+            and local_labels.get("org.opencontainers.image.revision") == expected_source_sha
+            and local_labels.get("git.commit") == expected_source_sha
+        )
+    )
     matched = (
         bool(image) and len(extprocs) == 1 and extprocs[0].get("image") == image
-        and bool(local_image_id) and bool(local_config_id) and desired > 0 and len(ready_pods) == desired
-        and all(pod.get("requested_tag_present") is True
-                and str(pod.get("runtime_imageID", "")).removeprefix("containerd://")
-                == str(pod.get("pod_imageID", "")).removeprefix("containerd://")
-                == local_config_id
+        and mode_valid and bool(local_image_id) and bool(local_config_id)
+        and desired > 0 and len(ready_pods) == desired
+        and provenance_matches
+        and all(pod.get("requested_reference_present") is True and pod_runtime_identity_matches(pod)
+                and str(pod.get("runtime_imageID", "")).removeprefix("containerd://") == local_config_id
                 for pod in ready_pods)
     )
     record("externalmodel_exact_extproc_image_loaded", matched, {
         "requested_image": image or None,
+        "image_mode": image_mode,
+        "expected_source_sha": expected_source_sha or None,
+        "expected_platform": expected_platform,
         "local_docker_image_id": local_image_id or None,
         "local_image_config_id": local_config_id,
+        "local_platform": local_platform or None,
+        "local_repo_digests": local_repo_digests,
+        "image_source": local_labels.get("org.opencontainers.image.source"),
+        "image_revision": local_labels.get("org.opencontainers.image.revision"),
+        "image_git_commit": local_labels.get("git.commit"),
         "desired_replicas": desired,
         "ready_serving_pods": ready_pods,
         "source_sha": os.environ.get("PRAXIS_EXTPROC_SOURCE_SHA"),

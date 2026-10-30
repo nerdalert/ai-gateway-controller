@@ -70,8 +70,8 @@ if [[ "${AI_GATEWAY_CONTROLLER_IMAGE}" == *@sha256:* ]]; then
   fi
 fi
 
-# Konflux group-test may export PRAXIS_EXTPROC_IMAGE from odh-praxis-extproc-ci snapshot.
-export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc:odh-stable}"
+# Konflux group-test may export PRAXIS_EXTPROC_IMAGE from the odh-praxis-extproc-ci snapshot.
+export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc@sha256:6e2ecf73b475c3e6a1fea06d6c1d1d955ac4d37bb7817a8435ca2336314945bd}"
 
 echo "MaaS platform images:"
 echo "  MAAS_API_IMAGE=${MAAS_API_IMAGE}"
