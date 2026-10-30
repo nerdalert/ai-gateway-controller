@@ -24,7 +24,10 @@ import (
 )
 
 const extprocCredentialDir = "/etc/praxis/credentials" //nolint:gosec // fixed non-secret mount path
-const anthropicTranslationRequestMaxBytes = 2 << 20
+const anthropicTranslationRequestMaxBytes = extprocMaxBodyBytes
+
+// Preserve the existing input allowance while bounding model-rewrite overhead separately.
+const anthropicTranslationAccumulationMaxBytes = extprocMaxBodyBytes + (64 << 10)
 const anthropicTranslationResponseMaxBytes = 1 << 20
 
 type extprocCredential struct {
@@ -445,7 +448,7 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 	// translation disabled, omit the translation and provider-profile filters
 	// and retain main's unbounded-body setting.
 	if apiTranslationEnabled {
-		fmt.Fprintf(&b, "  max_body_bytes: %d\n", extprocMaxBodyBytes)
+		fmt.Fprintf(&b, "  max_body_bytes: %d\n", anthropicTranslationAccumulationMaxBytes)
 	}
 	b.WriteString("  tls:\n    mode: self_signed\n\n")
 	b.WriteString("filter_chains:\n  - name: post-auth\n    filters:\n      - filter: intelligent_route\n")

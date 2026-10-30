@@ -227,7 +227,7 @@ func equalStrings(got, want []string) bool {
 
 func TestRecorderRejectsOversizedJSONWithTrailingWhitespace(t *testing.T) {
 	t.Parallel()
-	body := `{}` + strings.Repeat(" ", (4<<20)-1)
+	body := `{}` + strings.Repeat(" ", (12<<20)-1)
 	request := httptest.NewRequestWithContext(t.Context(), "POST", "/v1/messages", strings.NewReader(body))
 	response := httptest.NewRecorder()
 	recorderConfig{}.handleInference(response, request)

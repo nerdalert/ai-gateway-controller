@@ -284,3 +284,8 @@ rg -q 'index\(\$d\) != null' "$ROOT/test/kind-env/run.sh"
 for digests in '["other@sha256:abc","expected@sha256:def"]' '["expected@sha256:def","other@sha256:abc"]'; do
   [[ "$(jq -r --arg d 'expected@sha256:def' 'index($d) != null' <<<"$digests")" == true ]]
 done
+
+if rg -q '^kind: AuthPolicy$' "$ROOT/test/kind-env/manifests/51-route-policies-tenant-b.yaml"; then
+  echo "tenant B must inherit the MaaS Gateway policy, as tenant A does" >&2
+  exit 1
+fi

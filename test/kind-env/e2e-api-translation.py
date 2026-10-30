@@ -141,7 +141,7 @@ def remove_interrupted_translation_auth_diagnostics():
         metadata = policy.get("metadata", {})
         target = policy.get("spec", {}).get("targetRef", {})
         route_name = target.get("name")
-        if (target.get("kind") == "HTTPRoute" and route_name in expected
+        if (target.get("kind") == "HTTPRoute" and route_name in expected.values()
                 and target.get("group") == "gateway.networking.k8s.io"):
             relevant.append(policy)
 
@@ -177,7 +177,7 @@ def remove_interrupted_translation_auth_diagnostics():
         for policy in current:
             target = policy.get("spec", {}).get("targetRef", {})
             if (target.get("group") == "gateway.networking.k8s.io"
-                    and target.get("kind") == "HTTPRoute" and target.get("name") in expected):
+                    and target.get("kind") == "HTTPRoute" and target.get("name") in expected.values()):
                 remaining.append(policy)
         if not remaining:
             break
@@ -565,8 +565,8 @@ def mounted_extproc_translation_limits():
 def record_runtime_translation_limits():
     global MOUNTED_TRANSLATION_LIMITS
     expected = {
-        "server_max_body_bytes": 10 * 1024 * 1024,
-        "translator_max_request_body_bytes": 2 * 1024 * 1024,
+        "server_max_body_bytes": 10 * 1024 * 1024 + 64 * 1024,
+        "translator_max_request_body_bytes": 10 * 1024 * 1024,
         "translator_max_response_body_bytes": 1 * 1024 * 1024,
         "translator_filter_present": True,
     }
@@ -1634,7 +1634,7 @@ def wait_externalmodel_revision(expected_clusters, label, *, changed_from=None, 
                 for candidate in profile_candidates)
         )
         body_limit_state_matches = "filter: stream_usage_inject" in snapshot["extproc_config"] and (
-            "max_request_body_bytes: 2097152" in snapshot["extproc_config"]
+            "max_request_body_bytes: 10485760" in snapshot["extproc_config"]
             and "max_response_body_bytes: 1048576" in snapshot["extproc_config"]
             and translation_stream_filter_present
             if api_translation_enabled else
@@ -3642,7 +3642,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
            and openai_large_request_observation.get("tls") is True
            and openai_large_request_observation.get("sni_ok") is True
            and openai_large_request_observation.get("authority_ok") is True
-           and 1500 * 1024 < openai_large_request_observation.get("request_body_bytes", 0) < 2 * 1024 * 1024
+           and 1500 * 1024 < openai_large_request_observation.get("request_body_bytes", 0) < 10 * 1024 * 1024
            and openai_large_request_observation.get("message_text") in (None, []),
            {"http_status": openai_large_request_status,
             "serialized_client_request_bytes": 1536 * 1024,
@@ -3658,11 +3658,11 @@ def test_externalmodel_provider_aware_translation(auth_file):
 
     # Measure both sides of the configured OpenAI-compatible request boundary.
     # The client byte count is measured before target-model rewriting.
-    for label, request_size in (("below", 2 * 1024 * 1024 - 1), ("at", 2 * 1024 * 1024)):
+    for label, request_size in (("below", 10 * 1024 * 1024 - 1), ("at", 10 * 1024 * 1024)):
         diagnostic_id = f"{ROUTE_TRACE_PREFIX}openai-limit-{label}"
         # The request limit applies to the client body before target-model
         # rewriting. The provider body is expected to grow by the model-name
-        # delta, while remaining under ExtProc's separate 10 MiB accumulator.
+        # delta, while remaining within the server's separate rewrite headroom.
         body, raw_payload = chat_request_json_with_exact_size(request_size)
         serialized_request_bytes = len(raw_payload.encode())
         rejection_counter_before = extproc_body_rejection_snapshot()
@@ -3818,8 +3818,8 @@ def test_externalmodel_provider_aware_translation(auth_file):
                 shared_observations_after_under_limit - shared_observations_before_under_limit)})
 
     # OpenAI-compatible responses pass through the Anthropic translator. This
-    # response is above the former 1 MiB listener buffer but below the updated
-    # 2 MiB + 64 KiB listener limit, so it should remain an upstream success.
+    # response exceeds the Anthropic JSON cap but must pass through intact
+    # for an OpenAI-compatible provider. No listener override is installed.
     openai_large_response_marker = "externalmodel-openai-large-json-response"
     openai_large_response_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-response"
     shared_observations_before_large_response = len(observations())
@@ -3880,7 +3880,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
     record("externalmodel_openai_compatible_large_json_response_passes_through",
            rc == 0 and openai_large_response_status == "200"
            and openai_large_response_route.get("response_code_details") == "via_upstream"
-           and (1 << 20) < len(openai_large_response_raw) < (2 * 1024 * 1024 + 64 * 1024)
+           and (1 << 20) < len(openai_large_response_raw) < (10 * 1024 * 1024 + 64 * 1024)
            and len(openai_large_response_receipts) == 1
            and len(openai_large_response_content.encode()) == len(openai_expected_response_content.encode())
            and openai_large_response_content.endswith("::OPENAI_RESPONSE_COMPLETE::")
@@ -3926,7 +3926,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
     # the counter samples bracket the request on the same container instance.
     openai_large_request_id = f"{ROUTE_TRACE_PREFIX}openai-large-request"
     openai_upstream_count = len(provider_aware_observations())
-    large_content_size = 2 * 1024 * 1024 + 1
+    large_content_size = 10 * 1024 * 1024 + 1
     openai_over_limit_body = chat_request_with_exact_json_size(large_content_size)
     openai_over_limit_serialized_bytes = len(
         json.dumps(openai_over_limit_body, separators=(",", ":")).encode()
@@ -3950,8 +3950,8 @@ def test_externalmodel_provider_aware_translation(auth_file):
     openai_selected_limit_rejection = (
         openai_rejection_delta == 1
         and MOUNTED_TRANSLATION_LIMITS == {
-            "server_max_body_bytes": 10 * 1024 * 1024,
-            "translator_max_request_body_bytes": 2 * 1024 * 1024,
+            "server_max_body_bytes": 10 * 1024 * 1024 + 64 * 1024,
+            "translator_max_request_body_bytes": 10 * 1024 * 1024,
             "translator_max_response_body_bytes": 1 * 1024 * 1024,
             "translator_filter_present": True,
         }
@@ -4033,7 +4033,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
            and "api_translation_enabled:" not in openai_off_runtime["extproc_config"]
            and "filter: openai_chat_completions_to_anthropic\n" not in openai_off_runtime["extproc_config"]
            and "openai_chat_completions_to_anthropic_stream" not in openai_off_runtime["extproc_config"]
-           and "max_body_bytes" not in openai_off_runtime["extproc_config"]
+           and "\n  max_body_bytes:" not in openai_off_runtime["extproc_config"]
            and "max_request_body_bytes" not in openai_off_runtime["extproc_config"]
            and "max_response_body_bytes" not in openai_off_runtime["extproc_config"]
            and "allow_unbounded_body: true" in openai_off_runtime["extproc_config"]
@@ -4334,7 +4334,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
            large_compatibility_details)
     record("externalmodel_anthropic_15m_compatibility_request_succeeds",
            large_compatibility_success
-           and 1500 * 1024 < large_compatibility_observation.get("request_body_bytes", 0) < 2 * 1024 * 1024,
+           and 1500 * 1024 < large_compatibility_observation.get("request_body_bytes", 0) < 10 * 1024 * 1024,
            large_compatibility_details)
 
     # Exercise each legacy OpenAI-only option independently. Every request
@@ -4421,10 +4421,10 @@ def test_externalmodel_provider_aware_translation(auth_file):
             "image_source_types": image_observation.get("anthropic_image_source_types"),
             "text_order": image_observation.get("message_text"), "image_bytes_saved": False})
 
-    # Exercise the configured 2 MiB client-input boundary with exact serialized
+    # Exercise the configured 10 MiB client-input boundary with exact serialized
     # JSON sizes. At and below the limit reaches the provider. One byte over is
     # rejected by ExtProc's selected-upstream input guard before translation.
-    for label, request_size in (("below", 2 * 1024 * 1024 - 1), ("at", 2 * 1024 * 1024)):
+    for label, request_size in (("below", 10 * 1024 * 1024 - 1), ("at", 10 * 1024 * 1024)):
         diagnostic_id = f"{ROUTE_TRACE_PREFIX}anthropic-limit-{label}"
         # Include supported compatibility fields so this also verifies they
         # remain accepted and omitted while the client-input boundary is tested.
@@ -4477,7 +4477,7 @@ def test_externalmodel_provider_aware_translation(auth_file):
                     observation.get(key) is True for key in ("credential_ok", "tls", "sni_ok", "authority_ok")),
                 "response_payload_saved": False})
 
-    over_limit_size = 2 * 1024 * 1024 + 1
+    over_limit_size = 10 * 1024 * 1024 + 1
     over_limit_request_id = f"{ROUTE_TRACE_PREFIX}anthropic-limit-over"
     over_limit_body = chat_request_with_exact_json_size(over_limit_size)
     over_limit_serialized_bytes = len(json.dumps(over_limit_body, separators=(",", ":")).encode())
@@ -4497,8 +4497,8 @@ def test_externalmodel_provider_aware_translation(auth_file):
     extproc_rejected_over_limit = (
         over_limit_rejection_delta == 1
         and MOUNTED_TRANSLATION_LIMITS == {
-            "server_max_body_bytes": 10 * 1024 * 1024,
-            "translator_max_request_body_bytes": 2 * 1024 * 1024,
+            "server_max_body_bytes": 10 * 1024 * 1024 + 64 * 1024,
+            "translator_max_request_body_bytes": 10 * 1024 * 1024,
             "translator_max_response_body_bytes": 1 * 1024 * 1024,
             "translator_filter_present": True,
         }

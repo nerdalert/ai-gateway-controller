@@ -314,47 +314,31 @@ types; this does not provide multiple completions or deterministic generation.
 Text and supported `image_url` blocks are converted in order. Base64 data URLs
 become Anthropic base64 image sources, while HTTPS image URLs are passed to the
 provider without the Gateway fetching them. Other unknown request fields and
-unsupported content remain rejected.
+unsupported content remain rejected. `response_format` is currently unsupported
+by the pinned Praxis AI v0.9.0 translator and returns HTTP 400 for Anthropic
+translation. This known upgrade-compatibility gap requires an upstream AI fix;
+this PR does not claim to restore that behavior.
 
-When translation is enabled, the selected-provider request filter applies a
-2 MiB request limit before model validation, provider-format branching, and
-target-model rewriting. This is a limit on the incoming client body and also
-applies to OpenAI-compatible providers while the translation profile is
-enabled. After translation or target-model rewriting, ExtProc separately caps
-the provider-bound body at its configured 10 MiB accumulation ceiling. This
-allows bounded conversion overhead without charging it against the client's
-input allowance twice. The Anthropic JSON response limit remains 1 MiB;
-response SSE remains incremental. The ExtProc gRPC transport's default 4 MiB
-message limit has room for a 2 MiB body plus protocol overhead.
+When translation is enabled, the selected-provider request filter retains
+main's 10 MiB request allowance (`extprocMaxBodyBytes`), independently of the
+1 MiB buffered Anthropic JSON response limit. OpenAI-compatible providers in
+the translation-enabled chain share the request limit. Rewritten output has
+64 KiB of bounded headroom above the input allowance in the server accumulator.
+Streaming Anthropic responses remain incremental.
 
-Envoy buffers the request before pre-auth model extraction. The harness raises
-the selected Gateway listeners' connection buffer cap from Envoy's 1 MiB
-default to 2 MiB plus 64 KiB of bounded headroom. This is Gateway-wide because
-the pinned Envoy version has no route-scoped ExtProc buffer limit. Envoy's
-listener connection-buffer setting also affects response buffering and flow
-control; it is not a request-only knob. The explicit 1 MiB response limit is
-separate and applies to buffered Anthropic Messages JSON conversion. The E2E
-checks that an OpenAI-compatible JSON response above 1 MiB passes through
-intact, including its complete-content hash, terminal sentinel, model, usage,
-and finish reason, while remaining under the listener limit. This does not
-claim the listener-buffer change is response-neutral for other traffic.
+This PR does not override the Gateway-wide listener buffer limit. Platform
+buffering and gRPC message limits remain independent constraints: rendering a
+10 MiB filter allowance alone does not prove end-to-end acceptance of that size.
+The qualification probes below, at, and above 10 MiB must pass on the selected
+runtime before that boundary is described as qualified. Previous 2 MiB results
+are historical and do not qualify the updated configuration.
 
-The harness inspects the mounted ExtProc configuration and requires a 2 MiB
-translator request limit, an independent 1 MiB response limit, and a 10 MiB
-server accumulation ceiling. It sends valid 1.5 MiB Anthropic and
-OpenAI-compatible requests, then exact serialized requests just below and at
-2 MiB for both formats; each must reach the expected provider with one
-independent receipt, even when target-model rewriting makes the provider-bound
-body larger than the client-input limit. Rewritten output remains bounded by
-the 10 MiB ExtProc accumulation ceiling. A request 1 byte over the client-input
-limit returns 413 without provider contact. The ExtProc
-`praxis_extproc_body_size_rejections_total` counter must increase. The mounted
-2 MiB filter limit and ExtProc input-guard control flow establish that this
-request is rejected before body translation; the metric is not used alone to
-distinguish the input guard from the separate rewritten-output guard. The
-fail-closed sink trace by itself is not used to assign the rejection layer.
-With translation disabled, translation filter limits are absent; the harness
-also sends a 1.5 MiB OpenAI-compatible pass-through request.
+The harness verifies the mounted 10 MiB request limit, 1 MiB response limit,
+and 10 MiB + 64 KiB server accumulator. It preserves the 1.5 MiB compatibility
+checks and measures exact serialized request bytes for the boundary matrix.
+HTTP 413 is attributed to the ExtProc input guard only with a same-runtime
+rejection-counter increment and no provider receipt; earlier transport or
+Gateway rejection is not described as a translator-limit result.
 Large prompt text and image bytes are excluded from evidence and provider
 receipts. The current Kind setup installs KServe CRDs but does not deploy a
 serving runtime or internal model, so an internal-model large-request control

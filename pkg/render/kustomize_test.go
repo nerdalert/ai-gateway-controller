@@ -97,42 +97,30 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 	}
 }
 
-func TestRenderedExternalModelGatewayHasBoundedTwoMiBRequestBuffer(t *testing.T) {
+func TestRenderedExternalModelGatewayDoesNotLowerListenerBufferLimit(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 	requireVendoredManifests(t, manifestPath)
 	resources, err := Build(manifestPath)
 	if err != nil {
-		t.Fatalf("build vendored manifests at %s: %v", manifestPath, err)
+		t.Fatal(err)
 	}
-
-	var found bool
-	for i := range resources {
-		if resources[i].GetKind() != "EnvoyFilter" || resources[i].GetName() != "payload-processing-external-model-filters" {
+	for _, resource := range resources {
+		if resource.GetKind() != "EnvoyFilter" {
 			continue
 		}
-		patches, ok, err := unstructured.NestedSlice(resources[i].Object, "spec", "configPatches")
-		if err != nil || !ok {
-			t.Fatalf("ExternalModel EnvoyFilter patches missing: found=%t err=%v", ok, err)
+		patches, _, err := unstructured.NestedSlice(resource.Object, "spec", "configPatches")
+		if err != nil {
+			t.Fatal(err)
 		}
 		for _, raw := range patches {
 			patch, ok := raw.(map[string]any)
-			if !ok || patch["applyTo"] != "LISTENER" {
+			if !ok {
 				continue
 			}
-			context, _, _ := unstructured.NestedString(patch, "match", "context")
-			operation, _, _ := unstructured.NestedString(patch, "patch", "operation")
-			limit, _, _ := unstructured.NestedInt64(patch, "patch", "value", "per_connection_buffer_limit_bytes")
-			if context != "GATEWAY" || operation != "MERGE" || limit != 2*1024*1024+64*1024 {
-				t.Fatalf("listener buffer patch = context %q operation %q limit %d; want GATEWAY/MERGE/2162688", context, operation, limit)
+			if patch["applyTo"] == "LISTENER" {
+				t.Fatal("translation must not install a Gateway-wide listener buffer override")
 			}
-			if found {
-				t.Fatal("multiple Gateway-wide request buffer patches found")
-			}
-			found = true
 		}
-	}
-	if !found {
-		t.Fatal("bounded Gateway listener buffer patch missing")
 	}
 }
 

@@ -228,12 +228,12 @@ func handleObservations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Request) {
-	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, (4<<20)+1))
+	requestBytes, readErr := io.ReadAll(io.LimitReader(r.Body, (12<<20)+1))
 	if readErr != nil {
 		http.Error(w, "could not read request body", http.StatusBadRequest)
 		return
 	}
-	if len(requestBytes) > 4<<20 {
+	if len(requestBytes) > 12<<20 {
 		http.Error(w, "request body exceeds recorder limit", http.StatusRequestEntityTooLarge)
 		return
 	}
