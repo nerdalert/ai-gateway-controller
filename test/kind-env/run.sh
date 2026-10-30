@@ -623,7 +623,25 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   fi
   kind load docker-image "$KATAN_KIND_IMAGE" --name "$CLUSTER"
   kind load docker-image "$PROVIDER_RECORDER_IMAGE" --name "$CLUSTER"
-  kind load docker-image "$EXTPROC_IMAGE" --name "$CLUSTER"
+  if [[ "$EXTPROC_IMAGE_MODE" == published ]]; then
+    # kind load rewrites digest references to a synthetic import-* name in
+    # containerd. Kubernetes then resolves that synthetic alias instead of the
+    # requested registry digest, and the Pod can fail before its container
+    # starts. Pull the immutable reference directly into the node runtime.
+    docker exec "${CLUSTER}-control-plane" crictl pull "$EXTPROC_IMAGE" \
+      >"$EVIDENCE/extproc-node-pull.txt" 2>&1
+    node_runtime_json=$(docker exec "${CLUSTER}-control-plane" crictl inspecti "$EXTPROC_IMAGE")
+    containerd_image_has_exact_digest_reference "$node_runtime_json" "$EXTPROC_IMAGE" || {
+      fail "Kind node did not retain the published ExtProc digest after pull"; exit 2;
+    }
+    jq -n --arg requestedImage "$EXTPROC_IMAGE" \
+      --arg runtimeImageID "$(jq -r '.status.id // empty' <<<"$node_runtime_json")" \
+      --argjson repoDigests "$(jq -c '.status.repoDigests // []' <<<"$node_runtime_json")" \
+      '{requestedImage:$requestedImage,runtimeImageID:$runtimeImageID,repoDigests:$repoDigests}' \
+      >"$EVIDENCE/extproc-node-pull-identity.json"
+  else
+    kind load docker-image "$EXTPROC_IMAGE" --name "$CLUSTER"
+  fi
   kind load docker-image "${MAAS_API_IMAGE:-maas-api:external-model-two-plane}" --name "$CLUSTER"
   kind load docker-image "${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}" --name "$CLUSTER"
   timeout 120s "${KCTL[@]}" apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
