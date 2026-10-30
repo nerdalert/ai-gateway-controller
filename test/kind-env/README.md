@@ -326,8 +326,12 @@ the translation-enabled chain share the request limit. Rewritten output has
 64 KiB of bounded headroom above the input allowance in the server accumulator.
 Streaming Anthropic responses remain incremental.
 
-This PR does not override the Gateway-wide listener buffer limit. Platform
-buffering and gRPC message limits remain independent constraints: rendering a
+The ExternalModel EnvoyFilter sets the selected Gateway listeners' soft buffer
+limit to 10 MiB plus 64 KiB, allowing buffered pre-auth model extraction to
+handle the intended request allowance. This is Gateway-wide and also affects
+response buffering and flow control; it is not a request-only hard limit. The
+Anthropic JSON response cap remains independent. Other platform buffering and
+gRPC message limits remain independent constraints: rendering a
 10 MiB filter allowance alone does not prove end-to-end acceptance of that size.
 The qualification probes below, at, and above 10 MiB must pass on the selected
 runtime before that boundary is described as qualified. Previous 2 MiB results

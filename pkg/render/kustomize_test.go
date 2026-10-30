@@ -97,15 +97,16 @@ func TestRenderKustomizeBuildsVendoredOverlay(t *testing.T) {
 	}
 }
 
-func TestRenderedExternalModelGatewayDoesNotLowerListenerBufferLimit(t *testing.T) {
+func TestRenderedExternalModelGatewayHasTenMiBRequestHeadroom(t *testing.T) {
 	const manifestPath = "../../config/manifests/external-model/overlays/odh"
 	requireVendoredManifests(t, manifestPath)
 	resources, err := Build(manifestPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	found := 0
 	for _, resource := range resources {
-		if resource.GetKind() != "EnvoyFilter" {
+		if resource.GetKind() != "EnvoyFilter" || resource.GetName() != "payload-processing-external-model-filters" {
 			continue
 		}
 		patches, _, err := unstructured.NestedSlice(resource.Object, "spec", "configPatches")
@@ -117,10 +118,20 @@ func TestRenderedExternalModelGatewayDoesNotLowerListenerBufferLimit(t *testing.
 			if !ok {
 				continue
 			}
-			if patch["applyTo"] == "LISTENER" {
-				t.Fatal("translation must not install a Gateway-wide listener buffer override")
+			if patch["applyTo"] != "LISTENER" {
+				continue
+			}
+			found++
+			context, _, _ := unstructured.NestedString(patch, "match", "context")
+			operation, _, _ := unstructured.NestedString(patch, "patch", "operation")
+			limit, _, _ := unstructured.NestedInt64(patch, "patch", "value", "per_connection_buffer_limit_bytes")
+			if context != "GATEWAY" || operation != "MERGE" || limit != 10*1024*1024+64*1024 {
+				t.Fatalf("listener patch = %s/%s/%d, want GATEWAY/MERGE/10551296", context, operation, limit)
 			}
 		}
+	}
+	if found != 1 {
+		t.Fatalf("listener buffer patches = %d, want exactly one", found)
 	}
 }
 
