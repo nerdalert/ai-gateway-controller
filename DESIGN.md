@@ -60,15 +60,19 @@ single eligible provider remains deterministic. Repeating the same provider
 across `ExternalModel` objects with the same client-visible model name is
 rejected; otherwise that provider would receive extra selection entries. This
 does not add controller/ExtProc rollout coordination, health-aware selection,
-or retries. An explicit all-zero weight update withdraws the model's route
-and overlay candidates and reports `Ready=False/NoRoutes`, even when a
-referenced provider is missing or unready. Unrelated models retain their
-serving state. Readiness-driven final-provider withdrawal remains tracked in
-issue #106. Partial provider withdrawal ordering
-remains a separate issue tracked in
-[#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
-Requires a Praxis ExtProc / AI image that accepts `weightedRandom` and
-`traffic_weight` (praxis-ai #1068; included in the ExtProc pin used by AGC).
+or retries. An explicit all-zero weight update withdraws the model's route and
+overlay candidates and reports `Ready=False/NoRoutes`, even when a referenced
+provider is missing or unready. Unrelated models retain their serving state.
+Readiness-driven final-provider withdrawal remains tracked in issue #106.
+
+This PR stages provider withdrawal for tenant-local and Gateway-attached
+models: the reduced overlay must be observed by the serving ExtProc revision,
+then the request-drain interval must elapse before old routes, credentials, and
+transports are removed. Deleting an `ExternalProvider` that is still referenced
+is intentionally blocked with `Pending` / `ProviderInUse`; update or delete the
+referencing model to begin safe withdrawal. This prevents provider deletion
+alone from silently discarding a last-known-good route or leaving the operator
+without an actionable status.
 
 ### ExternalProvider status ownership
 
@@ -103,6 +107,15 @@ inconsistent with the tenant configuration) claims the provider and reports
 `Pending`/`TenantNotReady` before returning the error. Returning a bare error
 would leave the provider with neither the finalizer nor a status writer while
 IPP remains free to write status; the requeue retries the resolution.
+
+Deleting a provider that is still referenced or has an applied provider route
+keeps its cleanup finalizer and reports `Pending`/`ProviderInUse`, including the
+referencing model names. The operator must update or delete those models. Their
+reconciles first publish a reduced overlay; the old route, credential
+projection, and transport remain until the new ExtProc revision is serving and
+the in-flight request drain has elapsed. The provider finalizer then removes
+the unused transport. This is an explicit blocking state, not automatic
+provider failover.
 
 An explicit IPP selection is the existing handoff, unchanged in direction:
 remove the Praxis transport except the backends the namespace's attachment
@@ -447,8 +460,11 @@ compatibility one-pager; this records how it is implemented.
   tenant's own models win, then the oldest; same-namespace models share the
   name and are validated together as one selection group, as on the
   tenant-local path), a resolution or credential failure or more than 7
-  providers (`TooManyProviders`) excludes the model: it loses its route,
-  overlay entry, DestinationRules and copies. Over the 1024-candidate overlay
+  providers (`TooManyProviders`) excludes the model. A model that has never
+  been served is not published; for an already accepted route, withdrawal first
+  removes its candidate from the tenant overlay while retaining the old route,
+  DestinationRules, and credential copies until the reduced ExtProc revision
+  serves and the request drain completes. Over the 1024-candidate overlay
   limit (`OverlayCapacityExceeded`) a model keeps its accepted route but nothing
   else. Capacity is decided, and the handoff re-checked live, before anything is
   written into the tenant; a failed API read is retried, never treated as the
