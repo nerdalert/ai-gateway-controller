@@ -449,7 +449,7 @@ def start_resource_port_forward(resource, remote_port, namespace, label):
         sock.connect(("127.0.0.1", port))
     except OSError as exc:
         proc.terminate()
-        raise RuntimeError(f"port-forward for {service} reported a port that is not listening; see {log_path.name}") from exc
+        raise RuntimeError(f"port-forward for {resource} reported a port that is not listening; see {log_path.name}") from exc
     finally:
         sock.close()
     return proc, port
@@ -5984,12 +5984,19 @@ def main():
                         help="optionally qualify one live provider or all through the deployed Gateway; Bedrock reads the local Bedrock key entry and accepts BEDROCK_MANTLE_REGION/MODEL overrides")
     parser.add_argument("--diagnostic-route-auth", action="store_true",
                         help="use run-owned route AuthPolicies that validate the MaaS key directly; diagnostic only, not final Gateway auth qualification")
+    parser.add_argument("--diagnostic-bypass-auth", action="store_true",
+                        help="temporarily bypass only the test ExternalModel route; diagnostic only, never normal-auth qualification")
     args = parser.parse_args()
+    if args.diagnostic_route_auth and args.diagnostic_bypass_auth:
+        parser.error("choose one diagnostic auth mode")
+    if args.diagnostic_bypass_auth and args.scope != "externalmodel":
+        parser.error("--diagnostic-bypass-auth is limited to --scope externalmodel")
     LIVE_PROVIDER_SELECTION = args.live_provider
     if LIVE_PROVIDER_SELECTION and args.scope == "shared":
         parser.error("--live-provider requires --scope externalmodel or --scope all")
     RESULT["scope"] = args.scope
     RESULT["authentication_mode"] = (
+        "diagnostic_externalmodel_route_allow_only" if args.diagnostic_bypass_auth else
         "diagnostic_route_targeted_maas_key_validation" if args.diagnostic_route_auth else
         "installed_maas_gateway_authpolicy"
     )
