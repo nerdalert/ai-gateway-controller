@@ -82,6 +82,7 @@ record() {
 
 revoke_key() {
   [[ -n "$KEY_ID" && -n "$APF" ]] || return 0
+  [[ "$KEY_REVOKED" == true ]] && return 0
   local status
   status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o /dev/null -w '%{http_code}' --config "$ADMIN_CFG" -X DELETE "https://maas-api.maas-system.svc.cluster.local:$API_PORT/v1/api-keys/$KEY_ID" 2>/dev/null || true)
   printf 'key_id=%s status=%s\n' "$KEY_ID" "$status" >"$EVIDENCE/key-revocation.txt"
@@ -549,7 +550,7 @@ printf '{"http_status":"%s","valid":%s,"username":"%s","group_count":%s,"subscri
 selection_request="$TMP_DIR/select-subscription.json"
 validation_groups_json=$(jq -c '.groups // []' "$validation_response" 2>/dev/null || printf '[]')
 jq -cn --argjson groups "$validation_groups_json" --arg username "$validation_user" \
-  --arg subscription "$validation_subscription" '{groups:$groups,username:$username,requestedSubscription:$subscription,requestedModel:"demo"}' >"$selection_request"
+  --arg subscription "$validation_subscription" '{groups:$groups,username:$username,requestedSubscription:$subscription,requestedModel:"models-as-a-service/demo"}' >"$selection_request"
 chmod 600 "$selection_request"
 selection_response="$TMP_DIR/select-subscription-response.json"
 selection_status=$(timeout 20s curl --noproxy '*' --cacert "$CA_CERT" --resolve "maas-api.maas-system.svc.cluster.local:$API_PORT:127.0.0.1" -sS -o "$selection_response" -w '%{http_code}' --config "$ADMIN_CFG" -H 'content-type: application/json' --data-binary "@$selection_request" "https://maas-api.maas-system.svc.cluster.local:$API_PORT/internal/v1/subscriptions/select" 2>/dev/null || true)
@@ -560,8 +561,8 @@ printf '{"http_status":"%s","access_allowed":%s,"phase":"%s","resolved_model":"%
   "$selection_status" "$selection_allowed" "$selection_phase" "$selection_model" >"$EVIDENCE/normal-auth-direct-subscription-selection.json"
 if [[ "$validation_status" == 200 && "$validation_valid" == true && "$validation_user" == kind-user &&
   "$validation_subscription" == kind-e2e-subscription && "$selection_status" == 200 &&
-  "$selection_allowed" == true && "$selection_phase" == Active && "$selection_model" == demo ]]; then
-  record 39 direct_maas_key_and_model_access PASS "valid=true user=kind-user subscription=kind-e2e-subscription model=demo access_allowed=true"
+  "$selection_allowed" == true && "$selection_phase" == Active && "$selection_model" == models-as-a-service/demo ]]; then
+  record 39 direct_maas_key_and_model_access PASS "valid=true user=kind-user subscription=kind-e2e-subscription model=models-as-a-service/demo access_allowed=true"
 else
   record 39 direct_maas_key_and_model_access FAIL "validation_http=$validation_status valid=$validation_valid selection_http=$selection_status access_allowed=$selection_allowed phase=$selection_phase model=$selection_model"
 fi
