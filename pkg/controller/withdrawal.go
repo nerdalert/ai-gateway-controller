@@ -53,7 +53,10 @@ const (
 // errServingRevisionUnknown blocks cleanup without invalidating a proven drain.
 var errServingRevisionUnknown = errors.New("serving revision is absent from the bounded pod log tail")
 
-var extprocServingRevisionPattern = regexp.MustCompile(`accepted_revision.*?="([0-9a-f]{64})".*?serving_revision.*?="([0-9a-f]{64})"`)
+// errWithdrawnProviderGone identifies a stale candidate with no applied path.
+var errWithdrawnProviderGone = errors.New("withdrawn provider has no applied route")
+
+var extprocServingRevisionPattern = regexp.MustCompile(`(?:^|\s)accepted_revision=(?:"([0-9a-f]{64})"|([0-9a-f]{64})(?:\s|$)).*?\bserving_revision=(?:"([0-9a-f]{64})"|([0-9a-f]{64})(?:\s|$))`)
 var terminalEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 var (
@@ -153,6 +156,9 @@ func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespac
 				return nil, false, fmt.Errorf("cannot associate applied route %q with this tenant's prior candidate", id)
 			}
 			restored, err := r.routeForWithdrawnCandidate(ctx, namespace, candidate, modelName, providerNamespace, providerName, transportRoutes, apiTranslationEnabled)
+			if errors.Is(err, errWithdrawnProviderGone) {
+				continue
+			}
 			if err != nil {
 				return nil, false, err
 			}
@@ -185,6 +191,9 @@ func (r *Reconciler) transportRoutesForPublication(ctx context.Context, namespac
 				return nil, false, fmt.Errorf("cannot stage stale candidate %q with cluster %q", candidate.StableID, candidate.Cluster)
 			}
 			route, err := r.routeForWithdrawnCandidate(ctx, namespace, candidate, modelName, providerNamespace, providerName, transportRoutes, apiTranslationEnabled)
+			if errors.Is(err, errWithdrawnProviderGone) {
+				continue
+			}
 			if err != nil {
 				return nil, false, err
 			}
@@ -318,9 +327,24 @@ func (r *Reconciler) routeForWithdrawnCandidate(
 	}
 	var provider v1alpha1.ExternalProvider
 	if err := r.Get(ctx, client.ObjectKey{Namespace: route.ProviderNamespace, Name: providerName}, &provider); err != nil {
+		if apierrors.IsNotFound(err) {
+			if !appliedRoute {
+				return resolver.Route{}, fmt.Errorf("%w: %s/%s", errWithdrawnProviderGone, route.ProviderNamespace, providerName)
+			}
+			// An applied snapshot carries the credential/header semantics that
+			// cannot safely be guessed from an absent provider. Legacy public
+			// routes need no credential reconstruction; other legacy routes hold.
+			if route.ProviderType != "" || candidate.Credential == nil {
+				route.APITranslationEnabled = apiTranslationEnabled
+				route.StableID = candidate.StableID
+				return route, nil
+			}
+		}
 		return resolver.Route{}, fmt.Errorf("read ExternalProvider %s/%s for withdrawn route: %w", route.ProviderNamespace, providerName, err)
 	}
-	route.APIFormat, route.Path, route.TargetModel = candidate.APIFormat, candidate.Path, candidate.TargetModel
+	if candidate.APIFormat != "" || !appliedRoute {
+		route.APIFormat, route.Path, route.TargetModel = candidate.APIFormat, candidate.Path, candidate.TargetModel
+	}
 	route.APITranslationEnabled = apiTranslationEnabled
 	route.ProviderType = provider.Spec.Provider
 	route.TLSCACertificates = strings.TrimSpace(provider.Spec.Config["tls.caCertificates"])
@@ -373,6 +397,14 @@ func (r *Reconciler) readAppliedModelRoutes(ctx context.Context, namespace strin
 		if err != nil {
 			return nil, fmt.Errorf("read rules from HTTPRoute %s/%s: %w", namespace, route.GetName(), err)
 		}
+		profiles, err := tenant.HomeRuntimeRouteProfiles(route, namespace)
+		if err != nil {
+			return nil, err
+		}
+		profileByID := map[string]resolver.Route{}
+		for _, profile := range profiles {
+			profileByID[envelope.RouteStableID(profile)] = profile
+		}
 		clientName := routeClientName(rules, namespace, modelName)
 		for _, rawRule := range rules {
 			rule, ok := rawRule.(map[string]any)
@@ -422,6 +454,10 @@ func (r *Reconciler) readAppliedModelRoutes(ctx context.Context, namespace strin
 				continue
 			}
 			resolvedRoute.ClientName, resolvedRoute.Cluster, resolvedRoute.Endpoint = clientName, serviceName, endpoint
+			if profile, found := profileByID[stableID]; found {
+				profile.Endpoint, profile.Cluster = endpoint, serviceName
+				resolvedRoute = profile
+			}
 			result[stableID] = resolvedRoute
 		}
 	}
@@ -816,10 +852,12 @@ func (r *Reconciler) podServesOverlayRevision(ctx context.Context, pod *corev1.P
 			continue
 		}
 		match := extprocServingRevisionPattern.FindStringSubmatch(line)
-		if len(match) != 3 {
+		if len(match) != 5 {
 			return false, errServingRevisionUnknown
 		}
-		return match[1] == expectedRevision && match[2] == expectedRevision, nil
+		accepted := match[1] + match[2]
+		serving := match[3] + match[4]
+		return accepted == expectedRevision && serving == expectedRevision, nil
 	}
 	return false, errServingRevisionUnknown
 }
@@ -957,6 +995,10 @@ func runtimeConfigHash(ctx context.Context, r *Reconciler, models []*v1alpha1.Ex
 		return "", fmt.Errorf("resolve current ExternalModel ExtProc runtime routes: %w", err)
 	}
 	candidates, err := tenant.ExternalModelRuntimeCandidates(routes, apiTranslationEnabled)
+	if err != nil {
+		return "", err
+	}
+	candidates, err = tenant.RetainHomeRuntimeCandidates(ctx, r.Client, namespace, candidates, apiTranslationEnabled)
 	if err != nil {
 		return "", err
 	}

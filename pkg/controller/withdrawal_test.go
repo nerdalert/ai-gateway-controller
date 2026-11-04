@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -400,6 +401,12 @@ func TestRuntimeConfigHashPreservesScopedAnthropicHeaderWithNoHomeRoutes(t *test
 		t.Fatalf("published scoped Anthropic candidate = %#v", scoped)
 	}
 
+	// This case intentionally hashes an attachment-only runtime.
+	if route, err := getUnstructured(r, httpRouteGVK, home.Namespace, modelRouteName(home.Name)); err != nil {
+		t.Fatal(err)
+	} else if err := r.Delete(ctx, route); err != nil {
+		t.Fatal(err)
+	}
 	tracker := &secretMetadataReadTracker{Reader: r.APIReader}
 	r.APIReader = tracker
 	// With no home candidates, ErrNoRoutes is a valid empty local set. The
@@ -1219,6 +1226,10 @@ func seedSafeExternalModelRuntime(t *testing.T, r *Reconciler, tenantID, namespa
 	if err != nil {
 		t.Fatal(err)
 	}
+	candidates, err = tenant.RetainHomeRuntimeCandidates(context.Background(), r.Client, namespace, candidates, apiTranslationEnabled)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, candidate := range overlayEnvelope(t, r, namespace).Overlay.Candidates {
 		if envelope.IsScopedStableID(candidate.StableID) {
 			candidate = cloneCandidate(candidate)
@@ -1295,7 +1306,11 @@ func markSafeExternalModelRuntimeCurrent(t *testing.T, r *Reconciler, tenantID, 
 	t.Helper()
 	ctx := context.Background()
 	env := overlayEnvelope(t, r, namespace)
-	config, hash, err := tenant.ExternalModelExtProcConfig(namespace, env.Overlay.Candidates, apiTranslationEnabled)
+	candidates, err := tenant.RetainHomeRuntimeCandidates(ctx, r.Client, namespace, env.Overlay.Candidates, apiTranslationEnabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, hash, err := tenant.ExternalModelExtProcConfig(namespace, candidates, apiTranslationEnabled)
 	if err != nil {
 		t.Fatalf("render serving ExtProc config from reduced overlay: %v", err)
 	}
@@ -1509,5 +1524,158 @@ func TestTerminalPodsDoNotBlockServingRevision(t *testing.T) {
 	}
 	if _, safe, err := r.externalModelPodsSafe(ctx, model.Namespace, deployment, 1, deployment.Spec.Template.Annotations[extprocConfigHashAnnotation], env.Revision.Value); err != nil || safe {
 		t.Fatalf("nonterminal unowned Pod must still block: safe=%t err=%v", safe, err)
+	}
+}
+
+func TestPodServesOverlayRevisionParsesReloadLogs(t *testing.T) {
+	revision := strings.Repeat("a", 64)
+	other := strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name, logs               string
+		wantServing, wantUnknown bool
+	}{
+		{name: "unquoted reload", logs: "overlay reloaded accepted_revision=" + revision + " serving_revision=" + revision, wantServing: true},
+		{name: "quoted startup", logs: `accepted_revision="` + revision + `" serving_revision="` + revision + `"`, wantServing: true},
+		{name: "mixed quoting", logs: `accepted_revision="` + revision + `" serving_revision=` + revision + " elapsed=1ms", wantServing: true},
+		{name: "newest revision wins", logs: "accepted_revision=" + revision + " serving_revision=" + revision + "\naccepted_revision=" + other + " serving_revision=" + other},
+		{name: "accepted is not serving", logs: "accepted_revision=" + revision + " serving_revision=" + other},
+		{name: "oversized digest", logs: "accepted_revision=" + revision + "a serving_revision=" + revision, wantUnknown: true},
+		{name: "malformed newest line", logs: "accepted_revision=" + revision + " serving_revision=" + revision + "\naccepted_revision=unknown", wantUnknown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Reconciler{readPodLogs: func(context.Context, string, string, string) (string, error) { return tc.logs, nil }}
+			serving, err := r.podServesOverlayRevision(context.Background(), &corev1.Pod{}, revision)
+			if serving != tc.wantServing || errors.Is(err, errServingRevisionUnknown) != tc.wantUnknown || err != nil && !tc.wantUnknown {
+				t.Fatalf("serving=%v err=%v; want serving=%v unknown=%v", serving, err, tc.wantServing, tc.wantUnknown)
+			}
+		})
+	}
+}
+
+func TestDeletingHomeBindingRetainsRuntimeProfileThroughDrain(t *testing.T) {
+	for _, deleteProvider := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delete_provider_%v", deleteProvider), func(t *testing.T) {
+			ctx := context.Background()
+			r, model := reconcilerFixture(t)
+			providerB := createWithdrawalProvider(t, r, model.Namespace, "provider-b")
+			sibling := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid"},
+				Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{withdrawalProviderRef(providerB.Name, "sibling-target")}}}
+			if err := r.Create(ctx, sibling); err != nil {
+				t.Fatal(err)
+			}
+			reconcileModel(t, r, model)
+			reconcileModel(t, r, sibling)
+			models := []*v1alpha1.ExternalModel{getModel(t, r, model), getModel(t, r, sibling)}
+			beforeHash, err := runtimeConfigHash(ctx, r, models, model.Namespace, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: "provider"}}); err != nil {
+				t.Fatal(err)
+			}
+			seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, models)
+			quotedLogs := r.readPodLogs
+			r.readPodLogs = func(ctx context.Context, namespace, pod, container string) (string, error) {
+				logs, err := quotedLogs(ctx, namespace, pod, container)
+				return strings.ReplaceAll(logs, "\"", ""), err
+			}
+			model = getModel(t, r, model)
+			if deleteProvider {
+				var provider v1alpha1.ExternalProvider
+				if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "provider"}, &provider); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.Delete(ctx, &provider); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&provider)}); err != nil {
+					t.Fatal(err)
+				}
+				zero := 0
+				model.Spec.ExternalProviderRefs[0].Weight = &zero
+				if err := r.Update(ctx, model); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := r.Delete(ctx, model); err != nil {
+				t.Fatal(err)
+			}
+			assertRetained := func() {
+				t.Helper()
+				candidates, err := tenant.RetainHomeRuntimeCandidates(ctx, r.Client, model.Namespace, nil, false)
+				if err != nil || len(candidates) != 2 {
+					t.Fatalf("retained runtime candidates=%#v err=%v", candidates, err)
+				}
+				config, hash, err := tenant.ExternalModelExtProcConfig(model.Namespace, candidates, false)
+				if err != nil || hash != beforeHash || !strings.Contains(config, "provider-provider") || !strings.Contains(config, "credentials") {
+					t.Fatalf("retained runtime hash=%s want=%s err=%v", hash, beforeHash, err)
+				}
+			}
+			assertRetained()
+			result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+			if err != nil || result.RequeueAfter <= 0 {
+				t.Fatalf("stage withdrawal: result=%#v err=%v", result, err)
+			}
+			for _, candidate := range overlayEnvelope(t, r, model.Namespace).Overlay.Candidates {
+				if candidate.StableID == envelope.CandidateStableID(model.Name, "provider") {
+					t.Fatal("withdrawn provider is still eligible in the overlay")
+				}
+			}
+			assertRetained()
+			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sibling)}); err != nil {
+				t.Fatal(err)
+			}
+			assertRetained()
+			markWithdrawalDrainElapsed(t, r, model.Namespace)
+			if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+				t.Fatal(err)
+			}
+			candidates, err := tenant.RetainHomeRuntimeCandidates(ctx, r.Client, model.Namespace, nil, false)
+			if err != nil || len(candidates) != 1 || candidates[0].StableID != envelope.CandidateStableID(sibling.Name, providerB.Name) {
+				t.Fatalf("runtime after drain=%#v err=%v", candidates, err)
+			}
+		})
+	}
+}
+
+func TestMissingWithdrawnProviderUsesAppliedProfileOrSkipsStaleCandidate(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	previous := overlayEnvelope(t, r, model.Namespace)
+	base, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("test client does not support watches")
+	}
+	lookupErr := errors.New("provider API read failed")
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, provider := obj.(*v1alpha1.ExternalProvider); provider {
+			return lookupErr
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}})
+	if _, _, err := r.transportRoutesForPublication(ctx, model.Namespace, nil, &previous, false); !errors.Is(err, lookupErr) {
+		t.Fatalf("provider read failure was swallowed: %v", err)
+	}
+	r.Client = base
+
+	if err := r.Delete(ctx, &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Namespace: model.Namespace, Name: "provider"}}); err != nil {
+		t.Fatal(err)
+	}
+	routes, pending, err := r.transportRoutesForPublication(ctx, model.Namespace, nil, &previous, false)
+	if err != nil || !pending || len(routes) != 1 || routes[0].ProviderType != "openai" || routes[0].SecretName != "credentials" || routes[0].Endpoint != "api.example.com" {
+		t.Fatalf("applied profile not preserved: routes=%#v pending=%v err=%v", routes, pending, err)
+	}
+	if route, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
+		t.Fatal(err)
+	} else if err := r.Delete(ctx, route); err != nil {
+		t.Fatal(err)
+	}
+	routes, pending, err = r.transportRoutesForPublication(ctx, model.Namespace, nil, &previous, false)
+	if err != nil || pending || len(routes) != 0 {
+		t.Fatalf("stale candidate not skipped: routes=%#v pending=%v err=%v", routes, pending, err)
+	}
+	routes, err = r.routesForAttachmentWithdrawal(ctx, model, attachmentTenant{}, previous.Overlay.Candidates)
+	if err != nil || len(routes) != 0 {
+		t.Fatalf("stale attachment not skipped: routes=%#v err=%v", routes, err)
 	}
 }

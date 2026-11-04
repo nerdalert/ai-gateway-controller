@@ -4472,3 +4472,35 @@ func TestExcludedScopedCandidateIDsSupportHashedIdentitiesAndFailOnUnreadableMod
 		t.Fatalf("unreadable excluded model must fail closed: %v", err)
 	}
 }
+
+func TestHomeModelPublicationReportsOneStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		publication homeModelPublication
+		wantReason  string
+	}{
+		{name: "weight disabled takes precedence", publication: homeModelPublication{weightDisabled: true, denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "denied reference", publication: homeModelPublication{denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonRefNotPermitted},
+		{name: "unready credential", publication: homeModelPublication{unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonProviderNotReady},
+		{name: "unrouted", publication: homeModelPublication{unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "ready", wantReason: reasonReconciled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reportErr := range []error{nil, errors.New("status write failed")} {
+				calls := 0
+				publication := tc.publication
+				publication.report = func(ready bool, reason, _ string, _ *envelope.Envelope) error {
+					calls++
+					if reason != tc.wantReason || ready != (reason == reasonReconciled) {
+						t.Errorf("status ready=%v reason=%s; want %s", ready, reason, tc.wantReason)
+					}
+					return reportErr
+				}
+				_, err := (&Reconciler{}).finishHomeModelPublication(context.Background(), publication)
+				if calls != 1 || !errors.Is(err, reportErr) {
+					t.Fatalf("status calls=%d err=%v; want one call and %v", calls, err, reportErr)
+				}
+			}
+		})
+	}
+}

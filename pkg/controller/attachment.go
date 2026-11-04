@@ -1006,9 +1006,13 @@ func (r *Reconciler) routesForAttachmentWithdrawal(ctx context.Context, model *v
 			return nil, err
 		}
 		if !found {
-			return nil, fmt.Errorf("cannot resolve provider identity for retained attachment Service %q", candidate.Cluster)
+			// No provider remains to own this stale attachment candidate.
+			continue
 		}
 		route, err := r.routeForWithdrawnCandidate(ctx, model.Namespace, candidate, model.Name, providerNamespace, providerName, nil, t.apiTranslationEnabled)
+		if errors.Is(err, errWithdrawnProviderGone) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

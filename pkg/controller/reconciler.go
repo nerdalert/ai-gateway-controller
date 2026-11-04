@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -912,27 +913,18 @@ func homeModelInputs(models []v1alpha1.ExternalModel, gatewayName, gatewayNamesp
 
 func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication homeModelPublication) (reconcile.Result, error) {
 	var statusErr error
-	if publication.denied != "" {
-		// The model's permitted references are served; the others are reported.
+	switch {
+	case publication.weightDisabled:
+		statusErr = publication.report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
+	case publication.denied != "":
 		statusErr = publication.report(false, reasonRefNotPermitted, publication.denied, nil)
-	} else if publication.unserved != "" {
-		// Its references inherit a credential that is not ready; other models
-		// keep serving.
+	case publication.unserved != "":
 		statusErr = publication.report(false, reasonProviderNotReady, publication.unserved, nil)
-	} else if publication.unroutedReason != "" {
+	case publication.unroutedReason != "":
 		statusErr = publication.report(false, publication.unroutedReason, publication.unroutedMessage, nil)
-	} else {
+	default:
 		message := fmt.Sprintf("distributed routing overlay digest %s generation %d", publication.result.Envelope.Revision.Value, publication.result.Envelope.Provenance.SourceGeneration)
 		statusErr = publication.report(true, reasonReconciled, message, &publication.result.Envelope)
-	}
-	if publication.weightDisabled {
-		// A healthy sibling can keep the tenant overlay alive, but this model
-		// itself has no eligible providers and must not remain Ready.
-		statusErr = publication.report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
-	} else if publication.unroutedReason != "" {
-		// Other models of the namespace are served, but none of this model's
-		// references resolved: it has no route or overlay candidate.
-		statusErr = publication.report(false, publication.unroutedReason, publication.unroutedMessage, nil)
 	}
 	if publication.remaining > 0 {
 		if statusErr != nil {
@@ -2176,7 +2168,11 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			setOwnerReference(&obj, owner)
 		}
 		if hasForeign {
-			obj.SetAnnotations(routeStateAnnotations(home.gateway, state))
+			annotations := obj.GetAnnotations()
+			for key, value := range routeStateAnnotations(home.gateway, state) {
+				annotations[key] = value
+			}
+			obj.SetAnnotations(annotations)
 		}
 		key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
 		if !seen[key] {
@@ -2834,9 +2830,22 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 		"backendRefs": []any{map[string]any{"name": sinkName, "port": int64(443)}},
 		"timeouts":    map[string]any{"request": fmt.Sprintf("%ds", withdrawalRequestTimeoutSeconds)},
 	})
+	metadata := labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model)
+	localProfiles := make([]resolver.Route, 0, len(routes))
+	for _, profile := range routes {
+		if !profile.CrossNamespace() {
+			localProfiles = append(localProfiles, profile)
+		}
+	}
+	// Route contains only scalar fields and Secret references, never key data.
+	profiles, err := json.Marshal(localProfiles) //nolint:musttag // Internal resolved routes use Go field names in this reference-only snapshot.
+	if err != nil {
+		return unstructured.Unstructured{}
+	}
+	metadata["annotations"] = map[string]any{tenant.AnnotationHomeRuntimeRoutes: string(profiles)}
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
-		"metadata": labelledMetadata(modelRouteName(route.Model), ns, "inference.opendatahub.io/external-model", route.Model),
+		"metadata": metadata,
 		"spec": map[string]any{
 			"parentRefs": []any{parent},
 			"rules":      rules,

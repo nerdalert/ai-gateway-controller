@@ -713,19 +713,17 @@ func (r *Reconciler) resolvePraxisRuntimeCandidates(
 	if err != nil {
 		return nil, false, false, "", err
 	}
+	homeCandidates, policyExcludedOnly, homeErr := r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
+	if homeErr != nil && !errors.Is(homeErr, resolver.ErrNoRoutes) {
+		return nil, false, false, "", homeErr
+	}
 	// An unreadable overlay may still carry attachments: keep the processor
 	// and let routingOverlayReady report it, as for the tenant's own models.
-	serving := hasModels || len(attached) > 0 || unreadableOverlay
+	serving := hasModels || len(homeCandidates) > 0 || len(attached) > 0 || unreadableOverlay
 	if !serving {
 		return nil, false, true, "", nil
 	}
 
-	var homeCandidates []envelope.Candidate
-	var homeErr error
-	var policyExcludedOnly bool
-	if hasModels {
-		homeCandidates, policyExcludedOnly, homeErr = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace, apiTranslation)
-	}
 	if policyExcludedOnly && len(attached) == 0 && !unreadableOverlay {
 		// The model controller has withdrawn every home route on purpose. Its
 		// overlay may already be gone, so do not wait for it before applying
@@ -910,9 +908,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 			modelPtrs = append(modelPtrs, &models[i])
 		}
 	}
-	if len(modelPtrs) == 0 {
-		return nil, false, nil
-	}
+
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
 		if providers.Items[i].DeletionTimestamp.IsZero() {
@@ -921,14 +917,21 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
 	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
-	if err != nil {
+	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
-	candidates, err := ExternalModelRuntimeCandidates(runtimeSet, apiTranslationEnabled)
-	if err != nil {
-		return nil, false, err
+	candidates, candidateErr := ExternalModelRuntimeCandidates(runtimeSet, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
 	}
-	return candidates, false, nil
+	candidates, candidateErr = RetainHomeRuntimeCandidates(ctx, r.Client, namespace, candidates, apiTranslationEnabled)
+	if candidateErr != nil {
+		return nil, false, candidateErr
+	}
+	if errors.Is(err, resolver.ErrNoRoutes) && len(candidates) == 0 && len(modelPtrs) > 0 {
+		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
+	}
+	return candidates, policyExcludedOnly, nil
 }
 
 // allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation

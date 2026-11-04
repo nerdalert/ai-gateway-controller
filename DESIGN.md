@@ -74,6 +74,18 @@ referencing model to begin safe withdrawal. This prevents provider deletion
 alone from silently discarding a last-known-good route or leaving the operator
 without an actionable status.
 
+Home HTTPRoutes also retain reference-only runtime profiles (including Secret
+references, never credential values). The tenant's ExtProc configuration and
+the withdrawal safety check both include these profiles until their applied
+provider rules are pruned. Deleting a model/provider or reconciling a sibling
+therefore cannot remove credentials or provider hops ahead of the drain.
+Retaining a runtime profile does not put its candidate back into the overlay;
+new selection follows the reduced overlay. Quoted startup and unquoted reload
+revision logs are both accepted as serving-revision evidence. When a provider
+has already disappeared, an applied profile can still supply its drain contract;
+a stale candidate with no applied path is skipped. Missing credential semantics
+on a legacy applied route remain an error rather than being guessed.
+
 ### ExternalProvider status ownership
 
 Provider status has one writer per namespace, and that writer follows the
