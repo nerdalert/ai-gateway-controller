@@ -89,3 +89,55 @@ func TestRetainedRuntimeRejectsProfileWithoutMatchingProviderRule(t *testing.T) 
 		t.Fatal("unmatched runtime profile was accepted")
 	}
 }
+
+func TestHomeRuntimeRouteProfilesValidateDecodedFields(t *testing.T) {
+	baseline := resolver.Route{Model: "model", ClientName: "model", Namespace: "tenant-ns", Provider: "provider", Cluster: "provider-provider",
+		ProviderType: "openai", APIFormat: "openai-chat", AuthType: "apikey", SecretName: "provider-key", SecretKey: "api-key"}
+	for _, tc := range []struct {
+		name   string
+		change func(*resolver.Route)
+		valid  bool
+	}{
+		{name: "valid ownerless credential", change: func(*resolver.Route) {}, valid: true},
+		{name: "valid credential-free route", change: func(p *resolver.Route) { p.AuthType, p.SecretName, p.SecretKey = "", "", "" }, valid: true},
+		{name: "credential-free resolver key", change: func(p *resolver.Route) { p.AuthType, p.SecretName = "", "" }, valid: true},
+		{name: "local secret namespace", change: func(p *resolver.Route) { p.SecretNamespace = p.Namespace }, valid: true},
+		{name: "canonical stable ID", change: func(p *resolver.Route) { p.StableID = envelope.CandidateStableID(p.Model, p.Provider) }, valid: true},
+		{name: "secret name newline", change: func(p *resolver.Route) { p.SecretName = "key\n      - filter: forged" }},
+		{name: "secret name path traversal", change: func(p *resolver.Route) { p.SecretName = "../key" }},
+		{name: "secret key newline", change: func(p *resolver.Route) { p.SecretKey = "api-key\n        forged: true" }},
+		{name: "secret key traversal", change: func(p *resolver.Route) { p.SecretKey = "../api-key" }},
+		{name: "unsupported secret key", change: func(p *resolver.Route) { p.SecretKey = "other-key" }},
+		{name: "missing secret name", change: func(p *resolver.Route) { p.SecretName = "" }},
+		{name: "missing secret key", change: func(p *resolver.Route) { p.SecretKey = "" }},
+		{name: "cross-namespace secret", change: func(p *resolver.Route) { p.SecretNamespace = "other-tenant" }},
+		{name: "arbitrary cluster", change: func(p *resolver.Route) { p.Cluster = "other-target" }},
+		{name: "forged stable ID", change: func(p *resolver.Route) { p.StableID = "another-model/provider-provider" }},
+		{name: "malformed provider name", change: func(p *resolver.Route) { p.Provider = "provider\nforged"; p.Cluster = p.ServiceName() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := baseline
+			tc.change(&profile)
+			encoded, err := json.Marshal([]resolver.Route{profile}) //nolint:musttag // Mirrors the internal reference-only route annotation.
+			if err != nil {
+				t.Fatal(err)
+			}
+			route := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+				"metadata": map[string]any{"name": "model-route", "namespace": "tenant-ns"},
+				"spec": map[string]any{"rules": []any{map[string]any{
+					"matches": []any{map[string]any{"headers": []any{map[string]any{
+						"name": "X-AI-Routing-Candidate", "type": "Exact", "value": envelope.RouteStableID(profile),
+					}}}},
+					"backendRefs": []any{map[string]any{"name": profile.ServiceName()}},
+				}}},
+			}}
+			route.SetLabels(map[string]string{managedByLabel: ManagedByAIGatewayController, "inference.opendatahub.io/external-model": profile.Model})
+			route.SetAnnotations(map[string]string{AnnotationHomeRuntimeRoutes: string(encoded)})
+			profiles, err := HomeRuntimeRouteProfiles(route, "tenant-ns")
+			if tc.valid && (err != nil || len(profiles) != 1) || !tc.valid && err == nil {
+				t.Fatalf("valid=%v returned profiles=%#v err=%v", tc.valid, profiles, err)
+			}
+		})
+	}
+}

@@ -65,14 +65,15 @@ overlay candidates and reports `Ready=False/NoRoutes`, even when a referenced
 provider is missing or unready. Unrelated models retain their serving state.
 Readiness-driven final-provider withdrawal remains tracked in issue #106.
 
-This PR stages provider withdrawal for tenant-local and Gateway-attached
+The controller stages provider withdrawal for tenant-local and Gateway-attached
 models: the reduced overlay must be observed by the serving ExtProc revision,
 then the request-drain interval must elapse before old routes, credentials, and
-transports are removed. Deleting an `ExternalProvider` that is still referenced
-is intentionally blocked with `Pending` / `ProviderInUse`; update or delete the
-referencing model to begin safe withdrawal. This prevents provider deletion
-alone from silently discarding a last-known-good route or leaving the operator
-without an actionable status.
+transports are removed. Deleting an `ExternalProvider` whose transport is used
+by published candidates or applied routes is blocked with `Pending` /
+`ProviderInUse`; a spec-only reference from an unserved model does not block
+deletion. Update or delete the serving model to begin safe withdrawal. This
+prevents provider deletion alone from silently discarding a last-known-good
+route or leaving the operator without an actionable status.
 
 Home HTTPRoutes also retain reference-only runtime profiles (including Secret
 references, never credential values). The tenant's ExtProc configuration and
@@ -85,6 +86,12 @@ revision logs are both accepted as serving-revision evidence. When a provider
 has already disappeared, an applied profile can still supply its drain contract;
 a stale candidate with no applied path is skipped. Missing credential semantics
 on a legacy applied route remain an error rather than being guessed.
+
+Retained-profile field validation rejects malformed credential references and
+routing targets; it does not authenticate the HTTPRoute writer. Labels and
+owner references are not an authorization boundary. Namespace RBAC must protect
+controller-managed home routes as configuration inputs that can influence
+credential references within that namespace.
 
 ### ExternalProvider status ownership
 

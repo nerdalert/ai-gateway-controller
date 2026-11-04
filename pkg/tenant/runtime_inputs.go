@@ -8,6 +8,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -82,11 +83,37 @@ func HomeRuntimeRouteProfiles(route *unstructured.Unstructured, namespace string
 		return nil, fmt.Errorf("decode retained runtime profiles on HTTPRoute %s/%s: %w", namespace, route.GetName(), err)
 	}
 	for _, profile := range profiles {
+		if !validHomeRuntimeProfile(profile, namespace) {
+			return nil, fmt.Errorf("retained runtime profile on HTTPRoute %s/%s has invalid fields", namespace, route.GetName())
+		}
 		if profile.Namespace != namespace || profile.Model != modelName || profile.CrossNamespace() || !homeRouteHasRuntimeBinding(route, profile) {
 			return nil, fmt.Errorf("retained runtime profile does not match HTTPRoute %s/%s", namespace, route.GetName())
 		}
 	}
 	return profiles, nil
+}
+
+// validHomeRuntimeProfile bounds fields decoded from route annotations before
+// they can become credential paths, projected Secret references, or routing
+// targets. This validates configuration data, not the writer's authorization.
+func validHomeRuntimeProfile(profile resolver.Route, namespace string) bool {
+	if len(validation.IsDNS1123Subdomain(profile.Model)) > 0 || len(validation.IsDNS1123Subdomain(profile.Provider)) > 0 ||
+		profile.Cluster != profile.ServiceName() || profile.SecretNamespace != "" && profile.SecretNamespace != namespace {
+		return false
+	}
+	if profile.StableID != "" && profile.StableID != envelope.CandidateStableID(profile.Model, profile.Provider) {
+		return false
+	}
+	if profile.SecretName != "" && len(validation.IsDNS1123Subdomain(profile.SecretName)) > 0 {
+		return false
+	}
+	if profile.SecretKey != "" && profile.SecretKey != "api-key" {
+		return false
+	}
+	if profile.AuthType != "" && (profile.SecretName == "" || profile.SecretKey != "api-key") {
+		return false
+	}
+	return true
 }
 
 // homeRouteHasRuntimeBinding verifies the profile's exact provider handoff and
