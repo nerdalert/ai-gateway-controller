@@ -298,9 +298,9 @@ copy_source(ai_source, context / "praxis-ai")
 cargo_toml = context / "praxis-extproc" / "Cargo.toml"
 cargo = cargo_toml.read_text()
 replacements = {
-    'praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false, optional = true }':
+    'praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.9.0", default-features = false, optional = true }':
         'praxis-ai-apis = { path = "../praxis-ai/apis", default-features = false, optional = true }',
-    'praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false }':
+    'praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.9.0", default-features = false }':
         'praxis-ai-filters = { path = "../praxis-ai/filters", default-features = false }',
 }
 for old, new in replacements.items():
