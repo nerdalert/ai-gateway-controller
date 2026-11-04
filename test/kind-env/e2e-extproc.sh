@@ -98,9 +98,9 @@ finish() {
       -p='[{"op":"remove","path":"/spec/externalProviderRefs/0/auth"}]' >/dev/null 2>&1 || true
   fi
   timeout 20s kubectl --context "kind-$CLUSTER" -n "$NS" delete secret "$OVERRIDE_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+  revoke_key
   [[ -n "$APF" ]] && kill "$APF" 2>/dev/null || true
   [[ -n "$GPF" ]] && kill "$GPF" 2>/dev/null || true
-  revoke_key
   rm -f "$AUTH_CFG" "$ADMIN_CFG"
   rm -rf "$TMP_DIR"
   if jq -e '.status=="RUNNING"' "$RESULTS" >/dev/null 2>&1; then

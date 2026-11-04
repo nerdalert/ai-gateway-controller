@@ -374,7 +374,6 @@ rg -q 'make_katan_tls provider-proof-c-tls provider-proof-c-ext' <<<"$run_source
 )
 
 
-echo "Kind run harness contracts passed (image identity, handoff read errors, and static-weight receipt fixtures)."
 # Check the actual Docker RepoDigests expression against multiple entries.
 rg -q 'index\(\$d\) != null' "$ROOT/test/kind-env/run.sh"
 for digests in '["other@sha256:abc","expected@sha256:def"]' '["expected@sha256:def","other@sha256:abc"]'; do
@@ -486,5 +485,46 @@ fi
     }
   done
 )
+
+(
+  eval "$(sed -n '/^revoke_key() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")"
+  revocation_tmp=$(mktemp -d)
+  trap 'rm -rf "$revocation_tmp"' EXIT
+  EVIDENCE=$revocation_tmp
+  KEY_ID=contract-test-key
+  APF=contract-test-port-forward
+  KEY_REVOKED=false
+  CA_CERT=unused API_PORT=unused ADMIN_CFG=unused
+  timeout() {
+    printf '%s\n' called >>"$revocation_tmp/calls"
+    printf '%s' "$mock_status"
+  }
+  mock_status=503
+  if revoke_key; then
+    echo 'failed revocation must remain retryable' >&2
+    exit 1
+  fi
+  [[ "$KEY_REVOKED" == false ]] || { echo 'failed revocation marked the key revoked' >&2; exit 1; }
+  mock_status=200
+  revoke_key
+  mock_status=000
+  revoke_key
+  [[ "$KEY_REVOKED" == true && $(wc -l <"$revocation_tmp/calls") -eq 2 ]] || {
+    echo 'successful revocation must not be retried after a port-forward stops' >&2
+    exit 1
+  }
+  rg -q 'status=200$' "$EVIDENCE/key-revocation.txt" || {
+    echo 'repeat cleanup overwrote the successful revocation receipt' >&2
+    exit 1
+  }
+)
+
+finish_source=$(sed -n '/^finish() {$/,/^}$/p' "$ROOT/test/kind-env/e2e-extproc.sh")
+revoke_line=$(rg -n '^  revoke_key$' <<<"$finish_source" | cut -d: -f1)
+api_stop_line=$(rg -n 'kill "\$APF"' <<<"$finish_source" | cut -d: -f1)
+[[ -n "$revoke_line" && -n "$api_stop_line" && "$revoke_line" -lt "$api_stop_line" ]] || {
+  echo 'cleanup must revoke the key before stopping its API port-forward' >&2
+  exit 1
+}
 
 echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, exact MaaS runtime image identity, opt-in diagnostic auth, provider-log failure handling, MaaS callback-log failure handling, and AuthPolicy listing failures)."
