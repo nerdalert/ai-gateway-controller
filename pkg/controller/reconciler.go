@@ -115,6 +115,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return fmt.Errorf("create Kubernetes client for ExternalModel serving-state checks: %w", err)
 		}
 		r.readPodLogs = func(ctx context.Context, namespace, podName, container string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
 			tailLines := int64(300)
 			limitBytes := int64(1 << 20)
 			body, err := kubeClient.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
@@ -756,19 +758,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, err
 	}
 
-	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
-	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
-	for i := range models.Items {
-		// A terminating model is handled by its own staged-withdrawal
-		// reconcile. Including it here lets a sibling event republish its
-		// providers and replace the drain revision before its finalizer can
-		// finish.
-		if !models.Items[i].DeletionTimestamp.IsZero() || !tenant.ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
-			continue
-		}
-		modelPtrs = append(modelPtrs, &models.Items[i])
-		modelOwners[models.Items[i].Name] = &models.Items[i]
-	}
+	modelPtrs, modelOwners := homeModelInputs(models.Items, gatewayName, gatewayNamespace)
 	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -899,6 +889,25 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		attached: attached, state: state,
 		remaining: remaining, withdrawalPending: withdrawalPending, report: report,
 	})
+}
+
+// homeModelInputs selects live models owned by this tenant without republishing
+// terminating models whose staged withdrawal is handled independently.
+func homeModelInputs(models []v1alpha1.ExternalModel, gatewayName, gatewayNamespace string) ([]*v1alpha1.ExternalModel, map[string]*v1alpha1.ExternalModel) {
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models))
+	for i := range models {
+		// A terminating model is handled by its own staged-withdrawal
+		// reconcile. Including it here lets a sibling event republish its
+		// providers and replace the drain revision before its finalizer can
+		// finish.
+		if !models[i].DeletionTimestamp.IsZero() || !tenant.ServedByTenantGateway(&models[i], gatewayName, gatewayNamespace) {
+			continue
+		}
+		modelPtrs = append(modelPtrs, &models[i])
+		modelOwners[models[i].Name] = &models[i]
+	}
+	return modelPtrs, modelOwners
 }
 
 func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication homeModelPublication) (reconcile.Result, error) {

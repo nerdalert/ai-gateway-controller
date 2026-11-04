@@ -1480,3 +1480,34 @@ func TestUnknownServingRevisionPreservesDrainButCannotAuthorizeCleanup(t *testin
 		t.Fatal("confirmed mismatch did not invalidate the drain")
 	}
 }
+
+func TestTerminalPodsDoNotBlockServingRevision(t *testing.T) {
+	ctx := context.Background()
+	r, model := reconcilerFixture(t)
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{model})
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: tenant.PayloadProcessingExternalModelDeploymentName("tenant")}, deployment); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodSucceeded} {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "terminal-" + strings.ToLower(string(phase)), Namespace: model.Namespace, Labels: deployment.Spec.Selector.MatchLabels}, Status: corev1.PodStatus{Phase: phase}}
+		if err := r.Create(ctx, pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := overlayEnvelope(t, r, model.Namespace)
+	pods, safe, err := r.externalModelPodsSafe(ctx, model.Namespace, deployment, 1, deployment.Spec.Template.Annotations[extprocConfigHashAnnotation], env.Revision.Value)
+	if err != nil || !safe || len(pods) != 1 {
+		t.Fatalf("terminal Pods blocked the one current serving Pod: safe=%t pods=%v err=%v", safe, pods, err)
+	}
+	pending := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pending-unowned", Namespace: model.Namespace, Labels: deployment.Spec.Selector.MatchLabels}, Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	if err := r.Create(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, safe, err := r.externalModelPodsSafe(ctx, model.Namespace, deployment, 1, deployment.Spec.Template.Annotations[extprocConfigHashAnnotation], env.Revision.Value); err != nil || safe {
+		t.Fatalf("nonterminal unowned Pod must still block: safe=%t err=%v", safe, err)
+	}
+}

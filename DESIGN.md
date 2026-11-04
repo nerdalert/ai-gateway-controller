@@ -108,9 +108,11 @@ inconsistent with the tenant configuration) claims the provider and reports
 would leave the provider with neither the finalizer nor a status writer while
 IPP remains free to write status; the requeue retries the resolution.
 
-Deleting a provider that is still referenced or has an applied provider route
-keeps its cleanup finalizer and reports `Pending`/`ProviderInUse`, including the
-referencing model names. The operator must update or delete those models. Their
+Deleting a provider whose published overlay candidates or applied routes still
+use its transport keeps its cleanup finalizer and reports
+`Pending`/`ProviderInUse`, including referencing model names when present. A
+spec-only reference from an unserved model does not itself block deletion. To
+withdraw active routes, the operator must update or delete their models. Their
 reconciles first publish a reduced overlay; the old route, credential
 projection, and transport remain until the new ExtProc revision is serving and
 the in-flight request drain has elapsed. The provider finalizer then removes

@@ -769,6 +769,9 @@ func (r *Reconciler) externalModelPodsSafe(ctx context.Context, namespace string
 	currentPods := map[types.UID]bool{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
 		owner := metav1.GetControllerOf(pod)
 		if owner == nil {
 			return nil, false, nil
