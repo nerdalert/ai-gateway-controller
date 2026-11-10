@@ -356,7 +356,9 @@ print(f"chunks={n} first_ms={first or 0:.0f} last_ms={last or 0:.0f} status={sta
 
 provider_request_count() {
   local deployment=$1 logs
-  logs=$(timeout 5s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" --tail=300 2>/dev/null) || return 1
+  # Counts compared before and after a request must cover the same log start.
+  # A moving tail can hide an upstream request as older lines fall out.
+  logs=$(timeout 10s kubectl --context "kind-$CLUSTER" -n "$API_NS" logs "deploy/$deployment" --tail=-1 2>/dev/null) || return 1
   awk 'index($0,"POST /v1/chat/completions") { count++ } END { print count+0 }' <<<"$logs"
 }
 

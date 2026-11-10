@@ -221,6 +221,31 @@ if ! rg -q 'if args\.diagnostic_route_auth:' "$ROOT/test/kind-env/e2e-api-transl
     echo "translation diagnostic AuthPolicies are not applied only through their explicit opt-in" >&2
     exit 1
 fi
+(
+  eval "$(sed -n '/^cleanup_owned_translation_diagnostic_authpolicies() {$/,/^}$/p' "$ROOT/test/kind-env/run.sh")"
+  EVIDENCE=$(mktemp -d)
+  trap 'rm -rf "$EVIDENCE"' EXIT
+  KCTL=(fake_kubectl)
+  fake_kubectl() {
+    case "$*" in
+      *'get authpolicy api-translation-messages-auth'*)
+        printf '%s\n' '{"metadata":{"name":"api-translation-messages-auth","namespace":"models-as-a-service","labels":{"app.kubernetes.io/managed-by":"api-translation-kind-e2e-diagnostic"}},"spec":{"targetRef":{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"api-translation-messages"}}}' ;;
+      *'get authpolicy api-translation-openai-auth'*)
+        printf '%s\n' '{"metadata":{"name":"api-translation-openai-auth","namespace":"models-as-a-service","labels":{"app.kubernetes.io/managed-by":"another-owner"}},"spec":{"targetRef":{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"api-translation-openai"}}}' ;;
+      *'delete authpolicy api-translation-messages-auth'*) printf '%s\n' "$*" >>"$EVIDENCE/deletions.txt" ;;
+      *'delete authpolicy api-translation-openai-auth'*) echo 'non-owned policy was deleted' >&2; return 1 ;;
+      *) echo "unexpected diagnostic policy operation: $*" >&2; return 1 ;;
+    esac
+  }
+  cleanup_owned_translation_diagnostic_authpolicies
+  [[ "$(wc -l <"$EVIDENCE/deletions.txt")" -eq 1 ]] || {
+    echo 'diagnostic policy cleanup did not delete exactly one owned policy' >&2; exit 1;
+  }
+  rg -q 'preserved non-owned diagnostic AuthPolicy name api-translation-openai-auth' \
+    "$EVIDENCE/diagnostic-authpolicy-cleanup.txt" || {
+      echo 'diagnostic policy cleanup did not preserve the non-owned policy' >&2; exit 1;
+    }
+)
 if rg -q 'patch deployment maas-api|patch deployment "\$api_deployment"' <<<"$run_source"; then
   echo "the harness overrides MaaS API imagePullPolicy instead of satisfying its Always pull" >&2
   exit 1
